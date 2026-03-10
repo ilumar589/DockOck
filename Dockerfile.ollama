@@ -1,0 +1,28 @@
+# Dockerfile for running a local Ollama instance
+# Usage:
+#   docker build -f Dockerfile.ollama -t dockock-ollama .
+#   docker run -p 11434:11434 dockock-ollama
+#
+# Or use docker-compose.yml (recommended):
+#   docker-compose up -d
+
+FROM ollama/ollama:latest
+
+# Expose the default Ollama API port
+EXPOSE 11434
+
+# Default Ollama host binding – allow connections from outside the container
+ENV OLLAMA_HOST=0.0.0.0
+
+# Pull the default model during image build so the first run is instant.
+# The model is downloaded into the image layer; this makes the image large
+# (~2 GB for llama3.2) but avoids a slow first-start download.
+#
+# Comment this out if you prefer a smaller image and are happy to wait for
+# the model pull on first run.
+RUN ollama serve &\
+    sleep 5 &&\
+    ollama pull llama3.2 &&\
+    pkill ollama || true
+
+CMD ["serve"]
