@@ -1,20 +1,20 @@
-//! Multi-agent LLM integration using `rig-core` with multiple local Ollama instances.
+//! Multi-agent LLM integration using `rig-core` with local Ollama instances.
 //!
 //! ## Architecture
 //!
-//! Three specialised sub-agents run on separate Ollama instances:
+//! The pipeline has three configurable modes:
 //!
-//! | Agent       | Port  | Responsibility                                      |
-//! |-------------|-------|-----------------------------------------------------|
-//! | Extractor   | 11435 | Distils raw document text into structured summaries  |
-//! | Generator   | 11434 | Converts structured content into Gherkin features    |
-//! | Reviewer    | 11436 | Validates / refines the generated Gherkin             |
+//! | Mode     | Steps                                | LLM calls |
+//! |----------|--------------------------------------|-----------|
+//! | Fast     | Preprocess → Generate                | 1         |
+//! | Standard | Preprocess → Generate → Review       | 2         |
+//! | Full     | Extract(LLM) → Generate → Review     | 3         |
+//!
+//! The **Preprocess** step is a zero-cost Rust text truncation/structuring pass
+//! that replaces the slow LLM extractor in Fast and Standard modes.
 //!
 //! Files are parsed in parallel, then processed through the agent pipeline
 //! concurrently (up to `MAX_CONCURRENT` at a time).
-//!
-//! When fewer than 3 Ollama instances are available the orchestrator falls back
-//! to routing all work through whichever instance(s) *are* reachable.
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -33,6 +33,41 @@ pub const DEFAULT_MODEL: &str = "llama3.2";
 
 /// Maximum number of files processed through the LLM pipeline simultaneously.
 pub const MAX_CONCURRENT: usize = 3;
+
+/// Maximum number of characters to send to the LLM in a single prompt.
+/// Text beyond this limit is truncated with a note.
+const MAX_INPUT_CHARS: usize = 4000;
+
+/// Pipeline mode — controls which LLM stages are executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipelineMode {
+    /// Preprocess (fast) → Generate.  1 LLM call.
+    Fast,
+    /// Preprocess (fast) → Generate → Review.  2 LLM calls.
+    Standard,
+    /// Extract (LLM) → Generate → Review.  3 LLM calls.
+    Full,
+}
+
+impl Default for PipelineMode {
+    fn default() -> Self {
+        Self::Fast
+    }
+}
+
+impl std::fmt::Display for PipelineMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fast => write!(f, "Fast (1 LLM call)"),
+            Self::Standard => write!(f, "Standard (2 LLM calls)"),
+            Self::Full => write!(f, "Full (3 LLM calls)"),
+        }
+    }
+}
+
+impl PipelineMode {
+    pub const ALL: [PipelineMode; 3] = [Self::Fast, Self::Standard, Self::Full];
+}
 
 /// Ollama instance definitions.
 #[derive(Debug, Clone)]
@@ -120,6 +155,7 @@ pub struct AgentOrchestrator {
     reviewer_client: Option<ollama::Client>,
     model: String,
     pub semaphore: Arc<Semaphore>,
+    pub mode: PipelineMode,
 }
 
 /// Result of checking which Ollama endpoints are reachable.
@@ -133,7 +169,7 @@ pub struct EndpointStatus {
 impl AgentOrchestrator {
     /// Create the orchestrator, probing all endpoints.
     /// At minimum the generator (port 11434) must be reachable.
-    pub async fn new(model: &str) -> Result<(Self, Vec<EndpointStatus>)> {
+    pub async fn new(model: &str, mode: PipelineMode) -> Result<(Self, Vec<EndpointStatus>)> {
         let mut statuses = Vec::new();
 
         // Check each endpoint
@@ -194,12 +230,13 @@ impl AgentOrchestrator {
                 reviewer_client,
                 model: model.to_string(),
                 semaphore: Arc::new(Semaphore::new(concurrency)),
+                mode,
             },
             statuses,
         ))
     }
 
-    /// Run the full pipeline for one file: Extract → Generate → Review.
+    /// Run the pipeline for one file. Stages depend on `self.mode`.
     pub async fn process_file(
         &self,
         file_name: &str,
@@ -208,16 +245,24 @@ impl AgentOrchestrator {
         context: &ProjectContext,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        // ── Step 1: Extract structured summary ──
-        let _ = status_tx.send(format!(
-            "🔍 [Extractor] Analysing {}…", file_name
-        ));
-
-        let summary = self.extract(file_name, file_type, raw_text, status_tx).await
-            .unwrap_or_else(|e| {
-                warn!("Extraction failed for {}: {} — using raw text", file_name, e);
-                raw_text.to_string()
-            });
+        // ── Step 1: Prepare input for the generator ──
+        let summary = if self.mode == PipelineMode::Full {
+            // Full mode: use LLM extractor
+            let _ = status_tx.send(format!(
+                "🔍 [Extractor] Analysing {}…", file_name
+            ));
+            self.extract(file_name, file_type, raw_text, status_tx).await
+                .unwrap_or_else(|e| {
+                    warn!("Extraction failed for {}: {} — falling back to preprocessor", file_name, e);
+                    preprocess_text(raw_text, file_name, file_type)
+                })
+        } else {
+            // Fast / Standard: instant Rust preprocessor (no LLM)
+            let _ = status_tx.send(format!(
+                "⚡ [Preprocess] Structuring {}…", file_name
+            ));
+            preprocess_text(raw_text, file_name, file_type)
+        };
 
         // ── Step 2: Generate Gherkin ──
         let _ = status_tx.send(format!(
@@ -227,8 +272,9 @@ impl AgentOrchestrator {
         let context_summary = context.build_summary();
         let gherkin = self.generate(file_name, &summary, &context_summary, status_tx).await?;
 
-        // ── Step 3: Review / refine ──
-        if self.reviewer_client.is_some() {
+        // ── Step 3: Review / refine (Standard and Full modes only) ──
+        let do_review = self.mode != PipelineMode::Fast && self.reviewer_client.is_some();
+        if do_review {
             let _ = status_tx.send(format!(
                 "✅ [Reviewer] Validating Gherkin for {}…", file_name
             ));
@@ -333,6 +379,43 @@ impl AgentOrchestrator {
         )
         .await
     }
+}
+
+// ─────────────────────────────────────────────
+// Fast text preprocessor (no LLM)
+// ─────────────────────────────────────────────
+
+/// Instantly structure and truncate raw document text for the generator prompt.
+/// Replaces the slow LLM extractor in Fast and Standard modes.
+fn preprocess_text(raw_text: &str, file_name: &str, file_type: &str) -> String {
+    let lines: Vec<&str> = raw_text.lines().collect();
+    let total_lines = lines.len();
+
+    // Collect non-empty lines, trim whitespace
+    let meaningful: Vec<&str> = lines
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // Build a structured output
+    let mut result = format!(
+        "Document: {file_name}\nType: {file_type}\nTotal lines: {total_lines}\n\n"
+    );
+
+    // Take content up to the char limit
+    let mut chars_used = result.len();
+    for line in &meaningful {
+        if chars_used + line.len() + 1 > MAX_INPUT_CHARS {
+            result.push_str("\n[… content truncated …]\n");
+            break;
+        }
+        result.push_str(line);
+        result.push('\n');
+        chars_used += line.len() + 1;
+    }
+
+    result
 }
 
 // ─────────────────────────────────────────────

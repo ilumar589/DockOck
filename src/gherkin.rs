@@ -53,9 +53,7 @@ pub struct Scenario {
 pub struct GherkinDocument {
     pub feature_title: String,
     pub description: String,
-    pub scenarios: Vec<Scenario>,
-    /// Source file this document was generated from
-    pub source_file: String,
+    pub scenarios: Vec<Scenario>
 }
 
 impl GherkinDocument {
@@ -82,7 +80,7 @@ impl GherkinDocument {
     ///
     /// This is a best-effort parser – it handles the most common output shapes
     /// produced by instruction-tuned models without requiring perfect formatting.
-    pub fn parse_from_llm_output(raw: &str, source_file: &str) -> Self {
+    pub fn parse_from_llm_output(raw: &str, _source_file: &str) -> Self {
         let mut feature_title = String::from("Generated Feature");
         let mut description_lines: Vec<String> = Vec::new();
         let mut scenarios: Vec<Scenario> = Vec::new();
@@ -134,7 +132,6 @@ impl GherkinDocument {
             feature_title,
             description: description_lines.join("\n"),
             scenarios,
-            source_file: source_file.to_string(),
         }
     }
 }

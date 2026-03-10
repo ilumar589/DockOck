@@ -125,6 +125,8 @@ pub struct DockOckApp {
     show_log_panel: bool,
     /// Toast-style notification message and remaining display time
     toast: Option<(String, f32)>,
+    /// Pipeline mode: Fast (1 LLM call), Standard (2), Full (3)
+    pipeline_mode: crate::llm::PipelineMode,
 }
 
 impl DockOckApp {
@@ -145,6 +147,7 @@ impl DockOckApp {
             progress: (0, 0),
             show_log_panel: true,
             toast: None,
+            pipeline_mode: crate::llm::PipelineMode::default(),
         }
     }
 
@@ -266,10 +269,11 @@ impl DockOckApp {
         let context = Arc::clone(&self.context);
         let model = self.model_name.clone();
         let handle = self.runtime.clone();
+        let mode = self.pipeline_mode;
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
-            handle.block_on(process_files(files, context, model, tx));
+            handle.block_on(process_files(files, context, model, mode, tx));
         });
     }
 
@@ -367,6 +371,15 @@ impl DockOckApp {
             ui.separator();
             ui.label("Model:");
             ui.text_edit_singleline(&mut self.model_name);
+            ui.separator();
+            ui.label("Pipeline:");
+            egui::ComboBox::from_id_salt("pipeline_mode")
+                .selected_text(self.pipeline_mode.to_string())
+                .show_ui(ui, |ui| {
+                    for mode in crate::llm::PipelineMode::ALL {
+                        ui.selectable_value(&mut self.pipeline_mode, mode, mode.to_string());
+                    }
+                });
             ui.separator();
             ui.label("📁 Output:");
             if let Some(dir) = &self.output_dir {
@@ -679,6 +692,7 @@ async fn process_files(
     files: Vec<PathBuf>,
     context: Arc<Mutex<ProjectContext>>,
     model: String,
+    mode: crate::llm::PipelineMode,
     tx: Sender<ProcessingEvent>,
 ) {
     let total = files.len();
@@ -688,7 +702,7 @@ async fn process_files(
         "🔌 Probing Ollama instances…".to_string(),
     ));
 
-    let (orchestrator, statuses) = match crate::llm::AgentOrchestrator::new(&model).await {
+    let (orchestrator, statuses) = match crate::llm::AgentOrchestrator::new(&model, mode).await {
         Ok(pair) => pair,
         Err(e) => {
             let _ = tx.send(ProcessingEvent::Done(Err(e.to_string())));
