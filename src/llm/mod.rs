@@ -1,112 +1,433 @@
-//! LLM integration using `rig-core` with a local Ollama instance.
+//! Multi-agent LLM integration using `rig-core` with multiple local Ollama instances.
 //!
-//! The module wraps the rig-core `Agent` so the rest of the application only
-//! needs to call the high-level [`generate_gherkin`] function.
+//! ## Architecture
 //!
-//! ## Requirements
-//! A running Ollama instance is expected at `http://localhost:11434`.
-//! Start one with Docker Compose (see `docker-compose.yml`) or directly with
-//! `ollama serve`.
+//! Three specialised sub-agents run on separate Ollama instances:
+//!
+//! | Agent       | Port  | Responsibility                                      |
+//! |-------------|-------|-----------------------------------------------------|
+//! | Extractor   | 11435 | Distils raw document text into structured summaries  |
+//! | Generator   | 11434 | Converts structured content into Gherkin features    |
+//! | Reviewer    | 11436 | Validates / refines the generated Gherkin             |
+//!
+//! Files are parsed in parallel, then processed through the agent pipeline
+//! concurrently (up to `MAX_CONCURRENT` at a time).
+//!
+//! When fewer than 3 Ollama instances are available the orchestrator falls back
+//! to routing all work through whichever instance(s) *are* reachable.
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
+use rig::agent::{MultiTurnStreamItem, Text};
 use rig::client::{CompletionClient, Nothing};
-use rig::completion::Prompt;
 use rig::providers::ollama;
-use tokio;
+use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tracing::{info, warn};
 
 use crate::context::ProjectContext;
 
 /// Default model used when none is specified.
 pub const DEFAULT_MODEL: &str = "llama3.2";
 
-/// System preamble that instructs the model to generate Gherkin output.
-const SYSTEM_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
-Your task is to read extracted document content and produce well-structured Gherkin
+/// Maximum number of files processed through the LLM pipeline simultaneously.
+pub const MAX_CONCURRENT: usize = 3;
+
+/// Ollama instance definitions.
+#[derive(Debug, Clone)]
+pub struct OllamaEndpoint {
+    pub name: &'static str,
+    pub url: &'static str,
+    pub port: u16,
+}
+
+pub const ENDPOINT_GENERATOR: OllamaEndpoint = OllamaEndpoint {
+    name: "Generator",
+    url: "http://localhost:11434",
+    port: 11434,
+};
+
+pub const ENDPOINT_EXTRACTOR: OllamaEndpoint = OllamaEndpoint {
+    name: "Extractor",
+    url: "http://localhost:11435",
+    port: 11435,
+};
+
+pub const ENDPOINT_REVIEWER: OllamaEndpoint = OllamaEndpoint {
+    name: "Reviewer",
+    url: "http://localhost:11436",
+    port: 11436,
+};
+
+// ─────────────────────────────────────────────
+// Agent preambles
+// ─────────────────────────────────────────────
+
+const EXTRACTOR_PREAMBLE: &str = r#"You are an expert document analyst.
+Your task is to read raw extracted document content and produce a concise structured summary.
+
+Rules:
+1. Identify the key actors, systems, data entities, and processes described.
+2. List preconditions and postconditions for each process.
+3. Capture business rules and validation logic.
+4. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES.
+5. Be concise — no more than 300 words.
+6. Do not add conversational prose."#;
+
+const GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
+Your task is to read a structured document summary and produce well-structured Gherkin
 Feature documentation that can be used by OpenSpec to generate project implementations.
 
 Rules:
 1. Output ONLY valid Gherkin syntax starting with "Feature:".
-2. Create meaningful Scenarios that cover the key behaviours described in the document.
+2. Create meaningful Scenarios that cover the key behaviours described.
 3. Use concrete, business-readable language in steps.
 4. Where cross-file context is provided, reference other components or actors correctly.
 5. Do not add explanatory prose outside the Gherkin block.
 6. Always end with a blank line after the last Scenario."#;
 
-/// Generate a Gherkin feature document from the given `file_content` string.
-///
-/// `context` carries information extracted from all *other* files that have
-/// already been processed so that the model can produce consistent output
-/// across the whole project.
-///
-/// `model_name` overrides the default Ollama model if provided.
-pub async fn generate_gherkin(
-    file_name: &str,
-    file_type: &str,
-    file_content: &str,
-    context: &ProjectContext,
-    model_name: Option<&str>,
-) -> Result<String> {
-    let client = ollama::Client::new(Nothing)
-        .context("Failed to create Ollama client. Is Ollama running on port 11434?")?;
+const REVIEWER_PREAMBLE: &str = r#"You are a Gherkin quality reviewer.
+Your task is to review and improve a Gherkin Feature document.
 
-    let model = model_name.unwrap_or(DEFAULT_MODEL);
+Rules:
+1. Fix any Gherkin syntax errors (Feature/Scenario/Given/When/Then/And/But).
+2. Ensure scenarios are complete (have at least Given, When, Then).
+3. Improve step clarity and business readability where needed.
+4. Remove duplicate scenarios.
+5. Output ONLY the corrected Gherkin — no explanations.
+6. If the input is already good, return it unchanged."#;
 
-    let agent = client
-        .agent(model)
-        .preamble(SYSTEM_PREAMBLE)
-        .build();
+// ─────────────────────────────────────────────
+// Client creation
+// ─────────────────────────────────────────────
 
-    let context_summary = context.build_summary();
+fn create_client_for(endpoint: &OllamaEndpoint) -> Result<ollama::Client> {
+    ollama::Client::builder()
+        .api_key(Nothing)
+        .base_url(endpoint.url)
+        .build()
+        .with_context(|| format!(
+            "Failed to create Ollama client for {} at {}",
+            endpoint.name, endpoint.url
+        ))
+}
 
-    let prompt = format!(
-        r#"Convert the following {file_type} document content into a Gherkin Feature file.
+/// The orchestrator that owns clients for all reachable Ollama instances.
+pub struct AgentOrchestrator {
+    extractor_client: Option<ollama::Client>,
+    generator_client: ollama::Client,
+    reviewer_client: Option<ollama::Client>,
+    model: String,
+    pub semaphore: Arc<Semaphore>,
+}
 
-Document: {file_name}
+/// Result of checking which Ollama endpoints are reachable.
+#[derive(Debug, Clone)]
+pub struct EndpointStatus {
+    pub name: &'static str,
+    pub url: &'static str,
+    pub reachable: bool,
+}
 
-{context_section}
-=== Document Content ===
-{file_content}
+impl AgentOrchestrator {
+    /// Create the orchestrator, probing all endpoints.
+    /// At minimum the generator (port 11434) must be reachable.
+    pub async fn new(model: &str) -> Result<(Self, Vec<EndpointStatus>)> {
+        let mut statuses = Vec::new();
 
-Generate the Gherkin Feature below:"#,
-        file_type = file_type,
-        file_name = file_name,
-        context_section = if context_summary.contains("No prior files") {
+        // Check each endpoint
+        let gen_ok = check_endpoint(&ENDPOINT_GENERATOR).await;
+        statuses.push(EndpointStatus {
+            name: ENDPOINT_GENERATOR.name,
+            url: ENDPOINT_GENERATOR.url,
+            reachable: gen_ok,
+        });
+
+        let ext_ok = check_endpoint(&ENDPOINT_EXTRACTOR).await;
+        statuses.push(EndpointStatus {
+            name: ENDPOINT_EXTRACTOR.name,
+            url: ENDPOINT_EXTRACTOR.url,
+            reachable: ext_ok,
+        });
+
+        let rev_ok = check_endpoint(&ENDPOINT_REVIEWER).await;
+        statuses.push(EndpointStatus {
+            name: ENDPOINT_REVIEWER.name,
+            url: ENDPOINT_REVIEWER.url,
+            reachable: rev_ok,
+        });
+
+        if !gen_ok {
+            anyhow::bail!(
+                "Generator Ollama instance at {} is not reachable. \
+                 At minimum this instance must be running.",
+                ENDPOINT_GENERATOR.url
+            );
+        }
+
+        let generator_client = create_client_for(&ENDPOINT_GENERATOR)?;
+
+        let extractor_client = if ext_ok {
+            info!("Extractor agent available at {}", ENDPOINT_EXTRACTOR.url);
+            Some(create_client_for(&ENDPOINT_EXTRACTOR)?)
+        } else {
+            warn!("Extractor instance not available — generator will handle extraction");
+            None
+        };
+
+        let reviewer_client = if rev_ok {
+            info!("Reviewer agent available at {}", ENDPOINT_REVIEWER.url);
+            Some(create_client_for(&ENDPOINT_REVIEWER)?)
+        } else {
+            warn!("Reviewer instance not available — skipping review step");
+            None
+        };
+
+        let active_count = 1 + ext_ok as usize + rev_ok as usize;
+        let concurrency = MAX_CONCURRENT.max(active_count);
+
+        Ok((
+            Self {
+                extractor_client,
+                generator_client,
+                reviewer_client,
+                model: model.to_string(),
+                semaphore: Arc::new(Semaphore::new(concurrency)),
+            },
+            statuses,
+        ))
+    }
+
+    /// Run the full pipeline for one file: Extract → Generate → Review.
+    pub async fn process_file(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        raw_text: &str,
+        context: &ProjectContext,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        // ── Step 1: Extract structured summary ──
+        let _ = status_tx.send(format!(
+            "🔍 [Extractor] Analysing {}…", file_name
+        ));
+
+        let summary = self.extract(file_name, file_type, raw_text, status_tx).await
+            .unwrap_or_else(|e| {
+                warn!("Extraction failed for {}: {} — using raw text", file_name, e);
+                raw_text.to_string()
+            });
+
+        // ── Step 2: Generate Gherkin ──
+        let _ = status_tx.send(format!(
+            "⚙ [Generator] Creating Gherkin for {}…", file_name
+        ));
+
+        let context_summary = context.build_summary();
+        let gherkin = self.generate(file_name, &summary, &context_summary, status_tx).await?;
+
+        // ── Step 3: Review / refine ──
+        if self.reviewer_client.is_some() {
+            let _ = status_tx.send(format!(
+                "✅ [Reviewer] Validating Gherkin for {}…", file_name
+            ));
+            match self.review(file_name, &gherkin, status_tx).await {
+                Ok(refined) => Ok(refined),
+                Err(e) => {
+                    warn!("Review failed for {}: {} — using unreviewed output", file_name, e);
+                    Ok(gherkin)
+                }
+            }
+        } else {
+            Ok(gherkin)
+        }
+    }
+
+    async fn extract(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        raw_text: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        let client = self.extractor_client.as_ref().unwrap_or(&self.generator_client);
+        let agent = client.agent(&self.model).preamble(EXTRACTOR_PREAMBLE).build();
+
+        let prompt = format!(
+            "Analyse the following {file_type} document and produce a structured summary.\n\n\
+             Document: {file_name}\n\n\
+             === Document Content ===\n\
+             {raw_text}\n\n\
+             Structured summary:",
+        );
+
+        stream_with_progress(
+            &agent,
+            &prompt,
+            "Extractor",
+            file_name,
+            status_tx,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+    }
+
+    async fn generate(
+        &self,
+        file_name: &str,
+        summary: &str,
+        context_summary: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        let agent = self.generator_client.agent(&self.model).preamble(GENERATOR_PREAMBLE).build();
+
+        let context_section = if context_summary.contains("No prior files") {
             String::new()
         } else {
             format!("{}\n", context_summary)
-        },
-        file_content = file_content,
-    );
+        };
 
-    let response = agent
-        .prompt(prompt.as_str())
+        let prompt = format!(
+            "Convert the following structured document summary into a Gherkin Feature file.\n\n\
+             Document: {file_name}\n\n\
+             {context_section}\
+             === Structured Summary ===\n\
+             {summary}\n\n\
+             Generate the Gherkin Feature below:",
+        );
+
+        stream_with_progress(
+            &agent,
+            &prompt,
+            "Generator",
+            file_name,
+            status_tx,
+            std::time::Duration::from_secs(180),
+        )
         .await
-        .context("Failed to get response from Ollama LLM")?;
+    }
 
-    Ok(response)
+    async fn review(
+        &self,
+        file_name: &str,
+        gherkin: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        let client = self.reviewer_client.as_ref().unwrap_or(&self.generator_client);
+        let agent = client.agent(&self.model).preamble(REVIEWER_PREAMBLE).build();
+
+        let prompt = format!(
+            "Review and correct the following Gherkin Feature:\n\n\
+             {gherkin}\n\n\
+             Corrected Gherkin:",
+        );
+
+        stream_with_progress(
+            &agent,
+            &prompt,
+            "Reviewer",
+            file_name,
+            status_tx,
+            std::time::Duration::from_secs(120),
+        )
+        .await
+    }
 }
 
-/// Check whether the Ollama server is reachable.
-///
-/// Returns `Ok(())` on success or an error with a helpful message.
-pub async fn check_ollama_connection() -> Result<()> {
+// ─────────────────────────────────────────────
+// Streaming helper
+// ─────────────────────────────────────────────
+
+/// Stream a prompt to an agent, accumulating the full response text and sending
+/// periodic progress updates via `status_tx`.
+async fn stream_with_progress<M, P>(
+    agent: &rig::agent::Agent<M, P>,
+    prompt: &str,
+    stage_name: &str,
+    file_name: &str,
+    status_tx: &std::sync::mpsc::Sender<String>,
+    timeout: std::time::Duration,
+) -> Result<String>
+where
+    M: rig::completion::CompletionModel + 'static,
+    M::StreamingResponse: rig::completion::GetTokenUsage,
+    P: rig::agent::PromptHook<M> + 'static,
+{
+    let mut stream = tokio::time::timeout(timeout, agent.stream_prompt(prompt))
+        .await
+        .with_context(|| format!("{stage_name} timed out after {}s", timeout.as_secs()))?;
+
+    let mut accumulated = String::new();
+    let mut token_count: usize = 0;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(
+                StreamedAssistantContent::Text(Text { text }),
+            )) => {
+                accumulated.push_str(&text);
+                token_count += 1;
+                // Send progress every 20 tokens
+                if token_count % 20 == 0 {
+                    let _ = status_tx.send(format!(
+                        "🔄 [{stage_name}] {file_name}: {token_count} tokens…"
+                    ));
+                }
+            }
+            Ok(MultiTurnStreamItem::FinalResponse(_)) => {
+                break;
+            }
+            Err(e) => {
+                eprintln!("[{stage_name} STREAM ERROR] {file_name}: {e:?}");
+                anyhow::bail!("{stage_name} stream error for {file_name}: {e}");
+            }
+            _ => {}
+        }
+    }
+
+    if accumulated.is_empty() {
+        anyhow::bail!("{stage_name} returned empty response for {file_name}");
+    }
+
+    let _ = status_tx.send(format!(
+        "✓ [{stage_name}] {file_name}: done ({token_count} tokens, {} chars)",
+        accumulated.len()
+    ));
+
+    Ok(accumulated)
+}
+
+// ─────────────────────────────────────────────
+// Connection checks
+// ─────────────────────────────────────────────
+
+async fn check_endpoint(endpoint: &OllamaEndpoint) -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
 
-    tokio::task::spawn_blocking(|| {
+    let port = endpoint.port;
+    tokio::task::spawn_blocking(move || {
         TcpStream::connect_timeout(
-            &"127.0.0.1:11434"
+            &format!("127.0.0.1:{}", port)
                 .parse()
-                .expect("hardcoded address is always valid"),
-            Duration::from_secs(3),
+                .expect("valid address"),
+            Duration::from_secs(2),
         )
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!(
-            "Cannot reach Ollama at http://localhost:11434: {}. \
-             Make sure Ollama is running (see docker-compose.yml).",
-            e
-        ))
+        .is_ok()
     })
     .await
-    .context("Failed to spawn connection check")?
+    .unwrap_or(false)
+}
+
+/// Check whether the primary Ollama server is reachable.
+pub async fn check_ollama_connection() -> Result<()> {
+    if check_endpoint(&ENDPOINT_GENERATOR).await {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Cannot reach Ollama at {}. Make sure Ollama is running (see docker-compose.yml).",
+            ENDPOINT_GENERATOR.url
+        )
+    }
 }

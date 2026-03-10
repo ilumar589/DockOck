@@ -18,6 +18,9 @@ DockOck parses **Word** (`.docx`), **Excel** (`.xlsx`) and **Visio** (`.vsdx`) f
 | Local LLM | Runs 100 % locally via Ollama – no data leaves your machine |
 | Configurable model | Any model supported by Ollama can be used (default: `llama3.2`) |
 | One-click copy | Copy the generated `.feature` text to the clipboard |
+| Save to disk | Save individual or all `.feature` files to a chosen output directory |
+| Visual logging | Timestamped, colour-coded log panel with progress bar during processing |
+| Toast notifications | Brief on-screen confirmations for save and processing actions |
 
 ---
 
@@ -54,9 +57,11 @@ The first build downloads all Rust crates and may take a few minutes.
 1. Click **Check connection** to verify Ollama is reachable.
 2. Click **➕ Add Files** and select one or more `.docx`, `.xlsx`, or `.vsdx` files.
 3. Optionally change the **Model** name in the top bar (e.g. `mistral`, `llama3.1`).
-4. Click **⚙ Generate Gherkin**.
-5. Select any file in the left panel to view its generated `.feature` content.
-6. Click **📋 Copy** to copy the Gherkin to your clipboard for use with OpenSpec.
+4. Click **Browse…** next to **Output** in the top bar to choose where `.feature` files are saved.
+5. Click **⚙ Generate Gherkin**.
+6. Select any file in the left panel to view its generated `.feature` content.
+7. Click **📋 Copy** to copy to clipboard, or **💾 Save** / **💾 Save All** to write `.feature` files to disk.
+8. Toggle the **Log** panel in the bottom bar to see processing details.
 
 ---
 

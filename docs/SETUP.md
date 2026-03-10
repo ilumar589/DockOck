@@ -113,9 +113,8 @@ The default model is `llama3.2`. You can use any model supported by Ollama:
 
 ## 5. Using Generated Gherkin with OpenSpec
 
-1. In DockOck, after generating Gherkin, click **📋 Copy** for each file.
-2. Save the content to a `.feature` file (e.g. `my-feature.feature`).
-3. Open [OpenSpec](https://github.com/Fission-AI/OpenSpec) and import the `.feature` files.
+1. In DockOck, after generating Gherkin, click **� Save All** to write all `.feature` files to your chosen output directory. Alternatively, click **📋 Copy** to copy individual files to the clipboard.
+2. Open [OpenSpec](https://github.com/Fission-AI/OpenSpec) and import the `.feature` files.
 
 ---
 

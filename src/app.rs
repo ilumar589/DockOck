@@ -21,9 +21,48 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use tracing::{info, warn};
 
 use crate::context::ProjectContext;
 use crate::gherkin::GherkinDocument;
+
+/// A timestamped log entry.
+#[derive(Debug, Clone)]
+struct LogEntry {
+    timestamp: String,
+    message: String,
+    level: LogLevel,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LogLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl LogLevel {
+    fn color(&self) -> egui::Color32 {
+        match self {
+            Self::Info => egui::Color32::from_rgb(180, 180, 180),
+            Self::Success => egui::Color32::from_rgb(100, 200, 100),
+            Self::Warning => egui::Color32::from_rgb(230, 180, 60),
+            Self::Error => egui::Color32::from_rgb(230, 80, 80),
+        }
+    }
+}
+
+fn now_timestamp() -> String {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs() % 86400;
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
 
 // ─────────────────────────────────────────────
 // Events sent from background thread → UI
@@ -65,7 +104,7 @@ pub struct DockOckApp {
     /// Generated Gherkin documents keyed by file path
     results: HashMap<PathBuf, GherkinDocument>,
     /// Current status / log messages
-    status_messages: Vec<String>,
+    log_entries: Vec<LogEntry>,
     /// Current processing state
     state: AppState,
     /// Ollama status: None = not checked, Some(true) = reachable, Some(false) = unreachable
@@ -78,6 +117,14 @@ pub struct DockOckApp {
     context: Arc<Mutex<ProjectContext>>,
     /// Tokio runtime handle for spawning async tasks
     runtime: tokio::runtime::Handle,
+    /// User-selected output directory for saving .feature files
+    output_dir: Option<PathBuf>,
+    /// Processing progress: (files_completed, total_files)
+    progress: (usize, usize),
+    /// Whether the log panel is expanded
+    show_log_panel: bool,
+    /// Toast-style notification message and remaining display time
+    toast: Option<(String, f32)>,
 }
 
 impl DockOckApp {
@@ -87,20 +134,39 @@ impl DockOckApp {
             selected_files: Vec::new(),
             selected_index: None,
             results: HashMap::new(),
-            status_messages: Vec::new(),
+            log_entries: Vec::new(),
             state: AppState::Idle,
             ollama_ok: None,
             model_name: crate::llm::DEFAULT_MODEL.to_string(),
             event_rx: None,
             context: Arc::new(Mutex::new(ProjectContext::new())),
             runtime,
+            output_dir: None,
+            progress: (0, 0),
+            show_log_panel: true,
+            toast: None,
         }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
+    fn log(&mut self, level: LogLevel, msg: impl Into<String>) {
+        let message = msg.into();
+        match level {
+            LogLevel::Info => info!("{}", message),
+            LogLevel::Success => info!("{}", message),
+            LogLevel::Warning => warn!("{}", message),
+            LogLevel::Error => tracing::error!("{}", message),
+        }
+        self.log_entries.push(LogEntry {
+            timestamp: now_timestamp(),
+            message,
+            level,
+        });
+    }
+
     fn push_status(&mut self, msg: impl Into<String>) {
-        self.status_messages.push(msg.into());
+        self.log(LogLevel::Info, msg);
     }
 
     /// Open a multi-file dialog and append chosen files to the list.
@@ -126,12 +192,56 @@ impl DockOckApp {
     fn clear_all(&mut self) {
         self.selected_files.clear();
         self.results.clear();
-        self.status_messages.clear();
+        self.log_entries.clear();
         self.selected_index = None;
         self.state = AppState::Idle;
+        self.progress = (0, 0);
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
+    }
+
+    /// Save a single Gherkin document to the output directory.
+    fn save_feature_file(&mut self, path: &PathBuf, doc: &GherkinDocument) {
+        let dir = match &self.output_dir {
+            Some(d) => d.clone(),
+            None => {
+                self.log(LogLevel::Warning, "No output directory selected. Please choose one first.");
+                return;
+            }
+        };
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "output".to_string());
+        let out_path = dir.join(format!("{}.feature", stem));
+        match std::fs::write(&out_path, doc.to_feature_string()) {
+            Ok(()) => {
+                self.log(LogLevel::Success, format!("Saved: {}", out_path.display()));
+                self.toast = Some((format!("Saved {}.feature", stem), 3.0));
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, format!("Failed to save {}: {}", out_path.display(), e));
+            }
+        }
+    }
+
+    /// Save all generated feature files to the output directory.
+    fn save_all_feature_files(&mut self) {
+        if self.output_dir.is_none() {
+            self.log(LogLevel::Warning, "No output directory selected. Please choose one first.");
+            return;
+        }
+        let pairs: Vec<_> = self.results.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
+        if pairs.is_empty() {
+            self.log(LogLevel::Warning, "No generated Gherkin to save.");
+            return;
+        }
+        let count = pairs.len();
+        for (path, doc) in &pairs {
+            self.save_feature_file(path, doc);
+        }
+        self.log(LogLevel::Success, format!("Saved {} .feature file(s)", count));
     }
 
     /// Kick off background processing for all selected files.
@@ -143,7 +253,8 @@ impl DockOckApp {
 
         self.state = AppState::Processing;
         self.results.clear();
-        self.status_messages.clear();
+        self.log_entries.clear();
+        self.progress = (0, self.selected_files.len());
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -176,11 +287,14 @@ impl DockOckApp {
                     self.push_status(msg);
                 }
                 ProcessingEvent::FileResult { path, gherkin } => {
-                    self.push_status(format!(
-                        "✓ Generated Gherkin for: {}",
+                    self.progress.0 += 1;
+                    self.log(LogLevel::Success, format!(
+                        "✓ Generated Gherkin for: {} ({}/{})",
                         path.file_name()
                             .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                        self.progress.0,
+                        self.progress.1,
                     ));
                     self.results.insert(path, gherkin);
                 }
@@ -188,8 +302,14 @@ impl DockOckApp {
                     self.event_rx = None;
                     self.state = AppState::Done;
                     match result {
-                        Ok(()) => self.push_status("✅ All files processed successfully."),
-                        Err(e) => self.push_status(format!("❌ Processing failed: {}", e)),
+                        Ok(()) => {
+                            self.log(LogLevel::Success, format!(
+                                "✅ All {} files processed successfully.",
+                                self.progress.1
+                            ));
+                            self.toast = Some(("Processing complete!".to_string(), 4.0));
+                        }
+                        Err(e) => self.log(LogLevel::Error, format!("❌ Processing failed: {}", e)),
                     }
                 }
             }
@@ -247,6 +367,23 @@ impl DockOckApp {
             ui.separator();
             ui.label("Model:");
             ui.text_edit_singleline(&mut self.model_name);
+            ui.separator();
+            ui.label("📁 Output:");
+            if let Some(dir) = &self.output_dir {
+                let dir_display = dir.to_string_lossy();
+                ui.label(dir_display.as_ref()).on_hover_text(dir_display.as_ref());
+                if ui.small_button("✖").on_hover_text("Clear output directory").clicked() {
+                    self.output_dir = None;
+                }
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(180, 180, 60), "Not set");
+            }
+            if ui.button("Browse…").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.log(LogLevel::Info, format!("Output directory: {}", dir.display()));
+                    self.output_dir = Some(dir);
+                }
+            }
         });
     }
 
@@ -270,6 +407,16 @@ impl DockOckApp {
                 self.clear_all();
             }
         });
+
+        // Progress bar during processing
+        if self.state == AppState::Processing && self.progress.1 > 0 {
+            ui.add_space(4.0);
+            let fraction = self.progress.0 as f32 / self.progress.1 as f32;
+            let bar = egui::ProgressBar::new(fraction)
+                .text(format!("{}/{} files", self.progress.0, self.progress.1))
+                .animate(true);
+            ui.add(bar);
+        }
 
         ui.add_space(4.0);
 
@@ -305,7 +452,7 @@ impl DockOckApp {
                         resp.context_menu(|ui| {
                             if ui.button("Remove").clicked() {
                                 to_remove = Some(i);
-                                ui.close_menu();
+                                ui.close();
                             }
                         });
                     }
@@ -338,7 +485,29 @@ impl DockOckApp {
             Some(text) => {
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy").clicked() {
-                        ui.output_mut(|o| o.copied_text = text.clone());
+                        ui.ctx().copy_text(text.clone());
+                        self.toast = Some(("Copied to clipboard".to_string(), 2.0));
+                    }
+                    let can_save = self.output_dir.is_some();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("💾 Save"))
+                        .on_hover_text(if can_save { "Save this .feature file" } else { "Set output directory first" })
+                        .clicked()
+                    {
+                        if let Some(idx) = self.selected_index {
+                            if let Some(path) = self.selected_files.get(idx).cloned() {
+                                if let Some(doc) = self.results.get(&path).cloned() {
+                                    self.save_feature_file(&path, &doc);
+                                }
+                            }
+                        }
+                    }
+                    if ui
+                        .add_enabled(can_save && !self.results.is_empty(), egui::Button::new("💾 Save All"))
+                        .on_hover_text(if can_save { "Save all .feature files" } else { "Set output directory first" })
+                        .clicked()
+                    {
+                        self.save_all_feature_files();
                     }
                 });
                 ui.add_space(4.0);
@@ -386,16 +555,76 @@ impl DockOckApp {
 
             if is_processing {
                 ui.spinner();
-                ui.label("Processing…");
+                let pct = if self.progress.1 > 0 {
+                    (self.progress.0 as f32 / self.progress.1 as f32 * 100.0) as u32
+                } else {
+                    0
+                };
+                ui.label(format!("Processing… {}%", pct));
             }
 
             ui.separator();
 
-            // Show last few status messages
-            if let Some(msg) = self.status_messages.last() {
-                ui.label(msg);
+            // Toggle log panel
+            let log_label = if self.show_log_panel { "▼ Log" } else { "▶ Log" };
+            if ui.button(log_label).clicked() {
+                self.show_log_panel = !self.show_log_panel;
+            }
+
+            if !self.log_entries.is_empty() {
+                ui.label(format!("({} entries)", self.log_entries.len()));
+            }
+
+            ui.separator();
+
+            // Show last status message
+            if let Some(entry) = self.log_entries.last() {
+                ui.colored_label(entry.level.color(), &entry.message);
             }
         });
+    }
+
+    fn render_log_panel(&self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .id_salt("log_panel")
+            .stick_to_bottom(true)
+            .max_height(150.0)
+            .show(ui, |ui| {
+                for entry in &self.log_entries {
+                    ui.horizontal(|ui| {
+                        ui.monospace(
+                            egui::RichText::new(&entry.timestamp)
+                                .color(egui::Color32::from_rgb(120, 120, 120)),
+                        );
+                        ui.colored_label(entry.level.color(), &entry.message);
+                    });
+                }
+            });
+    }
+
+    fn render_toast(&mut self, ctx: &egui::Context) {
+        if let Some((msg, remaining)) = &mut self.toast {
+            egui::Area::new(egui::Id::new("toast_notification"))
+                .anchor(egui::Align2::CENTER_TOP, [0.0, 40.0])
+                .show(ctx, |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgba_premultiplied(40, 40, 40, 230))
+                        .corner_radius(8.0)
+                        .inner_margin(egui::Margin::same(12))
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(msg.as_str())
+                                    .color(egui::Color32::WHITE)
+                                    .size(14.0),
+                            );
+                        });
+                });
+            *remaining -= ctx.input(|i| i.unstable_dt);
+            if *remaining <= 0.0 {
+                self.toast = None;
+            }
+            ctx.request_repaint();
+        }
     }
 }
 
@@ -415,6 +644,15 @@ impl eframe::App for DockOckApp {
             self.render_bottom_bar(ui);
         });
 
+        if self.show_log_panel {
+            egui::TopBottomPanel::bottom("log_panel")
+                .resizable(true)
+                .default_height(120.0)
+                .show(ctx, |ui| {
+                    self.render_log_panel(ui);
+                });
+        }
+
         egui::SidePanel::left("left_panel")
             .resizable(true)
             .default_width(250.0)
@@ -425,6 +663,9 @@ impl eframe::App for DockOckApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_right_panel(ui);
         });
+
+        // Toast overlay
+        self.render_toast(ctx);
     }
 }
 
@@ -432,7 +673,8 @@ impl eframe::App for DockOckApp {
 // Background processing task
 // ─────────────────────────────────────────────
 
-/// Async task that parses all files, accumulates context, and generates Gherkin.
+/// Async task that parses all files in parallel, then runs them through the
+/// multi-agent pipeline (Extract → Generate → Review) concurrently.
 async fn process_files(
     files: Vec<PathBuf>,
     context: Arc<Mutex<ProjectContext>>,
@@ -441,84 +683,146 @@ async fn process_files(
 ) {
     let total = files.len();
 
-    for (i, path) in files.iter().enumerate() {
+    // ── Phase 0: Spin up the orchestrator and probe all Ollama instances ──
+    let _ = tx.send(ProcessingEvent::Status(
+        "🔌 Probing Ollama instances…".to_string(),
+    ));
+
+    let (orchestrator, statuses) = match crate::llm::AgentOrchestrator::new(&model).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            let _ = tx.send(ProcessingEvent::Done(Err(e.to_string())));
+            return;
+        }
+    };
+
+    for st in &statuses {
+        let symbol = if st.reachable { "●" } else { "○" };
+        let _ = tx.send(ProcessingEvent::Status(format!(
+            "{} {} ({}): {}",
+            symbol,
+            st.name,
+            st.url,
+            if st.reachable { "online" } else { "offline — will fallback" },
+        )));
+    }
+
+    let orchestrator = Arc::new(orchestrator);
+
+    // ── Phase 1: Parse ALL files in parallel (CPU/IO bound, no LLM) ──
+    let _ = tx.send(ProcessingEvent::Status(format!(
+        "📄 Parsing {} files in parallel…", total
+    )));
+
+    let mut parse_handles = Vec::with_capacity(total);
+    for path in &files {
+        let p = path.clone();
+        parse_handles.push(tokio::task::spawn_blocking(move || {
+            crate::parser::parse_file(&p).map(|r| (p, r.0, r.1))
+        }));
+    }
+
+    // Collect parsed results
+    let mut parsed_files: Vec<(PathBuf, String, String)> = Vec::with_capacity(total);
+    for handle in parse_handles {
+        match handle.await {
+            Ok(Ok((path, file_type, raw_text))) => {
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = tx.send(ProcessingEvent::Status(format!("📄 Parsed: {}", name)));
+
+                // Store in shared context
+                {
+                    let content = crate::context::FileContent {
+                        path: path.clone(),
+                        file_type: file_type.clone(),
+                        raw_text: raw_text.clone(),
+                    };
+                    if let Ok(mut ctx) = context.lock() {
+                        ctx.add_file(content);
+                    }
+                }
+
+                parsed_files.push((path, file_type, raw_text));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(ProcessingEvent::Status(format!("⚠ Parse error: {}", e)));
+            }
+            Err(e) => {
+                let _ = tx.send(ProcessingEvent::Status(format!("⚠ Parse task panicked: {}", e)));
+            }
+        }
+    }
+
+    let _ = tx.send(ProcessingEvent::Status(format!(
+        "✅ Parsed {}/{} files. Starting multi-agent pipeline…",
+        parsed_files.len(),
+        total
+    )));
+
+    // ── Phase 2: Run agent pipeline concurrently ──
+    // Take a snapshot of context now (after all files are parsed)
+    let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
+
+    let mut llm_handles = Vec::with_capacity(parsed_files.len());
+    for (path, file_type, raw_text) in parsed_files {
+        let orch = Arc::clone(&orchestrator);
+        let sem = Arc::clone(&orchestrator.semaphore);
+        let tx = tx.clone();
+        let ctx = ctx_snapshot.clone();
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string_lossy().to_string());
+            .unwrap_or_default();
 
-        let _ = tx.send(ProcessingEvent::Status(format!(
-            "Parsing {} ({}/{})",
-            file_name,
-            i + 1,
-            total
-        )));
+        let handle = tokio::spawn(async move {
+            // Acquire semaphore permit to limit concurrency
+            let _permit = sem.acquire().await;
 
-        // --- Parse the file (blocking I/O – run on thread pool) ---
-        let path_clone = path.clone();
-        let parse_result =
-            tokio::task::spawn_blocking(move || crate::parser::parse_file(&path_clone))
-                .await
-                .map_err(|e| e.to_string())
-                .and_then(|r| r.map_err(|e| e.to_string()));
+            // Create a status channel that wraps strings into ProcessingEvent::Status
+            let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
+            let tx_fwd = tx.clone();
+            // Spawn a small forwarder thread
+            let fwd = std::thread::spawn(move || {
+                while let Ok(msg) = status_rx.recv() {
+                    let _ = tx_fwd.send(ProcessingEvent::Status(msg));
+                }
+            });
 
-        let (file_type, raw_text) = match parse_result {
-            Ok(pair) => pair,
-            Err(e) => {
-                let _ = tx.send(ProcessingEvent::Status(format!(
-                    "⚠ Failed to parse {}: {}",
-                    file_name, e
-                )));
-                continue;
+            let result = orch
+                .process_file(&file_name, &file_type, &raw_text, &ctx, &status_tx)
+                .await;
+
+            drop(status_tx); // signal forwarder to stop
+            let _ = fwd.join();
+
+            match result {
+                Ok(raw_gherkin) => {
+                    let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                        &raw_gherkin,
+                        &file_name,
+                    );
+                    let _ = tx.send(ProcessingEvent::FileResult {
+                        path: path.clone(),
+                        gherkin: doc,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "⚠ Pipeline error for {}: {}",
+                        file_name, e
+                    )));
+                }
             }
-        };
+        });
 
-        // Store this file's content in the shared context
-        {
-            let content = crate::context::FileContent {
-                path: path.clone(),
-                file_type: file_type.clone(),
-                raw_text: raw_text.clone(),
-            };
-            if let Ok(mut ctx) = context.lock() {
-                ctx.add_file(content);
-            }
-        }
+        llm_handles.push(handle);
+    }
 
-        // --- Generate Gherkin via LLM ---
-        let _ = tx.send(ProcessingEvent::Status(format!(
-            "Generating Gherkin for {} via Ollama…",
-            file_name
-        )));
-
-        let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
-        let llm_result = crate::llm::generate_gherkin(
-            &file_name,
-            &file_type,
-            &raw_text,
-            &ctx_snapshot,
-            Some(&model),
-        )
-        .await;
-
-        match llm_result {
-            Ok(raw_gherkin) => {
-                let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
-                    &raw_gherkin,
-                    &file_name,
-                );
-                let _ = tx.send(ProcessingEvent::FileResult {
-                    path: path.clone(),
-                    gherkin: doc,
-                });
-            }
-            Err(e) => {
-                let _ = tx.send(ProcessingEvent::Status(format!(
-                    "⚠ LLM error for {}: {}",
-                    file_name, e
-                )));
-            }
-        }
+    // Wait for all LLM tasks to complete
+    for handle in llm_handles {
+        let _ = handle.await;
     }
 
     let _ = tx.send(ProcessingEvent::Done(Ok(())));
