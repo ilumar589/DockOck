@@ -23,8 +23,9 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 use tracing::{info, warn};
 
-use crate::context::ProjectContext;
+use crate::context::{FileGroup, ProjectContext};
 use crate::gherkin::GherkinDocument;
+use std::collections::HashSet;
 
 /// A timestamped log entry.
 #[derive(Debug, Clone)]
@@ -113,11 +114,17 @@ fn model_combo(ui: &mut egui::Ui, id: &str, model: &mut String) {
 pub enum ProcessingEvent {
     /// Progress update message
     Status(String),
-    /// A file has started LLM processing (used to animate the progress bar)
+    /// A file/group has started LLM processing (used to animate the progress bar)
     FileStarted(PathBuf),
     /// A single file has been fully processed
     FileResult {
         path: PathBuf,
+        gherkin: GherkinDocument,
+        elapsed: std::time::Duration,
+    },
+    /// A group of files has been fully processed
+    GroupResult {
+        group_name: String,
         gherkin: GherkinDocument,
         elapsed: std::time::Duration,
     },
@@ -138,16 +145,29 @@ enum AppState {
     Done,
 }
 
+/// Identifies what is currently selected in the left panel.
+#[derive(Debug, Clone, PartialEq)]
+enum Selection {
+    /// An individual (ungrouped) file by index in `selected_files`
+    File(usize),
+    /// A file group by name
+    Group(String),
+}
+
 /// Main application state owned by the egui event loop.
 pub struct DockOckApp {
     /// Files selected by the user
     selected_files: Vec<PathBuf>,
-    /// Index into `selected_files` for the currently displayed result
-    selected_index: Option<usize>,
+    /// What is currently selected in the left panel
+    selection: Option<Selection>,
     /// Generated Gherkin documents keyed by file path
     results: HashMap<PathBuf, GherkinDocument>,
+    /// Generated Gherkin documents for file groups, keyed by group name
+    group_results: HashMap<String, GherkinDocument>,
     /// Elapsed generation time per file
     elapsed_times: HashMap<PathBuf, std::time::Duration>,
+    /// Elapsed generation time per group
+    group_elapsed_times: HashMap<String, std::time::Duration>,
     /// Current status / log messages
     log_entries: Vec<LogEntry>,
     /// Current processing state
@@ -170,9 +190,9 @@ pub struct DockOckApp {
     runtime: tokio::runtime::Handle,
     /// User-selected output directory for saving .feature files
     output_dir: Option<PathBuf>,
-    /// Processing progress: (files_completed, total_files)
+    /// Processing progress: (items_completed, total_items) — items = groups + ungrouped files
     progress: (usize, usize),
-    /// Number of files that have started LLM processing (for sub-unit progress)
+    /// Number of items that have started LLM processing (for sub-unit progress)
     files_started: usize,
     /// Whether the log panel is expanded
     show_log_panel: bool,
@@ -180,6 +200,14 @@ pub struct DockOckApp {
     toast: Option<(String, f32)>,
     /// Pipeline mode: Fast (1 LLM call), Standard (2), Full (3)
     pipeline_mode: crate::llm::PipelineMode,
+    /// Whether auto-grouping by file stem is enabled
+    auto_group_enabled: bool,
+    /// File groups (auto-detected + manual)
+    file_groups: Vec<FileGroup>,
+    /// Name buffer for creating a new group
+    new_group_name: String,
+    /// Whether the new-group input is shown
+    show_new_group_input: bool,
 }
 
 impl DockOckApp {
@@ -187,9 +215,11 @@ impl DockOckApp {
     pub fn new(runtime: tokio::runtime::Handle, _cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             selected_files: Vec::new(),
-            selected_index: None,
+            selection: None,
             results: HashMap::new(),
+            group_results: HashMap::new(),
             elapsed_times: HashMap::new(),
+            group_elapsed_times: HashMap::new(),
             log_entries: Vec::new(),
             state: AppState::Idle,
             ollama_ok: None,
@@ -206,7 +236,48 @@ impl DockOckApp {
             show_log_panel: true,
             toast: None,
             pipeline_mode: crate::llm::PipelineMode::default(),
+            auto_group_enabled: true,
+            file_groups: Vec::new(),
+            new_group_name: String::new(),
+            show_new_group_input: false,
         }
+    }
+
+    /// Recompute file groups.  Auto-groups are rebuilt from scratch; manual groups
+    /// are preserved but stale members (files no longer in the selection) are pruned.
+    fn recompute_groups(&mut self) {
+        if self.auto_group_enabled {
+            // Preserve manual groups (names that have no auto equivalent)
+            let auto = crate::context::compute_auto_groups(&self.selected_files);
+            let auto_names: HashSet<&str> = auto.iter().map(|g| g.name.as_str()).collect();
+
+            // Keep manual groups that don't collide with auto names
+            let manual: Vec<FileGroup> = self
+                .file_groups
+                .iter()
+                .filter(|g| !auto_names.contains(g.name.as_str()))
+                .cloned()
+                .collect();
+
+            self.file_groups = auto;
+            self.file_groups.extend(manual);
+        }
+
+        // Prune members that are no longer in selected_files
+        let selected_set: HashSet<PathBuf> = self.selected_files.iter().cloned().collect();
+        for group in &mut self.file_groups {
+            group.members.retain(|m| selected_set.contains(m));
+        }
+        // Remove empty auto-groups (keep manual ones so the user can still add files)
+        self.file_groups.retain(|g| g.manual || !g.members.is_empty());
+    }
+
+    /// Return the set of file paths that belong to any group.
+    fn grouped_paths(&self) -> HashSet<PathBuf> {
+        self.file_groups
+            .iter()
+            .flat_map(|g| g.members.iter().cloned())
+            .collect()
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -246,6 +317,7 @@ impl DockOckApp {
                     self.selected_files.push(p);
                 }
             }
+            self.recompute_groups();
         }
     }
 
@@ -253,12 +325,15 @@ impl DockOckApp {
     fn clear_all(&mut self) {
         self.selected_files.clear();
         self.results.clear();
+        self.group_results.clear();
         self.elapsed_times.clear();
+        self.group_elapsed_times.clear();
         self.log_entries.clear();
-        self.selected_index = None;
+        self.selection = None;
         self.state = AppState::Idle;
         self.progress = (0, 0);
         self.files_started = 0;
+        self.file_groups.clear();
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -296,15 +371,40 @@ impl DockOckApp {
             return;
         }
         let pairs: Vec<_> = self.results.iter().map(|(p, d)| (p.clone(), d.clone())).collect();
-        if pairs.is_empty() {
+        let group_pairs: Vec<_> = self.group_results.iter().map(|(n, d)| (n.clone(), d.clone())).collect();
+        if pairs.is_empty() && group_pairs.is_empty() {
             self.log(LogLevel::Warning, "No generated Gherkin to save.");
             return;
         }
-        let count = pairs.len();
+        let count = pairs.len() + group_pairs.len();
         for (path, doc) in &pairs {
             self.save_feature_file(path, doc);
         }
+        for (name, doc) in &group_pairs {
+            self.save_group_feature_file(name, doc);
+        }
         self.log(LogLevel::Success, format!("Saved {} .feature file(s)", count));
+    }
+
+    /// Save a group's merged Gherkin document to the output directory.
+    fn save_group_feature_file(&mut self, group_name: &str, doc: &GherkinDocument) {
+        let dir = match &self.output_dir {
+            Some(d) => d.clone(),
+            None => {
+                self.log(LogLevel::Warning, "No output directory selected. Please choose one first.");
+                return;
+            }
+        };
+        let out_path = dir.join(format!("{}.feature", group_name));
+        match std::fs::write(&out_path, doc.to_feature_string()) {
+            Ok(()) => {
+                self.log(LogLevel::Success, format!("Saved: {}", out_path.display()));
+                self.toast = Some((format!("Saved {}.feature", group_name), 3.0));
+            }
+            Err(e) => {
+                self.log(LogLevel::Error, format!("Failed to save {}: {}", out_path.display(), e));
+            }
+        }
     }
 
     /// Kick off background processing for all selected files.
@@ -316,9 +416,21 @@ impl DockOckApp {
 
         self.state = AppState::Processing;
         self.results.clear();
+        self.group_results.clear();
         self.elapsed_times.clear();
+        self.group_elapsed_times.clear();
         self.log_entries.clear();
-        self.progress = (0, self.selected_files.len());
+
+        // Count work items: each group counts as 1, each ungrouped file counts as 1
+        let grouped = self.grouped_paths();
+        let ungrouped_count = self
+            .selected_files
+            .iter()
+            .filter(|p| !grouped.contains(*p))
+            .count();
+        let total_items = self.file_groups.len() + ungrouped_count;
+
+        self.progress = (0, total_items);
         self.files_started = 0;
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
@@ -328,6 +440,7 @@ impl DockOckApp {
         self.event_rx = Some(rx);
 
         let files = self.selected_files.clone();
+        let groups = self.file_groups.clone();
         let context = Arc::clone(&self.context);
         let gen_model = self.generator_model.clone();
         let ext_model = self.extractor_model.clone();
@@ -338,7 +451,9 @@ impl DockOckApp {
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
-            handle.block_on(process_files(files, context, gen_model, ext_model, rev_model, vis_model, mode, tx));
+            handle.block_on(process_files(
+                files, groups, context, gen_model, ext_model, rev_model, vis_model, mode, tx,
+            ));
         });
     }
 
@@ -377,6 +492,24 @@ impl DockOckApp {
                     ));
                     self.elapsed_times.insert(path.clone(), elapsed);
                     self.results.insert(path, gherkin);
+                }
+                ProcessingEvent::GroupResult { group_name, gherkin, elapsed } => {
+                    self.progress.0 += 1;
+                    let secs = elapsed.as_secs_f64();
+                    let elapsed_str = if secs >= 60.0 {
+                        format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                    } else {
+                        format!("{:.1}s", secs)
+                    };
+                    self.log(LogLevel::Success, format!(
+                        "✓ Generated Gherkin for group: {} ({}/{}) in {}",
+                        group_name,
+                        self.progress.0,
+                        self.progress.1,
+                        elapsed_str,
+                    ));
+                    self.group_elapsed_times.insert(group_name.clone(), elapsed);
+                    self.group_results.insert(group_name, gherkin);
                 }
                 ProcessingEvent::Done(result) => {
                     self.event_rx = None;
@@ -489,6 +622,7 @@ impl DockOckApp {
 
         let is_processing = self.state == AppState::Processing;
 
+        // ── Toolbar ──
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(!is_processing, egui::Button::new("➕ Add Files"))
@@ -502,32 +636,172 @@ impl DockOckApp {
             {
                 self.clear_all();
             }
+            if ui
+                .add_enabled(!is_processing, egui::Button::new("📎 New Group"))
+                .clicked()
+            {
+                self.show_new_group_input = !self.show_new_group_input;
+                self.new_group_name.clear();
+            }
         });
+
+        // Auto-group toggle
+        ui.horizontal(|ui| {
+            let prev = self.auto_group_enabled;
+            ui.checkbox(&mut self.auto_group_enabled, "Auto-group by name");
+            if self.auto_group_enabled != prev {
+                self.recompute_groups();
+            }
+        });
+
+        // New group name input
+        if self.show_new_group_input && !is_processing {
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut self.new_group_name);
+                if ui.button("✔").clicked() && !self.new_group_name.trim().is_empty() {
+                    let name = self.new_group_name.trim().to_string();
+                    if !self.file_groups.iter().any(|g| g.name == name) {
+                        self.file_groups.push(FileGroup {
+                            name,
+                            members: Vec::new(),
+                            manual: true,
+                        });
+                    }
+                    self.new_group_name.clear();
+                    self.show_new_group_input = false;
+                }
+                if ui.button("✖").clicked() {
+                    self.show_new_group_input = false;
+                    self.new_group_name.clear();
+                }
+            });
+        }
 
         // Progress bar during processing
         if self.state == AppState::Processing && self.progress.1 > 0 {
             ui.add_space(4.0);
-            // Each file contributes 1 unit when complete and 0.5 when started.
-            // This ensures the bar is non-zero as soon as LLM processing begins.
             let completed = self.progress.0 as f32;
             let started = self.files_started.saturating_sub(self.progress.0) as f32;
             let total = self.progress.1 as f32;
             let fraction = ((completed + started * 0.5) / total).clamp(0.0, 1.0);
             let bar = egui::ProgressBar::new(fraction)
-                .text(format!("{}/{} files", self.progress.0, self.progress.1))
+                .text(format!("{}/{} items", self.progress.0, self.progress.1))
                 .animate(true);
             ui.add(bar);
         }
 
         ui.add_space(4.0);
 
+        // ── File list with groups ──
+        let grouped_paths = self.grouped_paths();
+        let group_names: Vec<String> = self.file_groups.iter().map(|g| g.name.clone()).collect();
+
         egui::ScrollArea::vertical()
             .id_salt("file_list")
             .max_height(ui.available_height() - 60.0)
             .show(ui, |ui| {
-                let mut to_remove: Option<usize> = None;
+                // Deferred actions to apply after iteration
+                let mut remove_file: Option<usize> = None;
+                let mut remove_from_group: Option<(usize, usize)> = None; // (group_idx, member_idx)
+                let mut delete_group: Option<usize> = None;
+                let mut move_to_group: Option<(PathBuf, usize)> = None; // (path, group_idx)
+
+                // ── Render groups ──
+                for (gi, group) in self.file_groups.iter().enumerate() {
+                    let group_selected = self.selection == Some(Selection::Group(group.name.clone()));
+                    let has_group_result = self.group_results.contains_key(&group.name);
+
+                    let header_label = if has_group_result {
+                        if let Some(dur) = self.group_elapsed_times.get(&group.name) {
+                            let secs = dur.as_secs_f64();
+                            let elapsed_str = if secs >= 60.0 {
+                                format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                            } else {
+                                format!("{:.1}s", secs)
+                            };
+                            format!("✓ 📎 {} ({} files) ({})", group.name, group.members.len(), elapsed_str)
+                        } else {
+                            format!("✓ 📎 {} ({} files)", group.name, group.members.len())
+                        }
+                    } else {
+                        format!("📎 {} ({} files)", group.name, group.members.len())
+                    };
+
+                    let id = ui.make_persistent_id(format!("group_{}", gi));
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        id,
+                        true,
+                    )
+                    .show_header(ui, |ui| {
+                        let resp = ui.selectable_label(group_selected, &header_label);
+                        if resp.clicked() {
+                            self.selection = Some(Selection::Group(group.name.clone()));
+                        }
+                        if !is_processing {
+                            if ui.small_button("✖").on_hover_text("Delete group").clicked() {
+                                delete_group = Some(gi);
+                            }
+                        }
+                    })
+                    .body(|ui| {
+                        for (mi, member) in group.members.iter().enumerate() {
+                            let name = member
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_default();
+                            ui.horizontal(|ui| {
+                                ui.label(format!("   {}", name));
+                                if !is_processing {
+                                    if ui.small_button("✖").on_hover_text("Remove from group").clicked() {
+                                        remove_from_group = Some((gi, mi));
+                                    }
+                                }
+                            });
+                        }
+                        // ── Add file to group button ──
+                        if !is_processing {
+                            let ungrouped: Vec<(PathBuf, String)> = self
+                                .selected_files
+                                .iter()
+                                .filter(|p| !grouped_paths.contains(*p))
+                                .map(|p| {
+                                    let n = p
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| p.to_string_lossy().to_string());
+                                    (p.clone(), n)
+                                })
+                                .collect();
+                            if !ungrouped.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(12.0);
+                                    ui.menu_button("➕ Add file…", |ui| {
+                                        for (path, fname) in &ungrouped {
+                                            if ui.button(fname).clicked() {
+                                                move_to_group = Some((path.clone(), gi));
+                                                ui.close();
+                                            }
+                                        }
+                                    });
+                                });
+                            }
+                        }
+                    });
+                }
+
+                // ── Render ungrouped files ──
+                if self.selected_files.iter().any(|p| !grouped_paths.contains(p)) {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Ungrouped").italics());
+                }
 
                 for (i, path) in self.selected_files.iter().enumerate() {
+                    if grouped_paths.contains(path) {
+                        continue;
+                    }
                     let name = path
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -550,32 +824,79 @@ impl DockOckApp {
                         name.clone()
                     };
 
-                    let selected = self.selected_index == Some(i);
+                    let selected = self.selection == Some(Selection::File(i));
                     let resp = ui
                         .selectable_label(selected, &label)
                         .on_hover_text(path.to_string_lossy().as_ref());
 
                     if resp.clicked() {
-                        self.selected_index = Some(i);
+                        self.selection = Some(Selection::File(i));
                     }
 
                     if !is_processing {
                         resp.context_menu(|ui| {
                             if ui.button("Remove").clicked() {
-                                to_remove = Some(i);
+                                remove_file = Some(i);
                                 ui.close();
+                            }
+                            if !group_names.is_empty() {
+                                ui.menu_button("Move to group…", |ui| {
+                                    for (gi, gname) in group_names.iter().enumerate() {
+                                        if ui.button(gname).clicked() {
+                                            move_to_group = Some((path.clone(), gi));
+                                            ui.close();
+                                        }
+                                    }
+                                });
                             }
                         });
                     }
                 }
 
-                if let Some(idx) = to_remove {
+                // ── Apply deferred mutations ──
+                if let Some(idx) = remove_file {
                     let path = self.selected_files.remove(idx);
                     self.results.remove(&path);
                     self.elapsed_times.remove(&path);
-                    if self.selected_index == Some(idx) {
-                        self.selected_index = None;
+                    if self.selection == Some(Selection::File(idx)) {
+                        self.selection = None;
                     }
+                    self.recompute_groups();
+                }
+
+                if let Some((gi, mi)) = remove_from_group {
+                    if let Some(group) = self.file_groups.get_mut(gi) {
+                        group.members.remove(mi);
+                        if group.members.is_empty() && !group.manual {
+                            self.file_groups.remove(gi);
+                        }
+                    }
+                }
+
+                if let Some(gi) = delete_group {
+                    if gi < self.file_groups.len() {
+                        let removed_name = self.file_groups[gi].name.clone();
+                        self.file_groups.remove(gi);
+                        self.group_results.remove(&removed_name);
+                        self.group_elapsed_times.remove(&removed_name);
+                        if self.selection == Some(Selection::Group(removed_name)) {
+                            self.selection = None;
+                        }
+                    }
+                }
+
+                if let Some((path, gi)) = move_to_group {
+                    // Remove from any existing group first
+                    for group in &mut self.file_groups {
+                        group.members.retain(|m| m != &path);
+                    }
+                    if let Some(group) = self.file_groups.get_mut(gi) {
+                        if !group.members.contains(&path) {
+                            group.members.push(path);
+                        }
+                    }
+                    // Remove empty auto-groups (keep manual ones)
+                    self.file_groups.retain(|g| g.manual || !g.members.is_empty());
                 }
             });
     }
@@ -584,13 +905,17 @@ impl DockOckApp {
         ui.heading("📝 Gherkin Output");
         ui.separator();
 
-        let content = if let Some(idx) = self.selected_index {
-            self.selected_files
-                .get(idx)
+        let content = match &self.selection {
+            Some(Selection::File(idx)) => self
+                .selected_files
+                .get(*idx)
                 .and_then(|p| self.results.get(p))
-                .map(|doc| doc.to_feature_string())
-        } else {
-            None
+                .map(|doc| doc.to_feature_string()),
+            Some(Selection::Group(name)) => self
+                .group_results
+                .get(name)
+                .map(|doc| doc.to_feature_string()),
+            None => None,
         };
 
         match content {
@@ -606,16 +931,25 @@ impl DockOckApp {
                         .on_hover_text(if can_save { "Save this .feature file" } else { "Set output directory first" })
                         .clicked()
                     {
-                        if let Some(idx) = self.selected_index {
-                            if let Some(path) = self.selected_files.get(idx).cloned() {
-                                if let Some(doc) = self.results.get(&path).cloned() {
-                                    self.save_feature_file(&path, &doc);
+                        match &self.selection {
+                            Some(Selection::File(idx)) => {
+                                if let Some(path) = self.selected_files.get(*idx).cloned() {
+                                    if let Some(doc) = self.results.get(&path).cloned() {
+                                        self.save_feature_file(&path, &doc);
+                                    }
                                 }
                             }
+                            Some(Selection::Group(name)) => {
+                                if let Some(doc) = self.group_results.get(name).cloned() {
+                                    let name = name.clone();
+                                    self.save_group_feature_file(&name, &doc);
+                                }
+                            }
+                            None => {}
                         }
                     }
                     if ui
-                        .add_enabled(can_save && !self.results.is_empty(), egui::Button::new("💾 Save All"))
+                        .add_enabled(can_save && (!self.results.is_empty() || !self.group_results.is_empty()), egui::Button::new("💾 Save All"))
                         .on_hover_text(if can_save { "Save all .feature files" } else { "Set output directory first" })
                         .clicked()
                     {
@@ -790,8 +1124,10 @@ impl eframe::App for DockOckApp {
 
 /// Async task that parses all files in parallel, then runs them through the
 /// multi-agent pipeline (Extract → Generate → Review) concurrently.
+/// Groups of related files produce a single merged Gherkin output each.
 async fn process_files(
     files: Vec<PathBuf>,
+    groups: Vec<FileGroup>,
     context: Arc<Mutex<ProjectContext>>,
     generator_model: String,
     extractor_model: String,
@@ -847,8 +1183,9 @@ async fn process_files(
         }));
     }
 
-    // Collect parsed results
-    let mut parsed_files: Vec<(PathBuf, String, String, Vec<crate::parser::ExtractedImage>)> = Vec::with_capacity(total);
+    // Collect parsed results into a lookup
+    let mut parsed_map: HashMap<PathBuf, (String, String, Vec<crate::parser::ExtractedImage>)> =
+        HashMap::new();
     for handle in parse_handles {
         match handle.await {
             Ok(Ok((path, result))) => {
@@ -872,7 +1209,7 @@ async fn process_files(
                     }
                 }
 
-                parsed_files.push((path, result.file_type, result.text, result.images));
+                parsed_map.insert(path, (result.file_type, result.text, result.images));
             }
             Ok(Err(e)) => {
                 let _ = tx.send(ProcessingEvent::Status(format!("⚠ Parse error: {}", e)));
@@ -885,16 +1222,162 @@ async fn process_files(
 
     let _ = tx.send(ProcessingEvent::Status(format!(
         "✅ Parsed {}/{} files. Starting multi-agent pipeline…",
-        parsed_files.len(),
+        parsed_map.len(),
         total
     )));
 
-    // ── Phase 2: Run agent pipeline concurrently ──
+    // ── Phase 1.5: Build work items (groups vs ungrouped singles) ──
+    let grouped_paths: std::collections::HashSet<PathBuf> = groups
+        .iter()
+        .flat_map(|g| g.members.iter().cloned())
+        .collect();
+
     // Take a snapshot of context now (after all files are parsed)
     let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
 
-    let mut llm_handles = Vec::with_capacity(parsed_files.len());
-    for (path, file_type, raw_text, images) in parsed_files {
+    let mut llm_handles = Vec::new();
+
+    // ── Dispatch group work items ──
+    for group in &groups {
+        // Collect parsed data for each member
+        let mut members_data: Vec<(String, String, String, Vec<crate::parser::ExtractedImage>)> =
+            Vec::new();
+        for member_path in &group.members {
+            if let Some((file_type, text, images)) = parsed_map.get(member_path) {
+                let fname = member_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                members_data.push((fname, file_type.clone(), text.clone(), images.clone()));
+            }
+        }
+
+        if members_data.is_empty() {
+            continue;
+        }
+
+        // If group has only 1 member, treat as a single file
+        if members_data.len() == 1 {
+            let member_path = group.members[0].clone();
+            let (file_name, file_type, raw_text, images) = members_data.into_iter().next().unwrap();
+            let orch = Arc::clone(&orchestrator);
+            let sem = Arc::clone(&orchestrator.semaphore);
+            let tx = tx.clone();
+            let ctx = ctx_snapshot.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
+                let file_start = std::time::Instant::now();
+
+                let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
+                let tx_fwd = tx.clone();
+                let fwd = std::thread::spawn(move || {
+                    while let Ok(msg) = status_rx.recv() {
+                        let _ = tx_fwd.send(ProcessingEvent::Status(msg));
+                    }
+                });
+
+                let result = orch
+                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx)
+                    .await;
+
+                drop(status_tx);
+                let _ = fwd.join();
+
+                let elapsed = file_start.elapsed();
+                match result {
+                    Ok(raw_gherkin) => {
+                        let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                            &raw_gherkin,
+                            &file_name,
+                        );
+                        let _ = tx.send(ProcessingEvent::FileResult {
+                            path: member_path,
+                            gherkin: doc,
+                            elapsed,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Pipeline error for {}: {}",
+                            file_name, e
+                        )));
+                    }
+                }
+            });
+            llm_handles.push(handle);
+            continue;
+        }
+
+        let group_name = group.name.clone();
+        let member_paths = group.members.clone();
+        let orch = Arc::clone(&orchestrator);
+        let sem = Arc::clone(&orchestrator.semaphore);
+        let tx = tx.clone();
+        let ctx = ctx_snapshot.clone();
+
+        let handle = tokio::spawn(async move {
+            let _permit = sem.acquire().await;
+
+            // Use the first member path for FileStarted signal
+            if let Some(first) = member_paths.first() {
+                let _ = tx.send(ProcessingEvent::FileStarted(first.clone()));
+            }
+            let group_start = std::time::Instant::now();
+
+            let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
+            let tx_fwd = tx.clone();
+            let fwd = std::thread::spawn(move || {
+                while let Ok(msg) = status_rx.recv() {
+                    let _ = tx_fwd.send(ProcessingEvent::Status(msg));
+                }
+            });
+
+            let members_ref: Vec<(String, String, String, Vec<crate::parser::ExtractedImage>)> =
+                members_data;
+
+            let result = orch
+                .process_group(&group_name, &members_ref, &ctx, &status_tx)
+                .await;
+
+            drop(status_tx);
+            let _ = fwd.join();
+
+            let elapsed = group_start.elapsed();
+            match result {
+                Ok(raw_gherkin) => {
+                    let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                        &raw_gherkin,
+                        &group_name,
+                    );
+                    let _ = tx.send(ProcessingEvent::GroupResult {
+                        group_name,
+                        gherkin: doc,
+                        elapsed,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "⚠ Pipeline error for group {}: {}",
+                        group_name, e
+                    )));
+                }
+            }
+        });
+        llm_handles.push(handle);
+    }
+
+    // ── Dispatch ungrouped single-file work items ──
+    for (path, (file_type, raw_text, images)) in &parsed_map {
+        if grouped_paths.contains(path) {
+            continue;
+        }
+
+        let path = path.clone();
+        let file_type = file_type.clone();
+        let raw_text = raw_text.clone();
+        let images = images.clone();
         let orch = Arc::clone(&orchestrator);
         let sem = Arc::clone(&orchestrator.semaphore);
         let tx = tx.clone();
@@ -905,17 +1388,12 @@ async fn process_files(
             .unwrap_or_default();
 
         let handle = tokio::spawn(async move {
-            // Acquire semaphore permit to limit concurrency
             let _permit = sem.acquire().await;
-
-            // Signal the UI that this file has started LLM processing
             let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
             let file_start = std::time::Instant::now();
 
-            // Create a status channel that wraps strings into ProcessingEvent::Status
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();
-            // Spawn a small forwarder thread
             let fwd = std::thread::spawn(move || {
                 while let Ok(msg) = status_rx.recv() {
                     let _ = tx_fwd.send(ProcessingEvent::Status(msg));
@@ -926,11 +1404,10 @@ async fn process_files(
                 .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx)
                 .await;
 
-            drop(status_tx); // signal forwarder to stop
+            drop(status_tx);
             let _ = fwd.join();
 
             let file_elapsed = file_start.elapsed();
-
             match result {
                 Ok(raw_gherkin) => {
                     let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(

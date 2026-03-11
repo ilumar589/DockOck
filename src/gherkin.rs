@@ -57,6 +57,7 @@ pub struct GherkinDocument {
     pub description: String,
     pub scenarios: Vec<Scenario>,
     /// The file that was the source of this document (e.g. `"D028.docx"`).
+    #[allow(dead_code)]
     pub source_file: String,
 }
 

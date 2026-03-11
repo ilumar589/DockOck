@@ -6,7 +6,7 @@
 //! fields, etc.) that may be defined in *other* files than the one currently
 //! being transformed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// A single piece of extracted content from one file.
@@ -18,6 +18,19 @@ pub struct FileContent {
     pub file_type: String,
     /// Raw text / structured text extracted from the file
     pub raw_text: String,
+}
+
+/// A named collection of files whose content is merged into a single
+/// aggregated context before Gherkin generation.
+#[derive(Debug, Clone)]
+pub struct FileGroup {
+    /// Human-readable group label (e.g. "D028_Requirements")
+    pub name: String,
+    /// Ordered list of file paths that belong to this group
+    pub members: Vec<PathBuf>,
+    /// `true` when the group was manually created by the user (not auto-detected).
+    /// Manual groups are kept even when empty so the user can add files later.
+    pub manual: bool,
 }
 
 /// Accumulated project context shared across all files being processed.
@@ -48,14 +61,27 @@ impl ProjectContext {
     /// The summary lists every file that has already been processed along with a
     /// short excerpt of its raw text so that the model has cross-file awareness.
     pub fn build_summary(&self) -> String {
-        if self.file_contents.is_empty() {
+        self.build_summary_excluding(&HashSet::new())
+    }
+
+    /// Build a compact summary, excluding files whose path string is in `exclude`.
+    ///
+    /// Used by group processing to avoid injecting the group's own members as
+    /// cross-file context (they are already in the merged prompt).
+    pub fn build_summary_excluding(&self, exclude: &HashSet<String>) -> String {
+        let included: HashMap<&String, &FileContent> = self
+            .file_contents
+            .iter()
+            .filter(|(path, _)| !exclude.contains(path.as_str()))
+            .collect();
+
+        if included.is_empty() {
             return "No prior files have been processed yet.".to_string();
         }
 
         let mut summary = String::from("=== Cross-file project context ===\n\n");
-        for (path, content) in &self.file_contents {
+        for (path, content) in &included {
             summary.push_str(&format!("File: {}\nType: {}\n", path, content.file_type));
-            // Include the first 400 chars of each file as a compact excerpt
             let excerpt: String = content.raw_text.chars().take(400).collect();
             summary.push_str(&format!("Excerpt:\n{}\n\n", excerpt));
         }
@@ -76,4 +102,31 @@ impl ProjectContext {
         self.entities.clear();
         self.notes.clear();
     }
+}
+
+/// Compute automatic file groups from a list of paths.
+///
+/// Files whose file stems (filename without extension) are identical are placed
+/// into the same group.  E.g. `D028_Req.docx` + `D028_Req.vsdx` → group "D028_Req".
+/// Files with unique stems are left ungrouped (not returned).
+pub fn compute_auto_groups(files: &[PathBuf]) -> Vec<FileGroup> {
+    let mut stem_map: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for path in files {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !stem.is_empty() {
+            stem_map.entry(stem).or_default().push(path.clone());
+        }
+    }
+
+    let mut groups: Vec<FileGroup> = stem_map
+        .into_iter()
+        .filter(|(_, members)| members.len() >= 2)
+        .map(|(name, members)| FileGroup { name, members, manual: false })
+        .collect();
+
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    groups
 }

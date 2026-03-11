@@ -152,6 +152,34 @@ Rules:
 5. Output ONLY the corrected Gherkin — no explanations.
 6. If the input is already good, return it unchanged."#;
 
+const GROUP_EXTRACTOR_PREAMBLE: &str = r#"You are an expert document analyst.
+You will receive content extracted from MULTIPLE related documents that describe the same
+system, feature, or process. Your task is to produce a single unified structured summary
+that synthesises the information from all documents, resolving any overlaps or contradictions.
+
+Rules:
+1. Identify all actors, systems, data entities, and processes across ALL documents.
+2. List preconditions and postconditions for each process.
+3. Capture business rules and validation logic from every document.
+4. Merge overlapping information — do not repeat the same fact from different documents.
+5. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES.
+6. Be concise — no more than 500 words.
+7. Do not add conversational prose."#;
+
+const GROUP_GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
+You will receive a structured summary synthesised from MULTIPLE related documents that
+describe the same system, feature, or process. Generate a single, cohesive Gherkin Feature
+file that covers all scenarios described across the documents.
+
+Rules:
+1. Output ONLY valid Gherkin syntax starting with "Feature:".
+2. Create comprehensive Scenarios that cover behaviours from ALL source documents.
+3. Avoid duplicate scenarios — merge overlapping processes into single scenarios.
+4. Use concrete, business-readable language in steps.
+5. Where cross-file context is provided, reference other components or actors correctly.
+6. Do not add explanatory prose outside the Gherkin block.
+7. Always end with a blank line after the last Scenario."#;
+
 const VISION_DESCRIBE_PROMPT: &str = "\
 Describe this image in detail for a business analyst. Focus on:
 - Any text, labels, or annotations visible
@@ -483,7 +511,8 @@ impl AgentOrchestrator {
 
         for (i, image) in images.iter().enumerate() {
             let _ = status_tx.send(format!(
-                "👁 [Vision] Describing image {}/{}: {}…",
+                "👁 [Vision] {}: describing image {}/{}: {}…",
+                file_name,
                 i + 1,
                 images.len(),
                 image.label
@@ -521,6 +550,201 @@ impl AgentOrchestrator {
         enriched.push_str("\n\n=== Embedded Image Descriptions ===\n\n");
         enriched.push_str(&descriptions.join("\n\n"));
         enriched
+    }
+
+    /// Run the pipeline for a group of related files, producing a single merged Gherkin output.
+    pub async fn process_group(
+        &self,
+        group_name: &str,
+        members: &[(String, String, String, Vec<crate::parser::ExtractedImage>)],
+        context: &ProjectContext,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        // ── Step 0: Build merged text and images from all members ──
+        let mut merged_text = String::new();
+        let mut all_images: Vec<&crate::parser::ExtractedImage> = Vec::new();
+        let chars_per_member = MAX_INPUT_CHARS / members.len().max(1);
+
+        for (i, (file_name, file_type, raw_text, images)) in members.iter().enumerate() {
+            merged_text.push_str(&format!(
+                "=== Document {}: {} ({}) ===\n",
+                i + 1,
+                file_name,
+                file_type
+            ));
+            let excerpt: String = raw_text.chars().take(chars_per_member).collect();
+            merged_text.push_str(&excerpt);
+            if raw_text.len() > chars_per_member {
+                merged_text.push_str("\n[… content truncated …]\n");
+            }
+            merged_text.push_str("\n\n");
+            all_images.extend(images.iter());
+        }
+
+        // ── Step 0b: Describe images with vision model ──
+        if !all_images.is_empty() {
+            let _ = status_tx.send(format!(
+                "👁 [Vision] Describing {} image(s) from group {}…",
+                all_images.len(),
+                group_name
+            ));
+            let owned_images: Vec<crate::parser::ExtractedImage> =
+                all_images.iter().map(|img| (*img).clone()).collect();
+            merged_text =
+                self.enrich_text_with_images(&merged_text, &owned_images, group_name, status_tx)
+                    .await;
+        }
+
+        // ── Step 1: Prepare input for the generator ──
+        let summary = if self.mode == PipelineMode::Full {
+            let _ = status_tx.send(format!(
+                "🔍 [Extractor] Analysing group {}…",
+                group_name
+            ));
+            self.extract_group(group_name, &merged_text, status_tx)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        "Group extraction failed for {}: {} — falling back to preprocessor",
+                        group_name, e
+                    );
+                    preprocess_text(&merged_text, group_name, "Multi-document group")
+                })
+        } else {
+            let _ = status_tx.send(format!(
+                "⚡ [Preprocess] Structuring group {}…",
+                group_name
+            ));
+            preprocess_text(&merged_text, group_name, "Multi-document group")
+        };
+
+        // ── Step 2: Generate Gherkin ──
+        let _ = status_tx.send(format!(
+            "⚙ [Generator] Creating Gherkin for group {}…",
+            group_name
+        ));
+
+        // Exclude group members from cross-file context
+        let member_names: std::collections::HashSet<&str> =
+            members.iter().map(|(name, _, _, _)| name.as_str()).collect();
+        let exclude: std::collections::HashSet<String> = context
+            .file_contents
+            .keys()
+            .filter(|path| {
+                let fname = std::path::Path::new(path.as_str())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                member_names.contains(fname.as_str())
+            })
+            .cloned()
+            .collect();
+
+        let context_summary = context.build_summary_excluding(&exclude);
+        let gherkin = self
+            .generate_group(group_name, &summary, &context_summary, status_tx)
+            .await?;
+
+        // ── Step 3: Review / refine ──
+        let do_review = self.mode != PipelineMode::Fast && self.reviewer_client.is_some();
+        if do_review {
+            let _ = status_tx.send(format!(
+                "✅ [Reviewer] Validating Gherkin for group {}…",
+                group_name
+            ));
+            match self.review(group_name, &gherkin, status_tx).await {
+                Ok(refined) => Ok(refined),
+                Err(e) => {
+                    warn!(
+                        "Review failed for group {}: {} — using unreviewed output",
+                        group_name, e
+                    );
+                    Ok(gherkin)
+                }
+            }
+        } else {
+            Ok(gherkin)
+        }
+    }
+
+    async fn extract_group(
+        &self,
+        group_name: &str,
+        merged_text: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        let client = self
+            .extractor_client
+            .as_ref()
+            .unwrap_or(&self.generator_client);
+        let model = if self.extractor_client.is_some() {
+            &self.extractor_model
+        } else {
+            &self.generator_model
+        };
+        let agent = client
+            .agent(model)
+            .preamble(GROUP_EXTRACTOR_PREAMBLE)
+            .build();
+
+        let prompt = format!(
+            "Analyse the following group of related documents and produce a single unified \
+             structured summary.\n\n\
+             Group: {group_name}\n\n\
+             === Merged Document Content ===\n\
+             {merged_text}\n\n\
+             Unified structured summary:",
+        );
+
+        stream_with_progress(
+            &agent,
+            &prompt,
+            "Extractor",
+            group_name,
+            status_tx,
+            std::time::Duration::from_secs(180),
+        )
+        .await
+    }
+
+    async fn generate_group(
+        &self,
+        group_name: &str,
+        summary: &str,
+        context_summary: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        let agent = self
+            .generator_client
+            .agent(&self.generator_model)
+            .preamble(GROUP_GENERATOR_PREAMBLE)
+            .build();
+
+        let context_section = if context_summary.contains("No prior files") {
+            String::new()
+        } else {
+            format!("{}\n", context_summary)
+        };
+
+        let prompt = format!(
+            "Convert the following unified structured summary (synthesised from multiple \
+             related documents) into a single cohesive Gherkin Feature file.\n\n\
+             Group: {group_name}\n\n\
+             {context_section}\
+             === Unified Structured Summary ===\n\
+             {summary}\n\n\
+             Generate the Gherkin Feature below:",
+        );
+
+        stream_with_progress(
+            &agent,
+            &prompt,
+            "Generator",
+            group_name,
+            status_tx,
+            std::time::Duration::from_secs(240),
+        )
+        .await
     }
 
     /// Describe a single image using the vision model via Ollama's raw HTTP API.

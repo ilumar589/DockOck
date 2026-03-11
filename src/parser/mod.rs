@@ -23,6 +23,7 @@ pub struct ExtractedImage {
     /// Raw image bytes
     pub data: Vec<u8>,
     /// MIME type (e.g. "image/png", "image/jpeg")
+    #[allow(dead_code)]
     pub content_type: String,
 }
 
