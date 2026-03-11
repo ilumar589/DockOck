@@ -12,6 +12,7 @@ async fn main() -> Result<()> {
         "qwen2.5-coder:7b",
         "qwen2.5-coder:7b",
         "qwen2.5-coder:7b",
+        "minicpm-v",
         dockock::llm::PipelineMode::default(),
     ).await?;
 
@@ -41,7 +42,7 @@ async fn main() -> Result<()> {
     });
 
     println!("=== Running pipeline ===");
-    match orch.process_file("test_doc.docx", "word", raw_text, &ctx, &status_tx).await {
+    match orch.process_file("test_doc.docx", "word", raw_text, &[], &ctx, &status_tx).await {
         Ok(gherkin) => {
             println!("=== SUCCESS ===");
             println!("{}", gherkin);

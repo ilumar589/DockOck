@@ -15,8 +15,10 @@ use anyhow::{Context, Result};
 use std::io::{Cursor, Read};
 use std::path::Path;
 
-/// Extract all readable text from a `.docx` file.
-pub fn parse(path: &Path) -> Result<String> {
+use super::{ExtractedImage, ParseResult, is_vision_compatible, mime_from_extension};
+
+/// Extract all readable text and embedded images from a `.docx` file.
+pub fn parse(path: &Path) -> Result<ParseResult> {
     let data = std::fs::read(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
@@ -28,7 +30,14 @@ pub fn parse(path: &Path) -> Result<String> {
     let xml = read_zip_entry(&mut archive, "word/document.xml")
         .with_context(|| "Failed to read word/document.xml from archive")?;
 
-    extract_text_from_xml(&xml)
+    let text = extract_text_from_xml(&xml)?;
+    let images = extract_images_from_archive(&mut archive);
+
+    Ok(ParseResult {
+        file_type: "Word".to_string(),
+        text,
+        images,
+    })
 }
 
 /// Read a named entry from a ZIP archive and return its contents as a UTF-8 string.
@@ -244,6 +253,55 @@ fn extract_table(table: &roxmltree::Node) -> String {
     }
 
     rows_output.join("\n")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Image extraction
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract all images from the `word/media/` directory in the archive.
+fn extract_images_from_archive<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Vec<ExtractedImage> {
+    let mut images = Vec::new();
+
+    let media_entries: Vec<String> = (0..archive.len())
+        .filter_map(|i| {
+            archive.by_index(i).ok().and_then(|entry| {
+                let name = entry.name().to_string();
+                if name.starts_with("word/media/") && !name.ends_with('/') {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    for entry_name in media_entries {
+        if let Ok(mut entry) = archive.by_name(&entry_name) {
+            let mut buf = Vec::new();
+            if entry.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                let file_name = entry_name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&entry_name)
+                    .to_string();
+
+                let content_type = mime_from_extension(&file_name);
+
+                if is_vision_compatible(&content_type) {
+                    images.push(ExtractedImage {
+                        label: file_name,
+                        data: buf,
+                        content_type,
+                    });
+                }
+            }
+        }
+    }
+
+    images
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

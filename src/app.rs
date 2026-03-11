@@ -84,6 +84,12 @@ const KNOWN_MODELS: &[&str] = &[
     "llama3.2",
     "llama3.1:8b",
     "llama3.1:70b",
+    // Vision models
+    "minicpm-v",
+    "llava:7b",
+    "llava:13b",
+    "moondream",
+    "llama3.2-vision",
 ];
 
 /// Editable combo box for model selection — pick from presets or type a custom name.
@@ -154,6 +160,8 @@ pub struct DockOckApp {
     extractor_model: String,
     /// Ollama model name for the reviewer agent
     reviewer_model: String,
+    /// Ollama model name for the vision agent (image description)
+    vision_model: String,
     /// Channel receiver for background processing events
     event_rx: Option<Receiver<ProcessingEvent>>,
     /// Shared context accumulator (wrapped in Arc<Mutex<>> so background thread can write)
@@ -188,6 +196,7 @@ impl DockOckApp {
             generator_model: crate::llm::DEFAULT_GENERATOR_MODEL.to_string(),
             extractor_model: crate::llm::DEFAULT_EXTRACTOR_MODEL.to_string(),
             reviewer_model: crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
+            vision_model: crate::llm::DEFAULT_VISION_MODEL.to_string(),
             event_rx: None,
             context: Arc::new(Mutex::new(ProjectContext::new())),
             runtime,
@@ -323,12 +332,13 @@ impl DockOckApp {
         let gen_model = self.generator_model.clone();
         let ext_model = self.extractor_model.clone();
         let rev_model = self.reviewer_model.clone();
+        let vis_model = self.vision_model.clone();
         let handle = self.runtime.clone();
         let mode = self.pipeline_mode;
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
-            handle.block_on(process_files(files, context, gen_model, ext_model, rev_model, mode, tx));
+            handle.block_on(process_files(files, context, gen_model, ext_model, rev_model, vis_model, mode, tx));
         });
     }
 
@@ -442,6 +452,8 @@ impl DockOckApp {
             model_combo(ui, "ext_model", &mut self.extractor_model);
             ui.label("Rev:");
             model_combo(ui, "rev_model", &mut self.reviewer_model);
+            ui.label("Vis:");
+            model_combo(ui, "vis_model", &mut self.vision_model);
             ui.separator();
             ui.label("Pipeline:");
             egui::ComboBox::from_id_salt("pipeline_mode")
@@ -784,6 +796,7 @@ async fn process_files(
     generator_model: String,
     extractor_model: String,
     reviewer_model: String,
+    vision_model: String,
     mode: crate::llm::PipelineMode,
     tx: Sender<ProcessingEvent>,
 ) {
@@ -798,6 +811,7 @@ async fn process_files(
         &generator_model,
         &extractor_model,
         &reviewer_model,
+        &vision_model,
         mode,
     ).await {
         Ok(pair) => pair,
@@ -829,33 +843,36 @@ async fn process_files(
     for path in &files {
         let p = path.clone();
         parse_handles.push(tokio::task::spawn_blocking(move || {
-            crate::parser::parse_file(&p).map(|r| (p, r.0, r.1))
+            crate::parser::parse_file(&p).map(|r| (p, r))
         }));
     }
 
     // Collect parsed results
-    let mut parsed_files: Vec<(PathBuf, String, String)> = Vec::with_capacity(total);
+    let mut parsed_files: Vec<(PathBuf, String, String, Vec<crate::parser::ExtractedImage>)> = Vec::with_capacity(total);
     for handle in parse_handles {
         match handle.await {
-            Ok(Ok((path, file_type, raw_text))) => {
+            Ok(Ok((path, result))) => {
                 let name = path.file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                let _ = tx.send(ProcessingEvent::Status(format!("📄 Parsed: {}", name)));
+                let img_count = result.images.len();
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "📄 Parsed: {} ({} images found)", name, img_count
+                )));
 
                 // Store in shared context
                 {
                     let content = crate::context::FileContent {
                         path: path.clone(),
-                        file_type: file_type.clone(),
-                        raw_text: raw_text.clone(),
+                        file_type: result.file_type.clone(),
+                        raw_text: result.text.clone(),
                     };
                     if let Ok(mut ctx) = context.lock() {
                         ctx.add_file(content);
                     }
                 }
 
-                parsed_files.push((path, file_type, raw_text));
+                parsed_files.push((path, result.file_type, result.text, result.images));
             }
             Ok(Err(e)) => {
                 let _ = tx.send(ProcessingEvent::Status(format!("⚠ Parse error: {}", e)));
@@ -877,7 +894,7 @@ async fn process_files(
     let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
 
     let mut llm_handles = Vec::with_capacity(parsed_files.len());
-    for (path, file_type, raw_text) in parsed_files {
+    for (path, file_type, raw_text, images) in parsed_files {
         let orch = Arc::clone(&orchestrator);
         let sem = Arc::clone(&orchestrator.semaphore);
         let tx = tx.clone();
@@ -906,7 +923,7 @@ async fn process_files(
             });
 
             let result = orch
-                .process_file(&file_name, &file_type, &raw_text, &ctx, &status_tx)
+                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx)
                 .await;
 
             drop(status_tx); // signal forwarder to stop

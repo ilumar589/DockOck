@@ -993,10 +993,12 @@ name = "dockock"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "calamine",
  "eframe",
  "egui",
  "futures",
+ "reqwest",
  "rfd",
  "rig-core",
  "roxmltree",

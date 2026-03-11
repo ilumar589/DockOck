@@ -9,11 +9,14 @@
 //! LLM has a meaningful description of the diagram contents.
 
 use anyhow::{Context, Result};
+use std::collections::HashMap;
 use std::io::{Cursor, Read};
 use std::path::Path;
 
-/// Extract all readable text from a `.vsdx` file.
-pub fn parse(path: &Path) -> Result<String> {
+use super::{ExtractedImage, ParseResult, is_vision_compatible, mime_from_extension};
+
+/// Extract all readable text, connections, and embedded images from a `.vsdx` file.
+pub fn parse(path: &Path) -> Result<ParseResult> {
     let data = std::fs::read(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;
 
@@ -51,6 +54,14 @@ pub fn parse(path: &Path) -> Result<String> {
             .with_context(|| format!("Failed to parse page '{}'", page_name))?;
 
         output.push_str(&page_text);
+
+        // Extract connections between shapes on this page
+        let connections = extract_connections_from_page(&xml);
+        if !connections.is_empty() {
+            output.push_str("\n[Connections]\n");
+            output.push_str(&connections);
+        }
+
         output.push('\n');
     }
 
@@ -59,7 +70,13 @@ pub fn parse(path: &Path) -> Result<String> {
         output.push_str("(No Visio page files found in archive)\n");
     }
 
-    Ok(output.trim().to_string())
+    let images = extract_images_from_archive(&mut archive);
+
+    Ok(ParseResult {
+        file_type: "Visio".to_string(),
+        text: output.trim().to_string(),
+        images,
+    })
 }
 
 /// Read a named entry from a ZIP archive and return its contents as a UTF-8 string.
@@ -120,6 +137,154 @@ fn extract_text_from_page(xml: &str) -> Result<String> {
     }
 
     Ok(output)
+}
+
+/// Find the best human-readable label for a Visio shape.
+fn find_shape_label(shape: &roxmltree::Node) -> String {
+    // Try Label first
+    for child in shape.descendants() {
+        if !child.is_element() { continue; }
+        if child.tag_name().name() == "Cell" {
+            if child.attribute("N") == Some("Label") {
+                if let Some(v) = child.attribute("V") {
+                    let v = v.trim();
+                    if !v.is_empty() { return v.to_string(); }
+                }
+            }
+        }
+    }
+    // Fallback to Name
+    for child in shape.descendants() {
+        if !child.is_element() { continue; }
+        if child.tag_name().name() == "Cell" {
+            if child.attribute("N") == Some("Name") {
+                if let Some(v) = child.attribute("V") {
+                    let v = v.trim();
+                    if !v.is_empty() { return v.to_string(); }
+                }
+            }
+        }
+    }
+    // Fallback to Text element content
+    for child in shape.descendants() {
+        if !child.is_element() { continue; }
+        if child.tag_name().name() == "Text" {
+            let text: String = child
+                .descendants()
+                .filter(|n| n.is_text())
+                .filter_map(|n| n.text())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let text = text.trim().to_string();
+            if !text.is_empty() { return text; }
+        }
+    }
+    String::new()
+}
+
+/// Extract connections between shapes from a Visio page XML.
+///
+/// Connects elements link connector shapes (FromSheet) to endpoint shapes
+/// (ToSheet). BeginX = start of connector, EndX = end of connector.
+fn extract_connections_from_page(xml: &str) -> String {
+    let doc = match roxmltree::Document::parse(xml) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+
+    // Build shape ID → label map
+    let mut shape_labels: HashMap<String, String> = HashMap::new();
+    for node in doc.descendants() {
+        if !node.is_element() || node.tag_name().name() != "Shape" {
+            continue;
+        }
+        if let Some(id) = node.attribute("ID") {
+            let label = find_shape_label(&node);
+            if !label.is_empty() {
+                shape_labels.insert(id.to_string(), label);
+            }
+        }
+    }
+
+    // Group Connect elements by connector shape (FromSheet)
+    let mut connectors: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    for node in doc.descendants() {
+        if !node.is_element() || node.tag_name().name() != "Connect" {
+            continue;
+        }
+        let from_sheet = node.attribute("FromSheet").unwrap_or("").to_string();
+        let from_cell = node.attribute("FromCell").unwrap_or("");
+        let to_sheet = node.attribute("ToSheet").unwrap_or("").to_string();
+
+        let entry = connectors.entry(from_sheet).or_insert((None, None));
+        if from_cell.contains("Begin") {
+            entry.0 = Some(to_sheet);
+        } else if from_cell.contains("End") {
+            entry.1 = Some(to_sheet);
+        }
+    }
+
+    let mut output = String::new();
+    for (_connector_id, (start, end)) in &connectors {
+        if let (Some(start_id), Some(end_id)) = (start, end) {
+            let start_label = shape_labels
+                .get(start_id.as_str())
+                .map(|s| s.as_str())
+                .unwrap_or(start_id);
+            let end_label = shape_labels
+                .get(end_id.as_str())
+                .map(|s| s.as_str())
+                .unwrap_or(end_id);
+            output.push_str(&format!("  {} → {}\n", start_label, end_label));
+        }
+    }
+
+    output
+}
+
+/// Extract all images from the `visio/media/` directory in the archive.
+fn extract_images_from_archive<R: Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Vec<ExtractedImage> {
+    let mut images = Vec::new();
+
+    let media_entries: Vec<String> = (0..archive.len())
+        .filter_map(|i| {
+            archive.by_index(i).ok().and_then(|entry| {
+                let name = entry.name().to_string();
+                if name.starts_with("visio/media/") && !name.ends_with('/') {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    for entry_name in media_entries {
+        if let Ok(mut entry) = archive.by_name(&entry_name) {
+            let mut buf = Vec::new();
+            if entry.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                let file_name = entry_name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&entry_name)
+                    .to_string();
+
+                let content_type = mime_from_extension(&file_name);
+
+                if is_vision_compatible(&content_type) {
+                    images.push(ExtractedImage {
+                        label: file_name,
+                        data: buf,
+                        content_type,
+                    });
+                }
+            }
+        }
+    }
+
+    images
 }
 
 #[cfg(test)]

@@ -10,13 +10,6 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=4
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -40,13 +33,6 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=4
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -57,6 +43,29 @@ services:
         sleep 5
         echo "Pulling qwen2.5-coder:7b model..."
         ollama pull qwen2.5-coder:7b || true
+        wait $$OLLAMA_PID
+
+  # Fourth instance – Vision / image description (port 11437)
+  ollama-vision:
+    image: ollama/ollama:latest
+    container_name: dockock-ollama-vision
+    ports:
+      - "11437:11434"
+    volumes:
+      - ollama_data_vision:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=2
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        ollama serve &
+        OLLAMA_PID=$$!
+        echo "Waiting for Ollama (vision) to start..."
+        sleep 5
+        echo "Pulling moondream vision model (CPU-friendly)..."
+        ollama pull moondream || true
         wait $$OLLAMA_PID
 
   # Third instance – Gherkin reviewer / validator (port 11436)
@@ -70,13 +79,6 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=4
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -95,4 +97,6 @@ volumes:
   ollama_data_extractor:
     driver: local
   ollama_data_reviewer:
+    driver: local
+  ollama_data_vision:
     driver: local

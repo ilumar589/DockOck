@@ -17,6 +17,7 @@
 //! concurrently (up to `MAX_CONCURRENT` at a time).
 
 use anyhow::{Context, Result};
+use base64::prelude::*;
 use futures::StreamExt;
 use rig::agent::{MultiTurnStreamItem, Text};
 use rig::client::{CompletionClient, Nothing};
@@ -36,6 +37,10 @@ pub const DEFAULT_EXTRACTOR_MODEL: &str = "qwen2.5-coder:7b";
 
 /// Default model used for the reviewer agent.
 pub const DEFAULT_REVIEWER_MODEL: &str = "qwen2.5-coder:7b";
+
+/// Default model used for describing images (must be a vision-capable model).
+/// moondream is ~1.7B params and runs well on CPU-only setups.
+pub const DEFAULT_VISION_MODEL: &str = "moondream";
 
 /// Maximum number of files processed through the LLM pipeline simultaneously.
 pub const MAX_CONCURRENT: usize = 3;
@@ -103,6 +108,12 @@ pub const ENDPOINT_REVIEWER: OllamaEndpoint = OllamaEndpoint {
     port: 11436,
 };
 
+pub const ENDPOINT_VISION: OllamaEndpoint = OllamaEndpoint {
+    name: "Vision",
+    url: "http://localhost:11437",
+    port: 11437,
+};
+
 // ─────────────────────────────────────────────
 // Agent preambles
 // ─────────────────────────────────────────────
@@ -141,6 +152,21 @@ Rules:
 5. Output ONLY the corrected Gherkin — no explanations.
 6. If the input is already good, return it unchanged."#;
 
+const VISION_DESCRIBE_PROMPT: &str = "\
+Describe this image in detail for a business analyst. Focus on:
+- Any text, labels, or annotations visible
+- Diagram type (flowchart, architecture, sequence, ER diagram, etc.)
+- Process flows and connections between elements
+- Tables, forms, or structured data
+- UI wireframes or screenshots
+Be concise but capture all business-relevant information. Output plain text only.";
+
+/// Response from Ollama's `/api/generate` endpoint (non-streaming).
+#[derive(serde::Deserialize)]
+struct OllamaGenerateResponse {
+    response: String,
+}
+
 // ─────────────────────────────────────────────
 // Client creation
 // ─────────────────────────────────────────────
@@ -161,9 +187,11 @@ pub struct AgentOrchestrator {
     extractor_client: Option<ollama::Client>,
     generator_client: ollama::Client,
     reviewer_client: Option<ollama::Client>,
+    vision_endpoint_url: String,
     generator_model: String,
     extractor_model: String,
     reviewer_model: String,
+    vision_model: String,
     pub semaphore: Arc<Semaphore>,
     pub mode: PipelineMode,
 }
@@ -183,6 +211,7 @@ impl AgentOrchestrator {
         generator_model: &str,
         extractor_model: &str,
         reviewer_model: &str,
+        vision_model: &str,
         mode: PipelineMode,
     ) -> Result<(Self, Vec<EndpointStatus>)> {
         let mut statuses = Vec::new();
@@ -207,6 +236,13 @@ impl AgentOrchestrator {
             name: ENDPOINT_REVIEWER.name,
             url: ENDPOINT_REVIEWER.url,
             reachable: rev_ok,
+        });
+
+        let vis_ok = check_endpoint(&ENDPOINT_VISION).await;
+        statuses.push(EndpointStatus {
+            name: ENDPOINT_VISION.name,
+            url: ENDPOINT_VISION.url,
+            reachable: vis_ok,
         });
 
         if !gen_ok {
@@ -235,7 +271,19 @@ impl AgentOrchestrator {
             None
         };
 
-        let active_count = 1 + ext_ok as usize + rev_ok as usize;
+        let vision_endpoint_url = if vis_ok {
+            info!("Vision agent available at {}", ENDPOINT_VISION.url);
+            ENDPOINT_VISION.url.to_string()
+        } else {
+            warn!("Vision instance not available — falling back to extractor/generator for vision");
+            if ext_ok {
+                ENDPOINT_EXTRACTOR.url.to_string()
+            } else {
+                ENDPOINT_GENERATOR.url.to_string()
+            }
+        };
+
+        let active_count = 1 + ext_ok as usize + rev_ok as usize + vis_ok as usize;
         let concurrency = MAX_CONCURRENT.max(active_count);
 
         Ok((
@@ -243,9 +291,11 @@ impl AgentOrchestrator {
                 extractor_client,
                 generator_client,
                 reviewer_client,
+                vision_endpoint_url,
                 generator_model: generator_model.to_string(),
                 extractor_model: extractor_model.to_string(),
                 reviewer_model: reviewer_model.to_string(),
+                vision_model: vision_model.to_string(),
                 semaphore: Arc::new(Semaphore::new(concurrency)),
                 mode,
             },
@@ -259,26 +309,37 @@ impl AgentOrchestrator {
         file_name: &str,
         file_type: &str,
         raw_text: &str,
+        images: &[crate::parser::ExtractedImage],
         context: &ProjectContext,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
+        // ── Step 0: Describe images with vision model ──
+        let enriched_text = if !images.is_empty() {
+            let _ = status_tx.send(format!(
+                "👁 [Vision] Describing {} image(s) from {}…", images.len(), file_name
+            ));
+            self.enrich_text_with_images(raw_text, images, file_name, status_tx).await
+        } else {
+            raw_text.to_string()
+        };
+
         // ── Step 1: Prepare input for the generator ──
         let summary = if self.mode == PipelineMode::Full {
             // Full mode: use LLM extractor
             let _ = status_tx.send(format!(
                 "🔍 [Extractor] Analysing {}…", file_name
             ));
-            self.extract(file_name, file_type, raw_text, status_tx).await
+            self.extract(file_name, file_type, &enriched_text, status_tx).await
                 .unwrap_or_else(|e| {
                     warn!("Extraction failed for {}: {} — falling back to preprocessor", file_name, e);
-                    preprocess_text(raw_text, file_name, file_type)
+                    preprocess_text(&enriched_text, file_name, file_type)
                 })
         } else {
             // Fast / Standard: instant Rust preprocessor (no LLM)
             let _ = status_tx.send(format!(
                 "⚡ [Preprocess] Structuring {}…", file_name
             ));
-            preprocess_text(raw_text, file_name, file_type)
+            preprocess_text(&enriched_text, file_name, file_type)
         };
 
         // ── Step 2: Generate Gherkin ──
@@ -405,6 +466,92 @@ impl AgentOrchestrator {
             std::time::Duration::from_secs(120),
         )
         .await
+    }
+
+    /// Enrich document text with AI-generated descriptions of embedded images.
+    ///
+    /// Each image is sent to the vision model; the resulting descriptions are
+    /// appended to the raw text so the generator LLM has full context.
+    async fn enrich_text_with_images(
+        &self,
+        raw_text: &str,
+        images: &[crate::parser::ExtractedImage],
+        file_name: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> String {
+        let mut descriptions = Vec::new();
+
+        for (i, image) in images.iter().enumerate() {
+            let _ = status_tx.send(format!(
+                "👁 [Vision] Describing image {}/{}: {}…",
+                i + 1,
+                images.len(),
+                image.label
+            ));
+
+            match self.describe_image(image).await {
+                Ok(desc) => {
+                    descriptions.push(format!(
+                        "[Image {}: {}]\n{}",
+                        i + 1,
+                        image.label,
+                        desc.trim()
+                    ));
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to describe image {}: {} — using filename as fallback",
+                        image.label, e
+                    );
+                    descriptions.push(format!(
+                        "[Image {}: {}]\n(Could not describe image: {})",
+                        i + 1,
+                        image.label,
+                        e
+                    ));
+                }
+            }
+        }
+
+        if descriptions.is_empty() {
+            return raw_text.to_string();
+        }
+
+        let mut enriched = raw_text.to_string();
+        enriched.push_str("\n\n=== Embedded Image Descriptions ===\n\n");
+        enriched.push_str(&descriptions.join("\n\n"));
+        enriched
+    }
+
+    /// Describe a single image using the vision model via Ollama's raw HTTP API.
+    async fn describe_image(
+        &self,
+        image: &crate::parser::ExtractedImage,
+    ) -> Result<String> {
+        let endpoint_url = &self.vision_endpoint_url;
+
+        let b64 = BASE64_STANDARD.encode(&image.data);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/api/generate", endpoint_url))
+            .json(&serde_json::json!({
+                "model": self.vision_model,
+                "prompt": VISION_DESCRIBE_PROMPT,
+                "images": [b64],
+                "stream": false
+            }))
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .with_context(|| format!("Vision API request failed for {}", image.label))?;
+
+        let body: OllamaGenerateResponse = resp
+            .json()
+            .await
+            .with_context(|| "Failed to parse vision model response")?;
+
+        Ok(body.response)
     }
 }
 
