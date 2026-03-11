@@ -36,6 +36,7 @@ pub mod prefix_cache;
 pub mod provider;
 pub use prefix_cache::PrefixCache;
 pub use provider::ProviderBackend;
+pub use provider::{load_custom_providers, build_custom_backend, custom_model_ids, CustomProviderConfig};
 
 /// Default model used for the generator agent.
 pub const DEFAULT_GENERATOR_MODEL: &str = "qwen2.5-coder:32b";

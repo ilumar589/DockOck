@@ -63,6 +63,16 @@ pub struct CustomProviderConfig {
     pub name: String,
     pub base_url: String,
     pub models: HashMap<String, ModelInfo>,
+    /// Default model IDs for each pipeline role.
+    pub defaults: RoleDefaults,
+}
+
+/// Default model assignments per pipeline role.
+#[derive(Debug, Clone, Default)]
+pub struct RoleDefaults {
+    pub generator: Option<String>,
+    pub extractor: Option<String>,
+    pub reviewer: Option<String>,
 }
 
 /// Model info including display name and limits.
@@ -86,6 +96,15 @@ struct JsonProvider {
     name: String,
     options: JsonOptions,
     models: HashMap<String, JsonModel>,
+    #[serde(default)]
+    defaults: Option<JsonDefaults>,
+}
+
+#[derive(Deserialize, Default)]
+struct JsonDefaults {
+    generator: Option<String>,
+    extractor: Option<String>,
+    reviewer: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -129,26 +148,34 @@ pub fn load_custom_providers(dir: &Path) -> Vec<CustomProviderConfig> {
 
     root.provider
         .into_iter()
-        .map(|(key, prov)| CustomProviderConfig {
-            key,
-            name: prov.name,
-            base_url: prov.options.base_url,
-            models: prov
-                .models
-                .into_iter()
-                .map(|(id, m)| {
-                    (
-                        id,
-                        ModelInfo {
-                            display_name: m.name,
-                            limits: ModelLimits {
-                                context_tokens: m.limit.context,
-                                max_output_tokens: m.limit.output,
+        .map(|(key, prov)| {
+            let defaults = prov.defaults.unwrap_or_default();
+            CustomProviderConfig {
+                key,
+                name: prov.name,
+                base_url: prov.options.base_url,
+                models: prov
+                    .models
+                    .into_iter()
+                    .map(|(id, m)| {
+                        (
+                            id,
+                            ModelInfo {
+                                display_name: m.name,
+                                limits: ModelLimits {
+                                    context_tokens: m.limit.context,
+                                    max_output_tokens: m.limit.output,
+                                },
                             },
-                        },
-                    )
-                })
-                .collect(),
+                        )
+                    })
+                    .collect(),
+                defaults: RoleDefaults {
+                    generator: defaults.generator,
+                    extractor: defaults.extractor,
+                    reviewer: defaults.reviewer,
+                },
+            }
         })
         .collect()
 }

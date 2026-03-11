@@ -3,13 +3,18 @@
 //! Instead of using fixed 400-char excerpts from other files, this module:
 //! 1. Chunks parsed document text into overlapping windows
 //! 2. Embeds each chunk via Ollama's embedding API (e.g. `nomic-embed-text`)
-//! 3. Stores embeddings in an in-memory vector store
+//! 3. Stores embeddings in SurrealDB (embedded mode with HNSW vector indexing)
 //! 4. At generation time, retrieves the top-K most relevant chunks from OTHER
 //!    files to inject as cross-file context
+//!
+//! Storage: SurrealKV (persistent, pure-Rust) when an output dir is available;
+//! in-memory fallback otherwise. Persisted embeddings survive across app restarts.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use surrealdb::Surreal;
+use surrealdb::engine::local::Db;
+use tracing::info;
 
 // ─────────────────────────────────────────────
 // Configuration
@@ -49,13 +54,6 @@ pub struct TextChunk {
     pub chunk_index: usize,
 }
 
-/// A chunk with its embedding vector.
-#[derive(Debug, Clone)]
-struct EmbeddedChunk {
-    chunk: TextChunk,
-    embedding: Vec<f32>,
-}
-
 /// A search result: a chunk with its relevance score.
 #[derive(Debug, Clone)]
 pub struct SearchResult {
@@ -63,79 +61,26 @@ pub struct SearchResult {
     pub score: f32,
 }
 
-/// In-memory vector store holding all embedded chunks.
-#[derive(Debug)]
-pub struct VectorStore {
-    entries: Vec<EmbeddedChunk>,
+/// Row shape returned from the vector similarity SurrealQL query.
+#[derive(Debug, Deserialize)]
+struct ChunkRow {
+    file_name: String,
+    file_type: String,
+    text: String,
+    offset: usize,
+    chunk_index: usize,
+    score: f32,
 }
 
-impl VectorStore {
-    pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Number of chunks stored.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether the store is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Insert a chunk with its embedding.
-    fn insert(&mut self, chunk: TextChunk, embedding: Vec<f32>) {
-        self.entries.push(EmbeddedChunk { chunk, embedding });
-    }
-
-    /// Find the top-K most similar chunks to the query embedding,
-    /// excluding chunks from the specified file.
-    pub fn search(
-        &self,
-        query_embedding: &[f32],
-        exclude_file: &str,
-        top_k: usize,
-    ) -> Vec<SearchResult> {
-        let mut scored: Vec<SearchResult> = self
-            .entries
-            .iter()
-            .filter(|e| e.chunk.file_name != exclude_file)
-            .map(|e| SearchResult {
-                score: cosine_similarity(query_embedding, &e.embedding),
-                chunk: e.chunk.clone(),
-            })
-            .collect();
-
-        // Sort by score descending
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(top_k);
-        scored
-    }
-}
-
-/// Cosine similarity between two vectors.
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let mut dot = 0.0f64;
-    let mut norm_a = 0.0f64;
-    let mut norm_b = 0.0f64;
-    for (x, y) in a.iter().zip(b.iter()) {
-        let x = *x as f64;
-        let y = *y as f64;
-        dot += x * y;
-        norm_a += x * x;
-        norm_b += y * y;
-    }
-    let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom < 1e-12 {
-        return 0.0;
-    }
-    (dot / denom) as f32
+/// Row shape for INSERT (includes the embedding vector).
+#[derive(Debug, Serialize)]
+struct ChunkInsert {
+    file_name: String,
+    file_type: String,
+    text: String,
+    offset: usize,
+    chunk_index: usize,
+    embedding: Vec<f32>,
 }
 
 // ─────────────────────────────────────────────
@@ -221,41 +166,98 @@ struct OllamaEmbedResponse {
     embeddings: Vec<Vec<f32>>,
 }
 
-/// The RAG engine that owns the vector store and embedding client.
+/// The RAG engine backed by SurrealDB embedded with HNSW vector indexing.
 pub struct RagEngine {
     /// Ollama base URL for the embedding model (reuses an existing instance).
     endpoint_url: String,
     /// Name of the embedding model.
     model: String,
-    /// The in-memory vector store.
-    store: VectorStore,
+    /// SurrealDB embedded instance.
+    db: Surreal<Db>,
+    /// Running count of chunks stored in this session.
+    chunk_count: usize,
     /// HTTP client (reused across requests).
     client: reqwest::Client,
-    /// Disk cache for embeddings.
-    cache: crate::cache::DiskCache,
 }
 
+/// SurrealQL schema migration run on startup.
+const SCHEMA_SQL: &str = r#"
+DEFINE TABLE IF NOT EXISTS chunks SCHEMAFULL;
+DEFINE FIELD IF NOT EXISTS file_name   ON chunks TYPE string;
+DEFINE FIELD IF NOT EXISTS file_type   ON chunks TYPE string;
+DEFINE FIELD IF NOT EXISTS text        ON chunks TYPE string;
+DEFINE FIELD IF NOT EXISTS offset      ON chunks TYPE int;
+DEFINE FIELD IF NOT EXISTS chunk_index ON chunks TYPE int;
+DEFINE FIELD IF NOT EXISTS embedding   ON chunks TYPE array<float>;
+DEFINE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks
+    FIELDS embedding HNSW DIMENSION 768 DIST COSINE;
+DEFINE INDEX IF NOT EXISTS idx_chunks_file ON chunks FIELDS file_name;
+"#;
+
 impl RagEngine {
-    /// Create a new RAG engine.
-    pub fn new(endpoint_url: &str, model: &str, cache: crate::cache::DiskCache) -> Self {
-        Self {
+    /// Create a new RAG engine with SurrealDB storage.
+    ///
+    /// * `surreal_path` — if `Some`, SurrealKV persistent storage at that dir;
+    ///   if `None`, in-memory only.
+    /// * `endpoint_url` — Ollama base URL for embedding model
+    /// * `model` — name of the embedding model (e.g. `nomic-embed-text`)
+    pub async fn new(
+        surreal_path: Option<&std::path::Path>,
+        endpoint_url: &str,
+        model: &str,
+    ) -> Result<Self> {
+        let db = if let Some(path) = surreal_path {
+            let dir = path.join(".dockock_surreal");
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("Failed to create SurrealDB dir: {}", dir.display()))?;
+            let path_str = dir.to_string_lossy().to_string();
+            info!("SurrealDB: opening persistent store at {}", path_str);
+            Surreal::new::<surrealdb::engine::local::SurrealKv>(path_str.as_str())
+                .await
+                .context("Failed to open SurrealKV database")?
+        } else {
+            info!("SurrealDB: using in-memory store (no output dir)");
+            Surreal::new::<surrealdb::engine::local::Mem>(())
+                .await
+                .context("Failed to open in-memory SurrealDB")?
+        };
+
+        db.use_ns("dockock").use_db("rag").await
+            .context("Failed to select SurrealDB namespace/database")?;
+
+        // Run schema migration
+        db.query(SCHEMA_SQL).await
+            .context("Failed to run SurrealDB schema migration")?;
+
+        // Count existing chunks (from a previous run if persistent)
+        let mut result = db.query("SELECT count() AS c FROM chunks GROUP ALL")
+            .await
+            .context("Failed to count existing chunks")?;
+        let existing: Option<CountRow> = result.take(0).ok().and_then(|v: Vec<CountRow>| v.into_iter().next());
+        let chunk_count = existing.map(|r| r.c).unwrap_or(0);
+        if chunk_count > 0 {
+            info!("SurrealDB: loaded {} existing chunks from previous session", chunk_count);
+        }
+
+        Ok(Self {
             endpoint_url: endpoint_url.to_string(),
             model: model.to_string(),
-            store: VectorStore::new(),
+            db,
+            chunk_count,
             client: reqwest::Client::new(),
-            cache,
-        }
+        })
     }
 
     /// Number of chunks in the vector store.
     pub fn chunk_count(&self) -> usize {
-        self.store.len()
+        self.chunk_count
     }
 
     /// Embed and index all chunks from a single file.
     ///
-    /// Chunks are embedded in a single batch request.
-    /// Results are cached by (chunk_text, model_name) hash.
+    /// Chunks are embedded in a single batch request and inserted into SurrealDB.
+    /// Duplicate chunks (same file_name + chunk_index) are skipped via upsert-like
+    /// INSERT with ON DUPLICATE KEY UPDATE.
     pub async fn index_file(
         &mut self,
         file_name: &str,
@@ -267,78 +269,86 @@ impl RagEngine {
             return Ok(0);
         }
 
-        // Separate cached vs uncached chunks
-        let mut cached_embeddings: HashMap<usize, Vec<f32>> = HashMap::new();
-        let mut uncached_indices: Vec<usize> = Vec::new();
+        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
+        let embeddings = self.embed_batch(&texts).await?;
 
-        for (i, chunk) in chunks.iter().enumerate() {
-            let cache_key = crate::cache::composite_key(&[
-                chunk.text.as_bytes(),
-                self.model.as_bytes(),
-            ]);
-            if let Some(emb) = self.cache.get::<Vec<f32>>(crate::cache::NS_EMBEDDING, &cache_key) {
-                cached_embeddings.insert(i, emb);
-            } else {
-                uncached_indices.push(i);
-            }
+        if embeddings.len() != chunks.len() {
+            anyhow::bail!(
+                "Embedding count mismatch: expected {}, got {}",
+                chunks.len(),
+                embeddings.len()
+            );
         }
 
-        // Embed uncached chunks in batch
-        if !uncached_indices.is_empty() {
-            let texts: Vec<&str> = uncached_indices
-                .iter()
-                .map(|&i| chunks[i].text.as_str())
-                .collect();
-
-            let embeddings = self.embed_batch(&texts).await?;
-
-            if embeddings.len() != uncached_indices.len() {
-                anyhow::bail!(
-                    "Embedding count mismatch: expected {}, got {}",
-                    uncached_indices.len(),
-                    embeddings.len()
-                );
-            }
-
-            for (batch_idx, &chunk_idx) in uncached_indices.iter().enumerate() {
-                let emb = &embeddings[batch_idx];
-                // Cache the embedding
-                let cache_key = crate::cache::composite_key(&[
-                    chunks[chunk_idx].text.as_bytes(),
-                    self.model.as_bytes(),
-                ]);
-                self.cache.put(crate::cache::NS_EMBEDDING, &cache_key, emb);
-                cached_embeddings.insert(chunk_idx, emb.clone());
-            }
-        }
-
-        // Insert all chunks into the vector store
+        // Insert all chunks with embeddings into SurrealDB
         let count = chunks.len();
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            if let Some(emb) = cached_embeddings.remove(&i) {
-                self.store.insert(chunk, emb);
-            }
+        for (chunk, emb) in chunks.into_iter().zip(embeddings.into_iter()) {
+            let row = ChunkInsert {
+                file_name: chunk.file_name,
+                file_type: chunk.file_type,
+                text: chunk.text,
+                offset: chunk.offset,
+                chunk_index: chunk.chunk_index,
+                embedding: emb,
+            };
+            self.db
+                .create::<Option<serde_json::Value>>("chunks")
+                .content(row)
+                .await
+                .context("Failed to insert chunk into SurrealDB")?;
         }
 
+        self.chunk_count += count;
         Ok(count)
     }
 
     /// Retrieve the top-K most relevant chunks from files other than `exclude_file`.
     ///
-    /// The query text is embedded, then used to search the vector store.
+    /// Uses SurrealDB's built-in cosine similarity via HNSW index.
     pub async fn retrieve(
         &self,
         query_text: &str,
         exclude_file: &str,
     ) -> Result<Vec<SearchResult>> {
         let query_emb = self.embed_single(query_text).await?;
-        Ok(self.store.search(&query_emb, exclude_file, TOP_K))
+
+        let sql = "
+            SELECT
+                file_name, file_type, text, offset, chunk_index,
+                vector::similarity::cosine(embedding, $query_emb) AS score
+            FROM chunks
+            WHERE file_name != $exclude
+            ORDER BY score DESC
+            LIMIT $top_k
+        ";
+
+        let mut result = self.db
+            .query(sql)
+            .bind(("query_emb", query_emb))
+            .bind(("exclude", exclude_file.to_string()))
+            .bind(("top_k", TOP_K as i64))
+            .await
+            .context("SurrealDB vector search failed")?;
+
+        let rows: Vec<ChunkRow> = result.take(0)
+            .unwrap_or_default();
+
+        Ok(rows
+            .into_iter()
+            .map(|r| SearchResult {
+                chunk: TextChunk {
+                    file_name: r.file_name,
+                    file_type: r.file_type,
+                    text: r.text,
+                    offset: r.offset,
+                    chunk_index: r.chunk_index,
+                },
+                score: r.score,
+            })
+            .collect())
     }
 
     /// Build a formatted cross-file context string from RAG retrieval results.
-    ///
-    /// The query text should be a representative summary or the preprocessed text
-    /// of the current file being processed.
     pub async fn build_cross_file_context(
         &self,
         query_text: &str,
@@ -384,6 +394,15 @@ impl RagEngine {
         Ok(context)
     }
 
+    /// Clear all chunks for a fresh run (useful when force-regenerating).
+    #[allow(dead_code)]
+    pub async fn clear(&mut self) -> Result<()> {
+        self.db.query("DELETE chunks").await
+            .context("Failed to clear chunks table")?;
+        self.chunk_count = 0;
+        Ok(())
+    }
+
     /// Embed a single text string.
     async fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
         let batch = self.embed_batch(&[text]).await?;
@@ -420,6 +439,12 @@ impl RagEngine {
 
         Ok(body.embeddings)
     }
+}
+
+/// Helper for COUNT query deserialization.
+#[derive(Debug, Deserialize)]
+struct CountRow {
+    c: usize,
 }
 
 /// Build a short representative query from a file's raw text for RAG retrieval.

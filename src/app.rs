@@ -105,6 +105,18 @@ fn model_combo(ui: &mut egui::Ui, id: &str, model: &mut String) {
         });
 }
 
+/// Combo box for custom provider models loaded from custom_providers.json.
+fn custom_model_combo(ui: &mut egui::Ui, id: &str, model: &mut String, models: &[String]) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(model.as_str())
+        .width(160.0)
+        .show_ui(ui, |ui| {
+            for name in models {
+                ui.selectable_value(model, name.clone(), name.as_str());
+            }
+        });
+}
+
 // ─────────────────────────────────────────────
 // Events sent from background thread → UI
 // ─────────────────────────────────────────────
@@ -243,6 +255,12 @@ pub struct DockOckApp {
     refinement_input: String,
     /// Whether a session restore prompt should be shown
     session_restore_pending: bool,
+    /// Active LLM backend (Ollama or Custom provider)
+    backend: crate::llm::ProviderBackend,
+    /// Loaded custom provider configurations from custom_providers.json
+    custom_providers: Vec<crate::llm::CustomProviderConfig>,
+    /// Saved Ollama model selections (restored when switching back from custom)
+    saved_ollama_models: (String, String, String),
 }
 
 impl DockOckApp {
@@ -288,6 +306,15 @@ impl DockOckApp {
             show_diff: false,
             refinement_input: String::new(),
             session_restore_pending: false,
+            backend: crate::llm::ProviderBackend::Ollama,
+            custom_providers: crate::llm::load_custom_providers(
+                &std::env::current_dir().unwrap_or_default(),
+            ),
+            saved_ollama_models: (
+                crate::llm::DEFAULT_GENERATOR_MODEL.to_string(),
+                crate::llm::DEFAULT_EXTRACTOR_MODEL.to_string(),
+                crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
+            ),
         }
     }
 
@@ -597,11 +624,12 @@ impl DockOckApp {
         let openspec_output_dir = self.output_dir.clone();
         let cache = crate::cache::DiskCache::new(self.output_dir.as_deref());
         let force_regenerate = self.force_regenerate;
+        let backend = self.backend.clone();
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
             handle.block_on(process_files(
-                files, groups, context, crate::llm::ProviderBackend::Ollama,
+                files, groups, context, backend,
                 gen_model, ext_model, rev_model, vis_model,
                 emb_model, mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
@@ -621,6 +649,7 @@ impl DockOckApp {
         let selection = self.selection.clone();
         let model = self.generator_model.clone();
         let handle = self.runtime.clone();
+        let backend = self.backend.clone();
 
         let (tx, rx): (Sender<ProcessingEvent>, Receiver<ProcessingEvent>) = mpsc::channel();
         self.event_rx = Some(rx);
@@ -632,7 +661,7 @@ impl DockOckApp {
 
         std::thread::spawn(move || {
             handle.block_on(async move {
-                let prompt = format!(
+                let preamble = format!(
                     "You are a Gherkin expert. The user has generated the following Gherkin feature file \
                      and wants you to refine it.\n\n\
                      === CURRENT GHERKIN ===\n{}\n\n\
@@ -643,68 +672,97 @@ impl DockOckApp {
                     current_gherkin, instruction
                 );
 
-                let num_ctx = crate::llm::context_window_for_model(&model);
-                let client = reqwest::Client::new();
-                let resp = client
-                    .post(format!("{}/api/generate", crate::llm::ENDPOINT_GENERATOR.url))
-                    .json(&serde_json::json!({
-                        "model": model,
-                        "prompt": prompt,
-                        "stream": false,
-                        "options": { "num_ctx": num_ctx },
-                    }))
-                    .send()
-                    .await;
-
-                match resp {
-                    Ok(r) => {
-                        if let Ok(body) = r.json::<serde_json::Value>().await {
-                            if let Some(text) = body["response"].as_str() {
-                                let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
-                                    text,
-                                    "refinement",
-                                );
-
-                                match selection {
-                                    Some(Selection::File(idx)) => {
-                                        // We need the path but we don't have selected_files here.
-                                        // Send as a status + re-use the FileResult event with a
-                                        // placeholder path that will be resolved by the UI.
-                                        let _ = tx.send(ProcessingEvent::Status(format!(
-                                            "✏ Refinement complete (file index {})", idx
-                                        )));
-                                        // Use a synthetic path marker
-                                        let _ = tx.send(ProcessingEvent::FileResult {
-                                            path: PathBuf::from(format!("__refine_file_{}", idx)),
-                                            gherkin: doc,
-                                            elapsed: std::time::Duration::ZERO,
-                                        });
-                                    }
-                                    Some(Selection::Group(name)) => {
-                                        let _ = tx.send(ProcessingEvent::GroupResult {
-                                            group_name: name,
-                                            gherkin: doc,
-                                            elapsed: std::time::Duration::ZERO,
-                                        });
-                                    }
-                                    None => {}
-                                }
-                            } else {
-                                let _ = tx.send(ProcessingEvent::Status(
-                                    "⚠ Refinement: unexpected LLM response format".to_string(),
-                                ));
+                let result = match &backend {
+                    crate::llm::ProviderBackend::Ollama => {
+                        // Raw HTTP to local Ollama
+                        let num_ctx = crate::llm::context_window_for_model(&model);
+                        let client = reqwest::Client::new();
+                        let resp = client
+                            .post(format!("{}/api/generate", crate::llm::ENDPOINT_GENERATOR.url))
+                            .json(&serde_json::json!({
+                                "model": model,
+                                "prompt": preamble,
+                                "stream": false,
+                                "options": { "num_ctx": num_ctx },
+                            }))
+                            .send()
+                            .await;
+                        match resp {
+                            Ok(r) => match r.json::<serde_json::Value>().await {
+                                Ok(body) => body["response"].as_str().map(|s| s.to_string()),
+                                Err(_) => None,
+                            },
+                            Err(e) => {
+                                let _ = tx.send(ProcessingEvent::Status(format!(
+                                    "⚠ Refinement failed: {}", e
+                                )));
+                                None
                             }
-                        } else {
-                            let _ = tx.send(ProcessingEvent::Status(
-                                "⚠ Refinement: failed to parse LLM response".to_string(),
-                            ));
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(ProcessingEvent::Status(format!(
-                            "⚠ Refinement failed: {}", e
-                        )));
+                    crate::llm::ProviderBackend::Custom { base_url, api_key, .. } => {
+                        // OpenAI-compatible API
+                        use rig::client::CompletionClient;
+                        use rig::completion::Prompt;
+                        use rig::providers::openai;
+
+                        match openai::CompletionsClient::builder()
+                            .api_key(api_key)
+                            .base_url(base_url)
+                            .build()
+                        {
+                            Ok(client) => {
+                                let agent = client.agent(&model).build();
+                                match agent.prompt(&preamble).await {
+                                    Ok(text) => Some(text),
+                                    Err(e) => {
+                                        let _ = tx.send(ProcessingEvent::Status(format!(
+                                            "⚠ Refinement failed: {}", e
+                                        )));
+                                        None
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ProcessingEvent::Status(format!(
+                                    "⚠ Failed to create client: {}", e
+                                )));
+                                None
+                            }
+                        }
                     }
+                };
+
+                if let Some(text) = result {
+                    let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                        &text,
+                        "refinement",
+                    );
+
+                    match selection {
+                        Some(Selection::File(idx)) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "✏ Refinement complete (file index {})", idx
+                            )));
+                            let _ = tx.send(ProcessingEvent::FileResult {
+                                path: PathBuf::from(format!("__refine_file_{}", idx)),
+                                gherkin: doc,
+                                elapsed: std::time::Duration::ZERO,
+                            });
+                        }
+                        Some(Selection::Group(name)) => {
+                            let _ = tx.send(ProcessingEvent::GroupResult {
+                                group_name: name,
+                                gherkin: doc,
+                                elapsed: std::time::Duration::ZERO,
+                            });
+                        }
+                        None => {}
+                    }
+                } else if result.is_none() {
+                    let _ = tx.send(ProcessingEvent::Status(
+                        "⚠ Refinement: no response from LLM".to_string(),
+                    ));
                 }
 
                 let _ = tx.send(ProcessingEvent::Done(Ok(())));
@@ -910,19 +968,108 @@ impl DockOckApp {
 
         ui.add_space(2.0);
 
-        // ── Row 2: Models, Pipeline, Concurrency ──
+        // ── Row 2: Provider, Models, Pipeline, Concurrency ──
         ui.horizontal(|ui| {
+            // Provider selector
+            ui.label("Provider:");
+            let current_label = self.backend.display_name().to_string();
+            let was_custom = self.backend.is_custom();
+            egui::ComboBox::from_id_salt("provider_backend")
+                .selected_text(&current_label)
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    // Ollama option
+                    if ui.selectable_label(
+                        matches!(self.backend, crate::llm::ProviderBackend::Ollama),
+                        "Ollama (local)",
+                    ).clicked() {
+                        self.backend = crate::llm::ProviderBackend::Ollama;
+                    }
+                    // Custom providers from JSON — collect names to avoid borrow conflict
+                    let provider_names: Vec<String> = self.custom_providers.iter()
+                        .map(|c| c.name.clone())
+                        .collect();
+                    for pname in &provider_names {
+                        let is_selected = match &self.backend {
+                            crate::llm::ProviderBackend::Custom { name, .. } => name == pname,
+                            _ => false,
+                        };
+                        if ui.selectable_label(is_selected, pname).clicked() {
+                            if let Some(be) = crate::llm::build_custom_backend(&self.custom_providers) {
+                                self.backend = be;
+                            } else {
+                                self.log(LogLevel::Warning, format!(
+                                    "No API key found for provider '{}'. Set the env var and restart.",
+                                    pname
+                                ));
+                            }
+                        }
+                    }
+                });
+
+            // Auto-assign models when provider changes
+            let is_custom = self.backend.is_custom();
+            if is_custom && !was_custom {
+                // Switching TO custom — save Ollama models & apply defaults
+                self.saved_ollama_models = (
+                    self.generator_model.clone(),
+                    self.extractor_model.clone(),
+                    self.reviewer_model.clone(),
+                );
+                if let Some(cfg) = self.custom_providers.first() {
+                    let models: Vec<String> = cfg.models.keys().cloned().collect();
+                    let first = models.first().cloned().unwrap_or_default();
+                    self.generator_model = cfg.defaults.generator.clone().unwrap_or_else(|| first.clone());
+                    self.extractor_model = cfg.defaults.extractor.clone().unwrap_or_else(|| first.clone());
+                    self.reviewer_model = cfg.defaults.reviewer.clone().unwrap_or(first);
+                }
+            } else if !is_custom && was_custom {
+                // Switching BACK to Ollama — restore saved models
+                self.generator_model = self.saved_ollama_models.0.clone();
+                self.extractor_model = self.saved_ollama_models.1.clone();
+                self.reviewer_model = self.saved_ollama_models.2.clone();
+            }
+
+            // API key indicator for custom providers
+            if self.backend.is_custom() {
+                ui.colored_label(egui::Color32::GREEN, "🔑");
+            }
+
+            ui.separator();
             ui.label("Models ─");
+
+            // Gen/Ext/Rev use custom models when custom provider selected
+            let custom_models: Vec<String> = if self.backend.is_custom() {
+                crate::llm::custom_model_ids(&self.custom_providers)
+            } else {
+                Vec::new()
+            };
+
             ui.label("Gen:");
-            model_combo(ui, "gen_model", &mut self.generator_model);
+            if self.backend.is_custom() {
+                custom_model_combo(ui, "gen_model", &mut self.generator_model, &custom_models);
+            } else {
+                model_combo(ui, "gen_model", &mut self.generator_model);
+            }
             ui.label("Ext:");
-            model_combo(ui, "ext_model", &mut self.extractor_model);
+            if self.backend.is_custom() {
+                custom_model_combo(ui, "ext_model", &mut self.extractor_model, &custom_models);
+            } else {
+                model_combo(ui, "ext_model", &mut self.extractor_model);
+            }
             ui.label("Rev:");
-            model_combo(ui, "rev_model", &mut self.reviewer_model);
+            if self.backend.is_custom() {
+                custom_model_combo(ui, "rev_model", &mut self.reviewer_model, &custom_models);
+            } else {
+                model_combo(ui, "rev_model", &mut self.reviewer_model);
+            }
+
+            // Vision & Embedding always use local Ollama models
             ui.label("Vis:");
             model_combo(ui, "vis_model", &mut self.vision_model);
             ui.label("Emb:");
             model_combo(ui, "emb_model", &mut self.embedding_model);
+
             ui.separator();
             ui.label("Pipeline:");
             egui::ComboBox::from_id_salt("pipeline_mode")
@@ -1832,11 +1979,23 @@ async fn process_files(
     let _ = tx.send(ProcessingEvent::Status(
         "🧠 [RAG] Embedding document chunks…".to_string(),
     ));
-    let mut rag_engine = crate::rag::RagEngine::new(
+    let surreal_path = openspec_output_dir.as_deref();
+    let mut rag_engine = match crate::rag::RagEngine::new(
+        surreal_path,
         crate::llm::ENDPOINT_EXTRACTOR.url,
         &embedding_model,
-        cache.clone(),
-    );
+    ).await {
+        Ok(engine) => engine,
+        Err(e) => {
+            let _ = tx.send(ProcessingEvent::Status(format!(
+                "⚠ [RAG] SurrealDB init failed: {} — RAG disabled", e
+            )));
+            // Create a fallback in-memory engine so we can continue without RAG
+            crate::rag::RagEngine::new(None, crate::llm::ENDPOINT_EXTRACTOR.url, &embedding_model)
+                .await
+                .expect("in-memory SurrealDB should not fail")
+        }
+    };
     let mut rag_ok = true;
     for (path, (file_type, text, _images)) in &parsed_map {
         let fname = path

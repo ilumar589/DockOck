@@ -158,6 +158,16 @@
 
         }
 
+      },
+
+      "defaults": {
+
+        "generator": "deepseek-v3-2-251201",
+
+        "extractor": "seed-1-6-flash-250715",
+
+        "reviewer": "kimi-k2-thinking-251104"
+
       }
 
     }
