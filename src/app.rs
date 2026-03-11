@@ -850,6 +850,7 @@ impl DockOckApp {
     // ── UI rendering ─────────────────────────────────────────────────────
 
     fn render_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // ── Row 1: Title, Ollama status, Output directory ──
         ui.horizontal(|ui| {
             ui.heading("🦆 DockOck");
             ui.separator();
@@ -872,7 +873,43 @@ impl DockOckApp {
                 }
             }
             ui.separator();
-            ui.label("Models:");
+            ui.label("📁 Output:");
+            if let Some(dir) = &self.output_dir {
+                let dir_display = dir.to_string_lossy();
+                ui.label(dir_display.as_ref()).on_hover_text(dir_display.as_ref());
+                if ui.small_button("✖").on_hover_text("Clear output directory").clicked() {
+                    self.output_dir = None;
+                }
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(180, 180, 60), "Not set");
+            }
+            if ui.button("Browse…").clicked() {
+                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                    self.log(LogLevel::Info, format!("Output directory: {}", dir.display()));
+                    self.output_dir = Some(dir.clone());
+                    if crate::session::exists(&dir) {
+                        self.session_restore_pending = true;
+                    }
+                }
+            }
+            ui.separator();
+            ui.checkbox(&mut self.force_regenerate, "🔄 Force")
+                .on_hover_text("Force re-generation, bypassing cache");
+            ui.checkbox(&mut self.openspec_enabled, "📦 OpenSpec");
+            if self.openspec_enabled {
+                match self.openspec_ok {
+                    Some(true) => { ui.colored_label(egui::Color32::GREEN, "●"); }
+                    Some(false) => { ui.colored_label(egui::Color32::RED, "●"); }
+                    None => { ui.colored_label(egui::Color32::GRAY, "○"); }
+                }
+            }
+        });
+
+        ui.add_space(2.0);
+
+        // ── Row 2: Models, Pipeline, Concurrency ──
+        ui.horizontal(|ui| {
+            ui.label("Models ─");
             ui.label("Gen:");
             model_combo(ui, "gen_model", &mut self.generator_model);
             ui.label("Ext:");
@@ -892,49 +929,9 @@ impl DockOckApp {
                         ui.selectable_value(&mut self.pipeline_mode, mode, mode.to_string());
                     }
                 });
-            ui.separator();
             ui.label("∥");
             ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=8).speed(0.1))
                 .on_hover_text("Max concurrent LLM tasks");
-            ui.separator();
-            ui.checkbox(&mut self.force_regenerate, "🔄 Force")
-                .on_hover_text("Force re-generation, bypassing cache");
-            ui.separator();
-            ui.checkbox(&mut self.openspec_enabled, "📦 OpenSpec");
-            if self.openspec_enabled {
-                match self.openspec_ok {
-                    Some(true) => {
-                        ui.colored_label(egui::Color32::GREEN, "●");
-                    }
-                    Some(false) => {
-                        ui.colored_label(egui::Color32::RED, "●");
-                    }
-                    None => {
-                        ui.colored_label(egui::Color32::GRAY, "○");
-                    }
-                }
-            }
-            ui.separator();
-            ui.label("📁 Output:");
-            if let Some(dir) = &self.output_dir {
-                let dir_display = dir.to_string_lossy();
-                ui.label(dir_display.as_ref()).on_hover_text(dir_display.as_ref());
-                if ui.small_button("✖").on_hover_text("Clear output directory").clicked() {
-                    self.output_dir = None;
-                }
-            } else {
-                ui.colored_label(egui::Color32::from_rgb(180, 180, 60), "Not set");
-            }
-            if ui.button("Browse…").clicked() {
-                if let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    self.log(LogLevel::Info, format!("Output directory: {}", dir.display()));
-                    self.output_dir = Some(dir.clone());
-                    // Check for existing session
-                    if crate::session::exists(&dir) {
-                        self.session_restore_pending = true;
-                    }
-                }
-            }
         });
     }
 
