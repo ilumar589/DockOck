@@ -23,6 +23,9 @@ egui = "0.33.3"
 # LLM integration (Ollama via rig-core)
 rig-core = "0.32.0"
 
+# Environment file loading
+dotenv = "0.15"
+
 # File parsing – Excel
 calamine = { version = "0.34.0", features = ["dates"] }
 
@@ -51,3 +54,15 @@ reqwest = { version = "0.13.2", features = ["json"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Caching
+sha2 = "0.10"
+postcard = { version = "1", features = ["alloc"] }
+
+# Text processing
+regex = "1"
+
+# SurrealDB embedded vector store for RAG persistence
+# kv-surrealkv = pure-Rust persistent storage (no cmake/LLVM needed)
+# kv-mem = in-memory fallback
+surrealdb = { version = "2.5", features = ["kv-surrealkv", "kv-mem"] }

@@ -10,6 +10,13 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -33,6 +40,13 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -43,6 +57,8 @@ services:
         sleep 5
         echo "Pulling qwen2.5-coder:7b model..."
         ollama pull qwen2.5-coder:7b || true
+        echo "Pulling nomic-embed-text embedding model..."
+        ollama pull nomic-embed-text || true
         wait $$OLLAMA_PID
 
   # Fourth instance – Vision / image description (port 11437)
@@ -56,6 +72,13 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=2
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -79,6 +102,13 @@ services:
     environment:
       - OLLAMA_HOST=0.0.0.0
       - OLLAMA_NUM_PARALLEL=4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:

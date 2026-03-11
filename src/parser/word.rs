@@ -61,7 +61,12 @@ fn read_zip_entry<R: Read + std::io::Seek>(
 // Top-level XML walker
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Walk the body of `word/document.xml` and produce readable plain text.
+/// Walk the body of `word/document.xml` and produce readable plain text
+/// with a structural outline prepended.
+///
+/// The output begins with a `=== DOCUMENT STRUCTURE ===` header that lists
+/// all top-level sections (headings) together with paragraph and table counts.
+/// This gives the LLM an overview before diving into the content.
 ///
 /// Top-level body children are processed in document order:
 /// * `<w:p>`   → [`extract_paragraph`]
@@ -78,8 +83,98 @@ fn extract_text_from_xml(xml: &str) -> Result<String> {
         .find(|n| n.is_element() && n.tag_name().name() == "body")
         .ok_or_else(|| anyhow::anyhow!("No <w:body> element found in document.xml"))?;
 
-    let mut output = String::new();
+    // ── First pass: collect structure metadata ──
+    struct SectionInfo {
+        heading: String,
+        paragraphs: usize,
+        tables: usize,
+    }
 
+    let mut sections: Vec<SectionInfo> = Vec::new();
+    let mut title: Option<String> = None;
+    // Track items before the first heading
+    let mut pre_heading_paragraphs = 0usize;
+    let mut pre_heading_tables = 0usize;
+
+    for child in body.children() {
+        if !child.is_element() {
+            continue;
+        }
+        match child.tag_name().name() {
+            "p" => {
+                let style = paragraph_style(&child);
+                let is_heading = matches!(
+                    style.as_deref(),
+                    Some("Title") | Some("title")
+                ) || style.as_ref().is_some_and(|s| {
+                    s.to_ascii_lowercase().starts_with("heading")
+                        || matches!(s.as_str(), "1" | "2" | "3")
+                });
+
+                if is_heading {
+                    let text = extract_paragraph(&child);
+                    if !text.is_empty() {
+                        // Capture the title specifically
+                        if matches!(style.as_deref(), Some("Title") | Some("title"))
+                            && title.is_none()
+                        {
+                            title = Some(text.trim_start_matches('#').trim().to_string());
+                        }
+                        sections.push(SectionInfo {
+                            heading: text.trim_start_matches('#').trim().to_string(),
+                            paragraphs: 0,
+                            tables: 0,
+                        });
+                    }
+                } else {
+                    let text = extract_paragraph(&child);
+                    if !text.is_empty() {
+                        if let Some(last) = sections.last_mut() {
+                            last.paragraphs += 1;
+                        } else {
+                            pre_heading_paragraphs += 1;
+                        }
+                    }
+                }
+            }
+            "tbl" => {
+                if let Some(last) = sections.last_mut() {
+                    last.tables += 1;
+                } else {
+                    pre_heading_tables += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ── Build structural outline ──
+    let mut output = String::new();
+    if !sections.is_empty() {
+        output.push_str("=== DOCUMENT STRUCTURE ===\n");
+        if let Some(ref t) = title {
+            output.push_str(&format!("Title: {}\n", t));
+        }
+        if pre_heading_paragraphs > 0 || pre_heading_tables > 0 {
+            output.push_str(&format!(
+                "  (preamble: {} paragraphs, {} tables)\n",
+                pre_heading_paragraphs, pre_heading_tables
+            ));
+        }
+        output.push_str("Sections:\n");
+        for (i, sec) in sections.iter().enumerate() {
+            output.push_str(&format!(
+                "  {}. {} (paragraphs: {}, tables: {})\n",
+                i + 1,
+                sec.heading,
+                sec.paragraphs,
+                sec.tables,
+            ));
+        }
+        output.push_str("\n=== SECTION CONTENT ===\n\n");
+    }
+
+    // ── Second pass: emit content ──
     for child in body.children() {
         if !child.is_element() {
             continue;

@@ -22,7 +22,7 @@ pub struct FileContent {
 
 /// A named collection of files whose content is merged into a single
 /// aggregated context before Gherkin generation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileGroup {
     /// Human-readable group label (e.g. "D028_Requirements")
     pub name: String,
@@ -102,6 +102,101 @@ impl ProjectContext {
         self.entities.clear();
         self.notes.clear();
     }
+
+    /// Extract named entities (actors, systems, data objects) from all file contents.
+    ///
+    /// Uses heuristic patterns to find capitalised multi-word terms and known
+    /// keywords that indicate actors, systems, or data objects. The results
+    /// populate `self.entities` for injection into LLM prompts as a glossary.
+    pub fn extract_entities(&mut self) {
+        let mut found: HashSet<String> = HashSet::new();
+
+        // Keywords that often precede actor/system/entity names
+        let actor_signals = [
+            "the ", "a ", "an ", "user ", "admin ", "manager ", "system ",
+            "service ", "module ", "component ", "server ", "client ",
+            "portal ", "gateway ", "engine ", "agent ", "api ",
+        ];
+
+        for content in self.file_contents.values() {
+            let text = &content.raw_text;
+
+            for line in text.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                // Pattern 1: Capitalised multi-word terms (e.g. "Invoice Processing System")
+                // Look for runs of 2-5 capitalised words
+                let words: Vec<&str> = trimmed.split_whitespace().collect();
+                let mut i = 0;
+                while i < words.len() {
+                    if starts_with_upper(words[i]) && words[i].len() > 1 && words[i].chars().all(|c| c.is_alphanumeric()) {
+                        let mut j = i + 1;
+                        while j < words.len()
+                            && j - i < 5
+                            && starts_with_upper(words[j])
+                            && words[j].len() > 1
+                            && words[j].chars().all(|c| c.is_alphanumeric())
+                        {
+                            j += 1;
+                        }
+                        if j - i >= 2 {
+                            let term: String = words[i..j].join(" ");
+                            // Filter out common non-entity phrases
+                            if !is_noise_phrase(&term) {
+                                found.insert(term);
+                            }
+                        }
+                        i = j;
+                    } else {
+                        i += 1;
+                    }
+                }
+
+                // Pattern 2: Terms after actor signal keywords in table cells / labels
+                let lower = trimmed.to_lowercase();
+                for signal in &actor_signals {
+                    if let Some(pos) = lower.find(signal) {
+                        let after = &trimmed[pos + signal.len()..];
+                        let candidate: String = after
+                            .split(|c: char| !c.is_alphanumeric() && c != ' ' && c != '-')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if candidate.len() >= 3 && starts_with_upper(&candidate) && !is_noise_phrase(&candidate) {
+                            found.insert(candidate);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sort and deduplicate
+        let mut entities: Vec<String> = found.into_iter().collect();
+        entities.sort();
+        self.entities = entities;
+    }
+
+    /// Build a glossary string for injection into LLM prompts.
+    ///
+    /// Returns an empty string if no entities have been extracted.
+    pub fn build_glossary(&self) -> String {
+        if self.entities.is_empty() {
+            return String::new();
+        }
+
+        let mut glossary = String::from("=== PROJECT GLOSSARY ===\n");
+        glossary.push_str("The following named entities were found across all project documents.\n");
+        glossary.push_str("Use ONLY these terms (or close variants) in your Gherkin scenarios:\n\n");
+        for entity in &self.entities {
+            glossary.push_str(&format!("  - {}\n", entity));
+        }
+        glossary.push('\n');
+        glossary
+    }
 }
 
 /// Compute automatic file groups from a list of paths.
@@ -129,4 +224,27 @@ pub fn compute_auto_groups(files: &[PathBuf]) -> Vec<FileGroup> {
 
     groups.sort_by(|a, b| a.name.cmp(&b.name));
     groups
+}
+
+/// Check if a string starts with an uppercase letter.
+fn starts_with_upper(s: &str) -> bool {
+    s.chars().next().is_some_and(|c| c.is_uppercase())
+}
+
+/// Filter out common capitalised phrases that are not meaningful entities.
+fn is_noise_phrase(s: &str) -> bool {
+    const NOISE: &[&str] = &[
+        "The", "This", "That", "These", "Those", "There",
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+        "True", "False", "Yes", "No", "None", "All", "Any",
+        "Table", "Figure", "Page", "Section", "Chapter", "Appendix",
+        "Note", "Version", "Document", "Sheet", "Row", "Column",
+    ];
+    if NOISE.contains(&s) {
+        return true;
+    }
+    // Very short or very long phrases are unlikely to be useful entities
+    s.len() < 4 || s.len() > 60
 }

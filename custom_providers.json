@@ -1,0 +1,178 @@
+{
+
+  "$schema": "https://opencode.ai/config.json",
+
+  "provider": {
+
+    "bytedance": {
+
+      "npm": "@ai-sdk/openai-compatible",
+
+      "name": "rinf.tech AIArk",
+
+      "options": {
+
+        "baseURL": "https://ark.ap-southeast.bytepluses.com/api/v3"
+
+      },
+
+      "models": {
+
+        "kimi-k2-250905": {
+
+          "name": "Kimi K2",
+
+          "limit": {
+
+            "context": 256000,
+
+            "output": 32768
+
+          }
+
+        },
+
+        "seed-1-8-251228": {
+
+          "name": "Seed 1.8",
+
+          "limit": {
+
+            "context": 224000,
+
+            "output": 64000
+
+          }
+
+        },
+
+        "seed-1-6-250915": {
+
+          "name": "Seed 1.6",
+
+          "limit": {
+
+            "context": 224000,
+
+            "output": 32000
+
+          }
+
+        },
+
+        "seed-1-6-flash-250715": {
+
+          "name": "Seed 1.6 Flash",
+
+          "limit": {
+
+            "context": 256000,
+
+            "output": 16000
+
+          }
+
+        },
+
+        "deepseek-v3-2-251201": {
+
+          "name": "DeepSeek V3.2",
+
+          "limit": {
+
+            "context": 120000,
+
+            "output": 32768
+
+          }
+
+        },
+
+        "gpt-oss-120b-250805": {
+
+          "name": "GPT OSS 120B",
+
+          "limit": {
+
+            "context": 128000,
+
+            "output": 64000
+
+          }
+
+        },
+
+        "kimi-k2-thinking-251104": {
+
+          "name": "Kimi K2 Thinking",
+
+          "limit": {
+
+            "context": 256000,
+
+            "output": 32000
+
+          }
+
+        },
+
+        "seed-2-0-mini-260215": {
+
+          "name": "Seed 2.0 260215",
+
+          "limit": {
+
+            "context": 262144,
+
+            "output": 131072
+
+          }
+
+        },
+
+        "seed-2-0-lite-260228": {
+
+          "name": "Seed 2.0 Lite",
+
+          "limit": {
+
+            "context": 262144,
+
+            "output": 131072
+
+          }
+
+        },
+
+        "glm-4-7-251222": {
+
+          "name": "GLM 4.7",
+
+          "limit": {
+
+            "context": 220000,
+
+            "output": 131072
+
+          }
+
+        }
+
+      },
+
+      "defaults": {
+
+        "generator": "deepseek-v3-2-251201",
+
+        "extractor": "seed-1-6-flash-250715",
+
+        "reviewer": "kimi-k2-thinking-251104"
+
+      }
+
+    }
+
+  }
+
+}
+ 

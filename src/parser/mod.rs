@@ -16,7 +16,7 @@ use anyhow::{Result, anyhow};
 use std::path::Path;
 
 /// An image extracted from a document.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExtractedImage {
     /// Human-readable label (alt-text, filename, etc.)
     pub label: String,
@@ -28,7 +28,7 @@ pub struct ExtractedImage {
 }
 
 /// Result of parsing a document file.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ParseResult {
     /// Human-readable file type label ("Word", "Excel", "Visio")
     pub file_type: String,

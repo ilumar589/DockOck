@@ -14,13 +14,19 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod cache;
 mod context;
 mod gherkin;
 mod llm;
 mod openspec;
 mod parser;
+mod rag;
+mod session;
 
 fn main() -> eframe::Result<()> {
+    // Load .env file (API keys, custom provider settings)
+    dotenv::dotenv().ok();
+
     // Initialise tracing for debug logs
     tracing_subscriber::fmt()
         .with_env_filter(
