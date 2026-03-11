@@ -23,6 +23,7 @@ use rig::agent::{MultiTurnStreamItem, Text};
 use rig::client::{CompletionClient, Nothing};
 use rig::completion::{Message, Prompt};
 use rig::providers::ollama;
+use rig::providers::openai;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use sha2::Digest;
 use std::sync::Arc;
@@ -32,7 +33,9 @@ use tracing::{info, warn};
 use crate::context::ProjectContext;
 
 pub mod prefix_cache;
+pub mod provider;
 pub use prefix_cache::PrefixCache;
+pub use provider::ProviderBackend;
 
 /// Default model used for the generator agent.
 pub const DEFAULT_GENERATOR_MODEL: &str = "qwen2.5-coder:32b";
@@ -281,11 +284,15 @@ fn create_client_for(endpoint: &OllamaEndpoint) -> Result<ollama::Client> {
         ))
 }
 
-/// The orchestrator that owns clients for all reachable Ollama instances.
+/// The orchestrator that owns clients for all reachable LLM instances.
 pub struct AgentOrchestrator {
+    backend: ProviderBackend,
+    /// Ollama clients (present when backend is Ollama)
+    generator_client: Option<ollama::Client>,
     extractor_client: Option<ollama::Client>,
-    generator_client: ollama::Client,
     reviewer_client: Option<ollama::Client>,
+    /// OpenAI-compatible client (present when backend is Custom)
+    openai_client: Option<openai::CompletionsClient>,
     vision_endpoint_url: String,
     generator_model: String,
     extractor_model: String,
@@ -294,9 +301,8 @@ pub struct AgentOrchestrator {
     pub semaphore: Arc<Semaphore>,
     pub mode: PipelineMode,
     cache: crate::cache::DiskCache,
-    /// KV-cache for generator shared prefix (preamble + glossary).
-    /// Wrapped in a Mutex so we can prime it after construction.
-    generator_prefix_cache: tokio::sync::Mutex<PrefixCache>,
+    /// KV-cache for generator shared prefix (Ollama only).
+    generator_prefix_cache: Option<tokio::sync::Mutex<PrefixCache>>,
 }
 
 /// Result of checking which Ollama endpoints are reachable.
@@ -308,9 +314,11 @@ pub struct EndpointStatus {
 }
 
 impl AgentOrchestrator {
-    /// Create the orchestrator, probing all endpoints.
-    /// At minimum the generator (port 11434) must be reachable.
+    /// Create the orchestrator, probing endpoints as appropriate.
+    /// For Ollama backend: at minimum the generator (port 11434) must be reachable.
+    /// For Custom backend: only the vision endpoint is probed locally.
     pub async fn new(
+        backend: ProviderBackend,
         generator_model: &str,
         extractor_model: &str,
         reviewer_model: &str,
@@ -321,124 +329,189 @@ impl AgentOrchestrator {
     ) -> Result<(Self, Vec<EndpointStatus>)> {
         let mut statuses = Vec::new();
 
-        // Check each endpoint
-        let gen_ok = check_endpoint(&ENDPOINT_GENERATOR).await;
-        statuses.push(EndpointStatus {
-            name: ENDPOINT_GENERATOR.name,
-            url: ENDPOINT_GENERATOR.url,
-            reachable: gen_ok,
-        });
+        match &backend {
+            ProviderBackend::Ollama => {
+                // ── Ollama: probe all 4 local endpoints ──
+                let gen_ok = check_endpoint(&ENDPOINT_GENERATOR).await;
+                statuses.push(EndpointStatus {
+                    name: ENDPOINT_GENERATOR.name,
+                    url: ENDPOINT_GENERATOR.url,
+                    reachable: gen_ok,
+                });
 
-        let ext_ok = check_endpoint(&ENDPOINT_EXTRACTOR).await;
-        statuses.push(EndpointStatus {
-            name: ENDPOINT_EXTRACTOR.name,
-            url: ENDPOINT_EXTRACTOR.url,
-            reachable: ext_ok,
-        });
+                let ext_ok = check_endpoint(&ENDPOINT_EXTRACTOR).await;
+                statuses.push(EndpointStatus {
+                    name: ENDPOINT_EXTRACTOR.name,
+                    url: ENDPOINT_EXTRACTOR.url,
+                    reachable: ext_ok,
+                });
 
-        let rev_ok = check_endpoint(&ENDPOINT_REVIEWER).await;
-        statuses.push(EndpointStatus {
-            name: ENDPOINT_REVIEWER.name,
-            url: ENDPOINT_REVIEWER.url,
-            reachable: rev_ok,
-        });
+                let rev_ok = check_endpoint(&ENDPOINT_REVIEWER).await;
+                statuses.push(EndpointStatus {
+                    name: ENDPOINT_REVIEWER.name,
+                    url: ENDPOINT_REVIEWER.url,
+                    reachable: rev_ok,
+                });
 
-        let vis_ok = check_endpoint(&ENDPOINT_VISION).await;
-        statuses.push(EndpointStatus {
-            name: ENDPOINT_VISION.name,
-            url: ENDPOINT_VISION.url,
-            reachable: vis_ok,
-        });
+                let vis_ok = check_endpoint(&ENDPOINT_VISION).await;
+                statuses.push(EndpointStatus {
+                    name: ENDPOINT_VISION.name,
+                    url: ENDPOINT_VISION.url,
+                    reachable: vis_ok,
+                });
 
-        if !gen_ok {
-            anyhow::bail!(
-                "Generator Ollama instance at {} is not reachable. \
-                 At minimum this instance must be running.",
-                ENDPOINT_GENERATOR.url
-            );
-        }
+                if !gen_ok {
+                    anyhow::bail!(
+                        "Generator Ollama instance at {} is not reachable. \
+                         At minimum this instance must be running.",
+                        ENDPOINT_GENERATOR.url
+                    );
+                }
 
-        let generator_client = create_client_for(&ENDPOINT_GENERATOR)?;
+                let generator_client = Some(create_client_for(&ENDPOINT_GENERATOR)?);
 
-        let extractor_client = if ext_ok {
-            info!("Extractor agent available at {}", ENDPOINT_EXTRACTOR.url);
-            Some(create_client_for(&ENDPOINT_EXTRACTOR)?)
-        } else {
-            warn!("Extractor instance not available — generator will handle extraction");
-            None
-        };
+                let extractor_client = if ext_ok {
+                    info!("Extractor agent available at {}", ENDPOINT_EXTRACTOR.url);
+                    Some(create_client_for(&ENDPOINT_EXTRACTOR)?)
+                } else {
+                    warn!("Extractor instance not available — generator will handle extraction");
+                    None
+                };
 
-        let reviewer_client = if rev_ok {
-            info!("Reviewer agent available at {}", ENDPOINT_REVIEWER.url);
-            Some(create_client_for(&ENDPOINT_REVIEWER)?)
-        } else {
-            warn!("Reviewer instance not available — skipping review step");
-            None
-        };
+                let reviewer_client = if rev_ok {
+                    info!("Reviewer agent available at {}", ENDPOINT_REVIEWER.url);
+                    Some(create_client_for(&ENDPOINT_REVIEWER)?)
+                } else {
+                    warn!("Reviewer instance not available — skipping review step");
+                    None
+                };
 
-        let vision_endpoint_url = if vis_ok {
-            info!("Vision agent available at {}", ENDPOINT_VISION.url);
-            ENDPOINT_VISION.url.to_string()
-        } else {
-            warn!("Vision instance not available — falling back to extractor/generator for vision");
-            if ext_ok {
-                ENDPOINT_EXTRACTOR.url.to_string()
-            } else {
-                ENDPOINT_GENERATOR.url.to_string()
+                let vision_endpoint_url = if vis_ok {
+                    info!("Vision agent available at {}", ENDPOINT_VISION.url);
+                    ENDPOINT_VISION.url.to_string()
+                } else {
+                    warn!("Vision instance not available — falling back to extractor/generator for vision");
+                    if ext_ok {
+                        ENDPOINT_EXTRACTOR.url.to_string()
+                    } else {
+                        ENDPOINT_GENERATOR.url.to_string()
+                    }
+                };
+
+                let active_count = 1 + ext_ok as usize + rev_ok as usize + vis_ok as usize;
+                let concurrency = max_concurrent.max(active_count);
+
+                Ok((
+                    Self {
+                        backend,
+                        generator_client,
+                        extractor_client,
+                        reviewer_client,
+                        openai_client: None,
+                        vision_endpoint_url,
+                        generator_model: generator_model.to_string(),
+                        extractor_model: extractor_model.to_string(),
+                        reviewer_model: reviewer_model.to_string(),
+                        vision_model: vision_model.to_string(),
+                        semaphore: Arc::new(Semaphore::new(concurrency)),
+                        mode,
+                        cache,
+                        generator_prefix_cache: Some(tokio::sync::Mutex::new(
+                            PrefixCache::new(ENDPOINT_GENERATOR.url, generator_model)
+                        )),
+                    },
+                    statuses,
+                ))
             }
-        };
+            ProviderBackend::Custom { name, base_url, api_key } => {
+                // ── Custom: single OpenAI-compatible client for text roles ──
+                info!("Using custom provider: {name} at {base_url}");
 
-        let active_count = 1 + ext_ok as usize + rev_ok as usize + vis_ok as usize;
-        let concurrency = max_concurrent.max(active_count);
+                let openai_client = openai::CompletionsClient::builder()
+                    .api_key(api_key)
+                    .base_url(base_url)
+                    .build()
+                    .with_context(|| format!("Failed to create OpenAI-compatible client for {}", name))?;
 
-        Ok((
-            Self {
-                extractor_client,
-                generator_client,
-                reviewer_client,
-                vision_endpoint_url,
-                generator_model: generator_model.to_string(),
-                extractor_model: extractor_model.to_string(),
-                reviewer_model: reviewer_model.to_string(),
-                vision_model: vision_model.to_string(),
-                semaphore: Arc::new(Semaphore::new(concurrency)),
-                mode,
-                cache,
-                generator_prefix_cache: tokio::sync::Mutex::new(
-                    PrefixCache::new(ENDPOINT_GENERATOR.url, &generator_model)
-                ),
-            },
-            statuses,
-        ))
+                // Only probe the local vision endpoint
+                let vis_ok = check_endpoint(&ENDPOINT_VISION).await;
+                statuses.push(EndpointStatus {
+                    name: "Cloud API",
+                    url: Box::leak(base_url.clone().into_boxed_str()),
+                    reachable: true, // assume cloud is reachable; errors surface at call time
+                });
+                statuses.push(EndpointStatus {
+                    name: ENDPOINT_VISION.name,
+                    url: ENDPOINT_VISION.url,
+                    reachable: vis_ok,
+                });
+
+                let vision_endpoint_url = if vis_ok {
+                    info!("Vision agent available at {}", ENDPOINT_VISION.url);
+                    ENDPOINT_VISION.url.to_string()
+                } else {
+                    warn!("Vision instance not available — image enrichment will be skipped");
+                    String::new()
+                };
+
+                Ok((
+                    Self {
+                        backend,
+                        generator_client: None,
+                        extractor_client: None,
+                        reviewer_client: None,
+                        openai_client: Some(openai_client),
+                        vision_endpoint_url,
+                        generator_model: generator_model.to_string(),
+                        extractor_model: extractor_model.to_string(),
+                        reviewer_model: reviewer_model.to_string(),
+                        vision_model: vision_model.to_string(),
+                        semaphore: Arc::new(Semaphore::new(max_concurrent)),
+                        mode,
+                        cache,
+                        generator_prefix_cache: None, // not applicable for cloud APIs
+                    },
+                    statuses,
+                ))
+            }
+        }
     }
 
-    /// Prime the generator's KV-cache prefix with the shared preamble + glossary.
-    /// Call this once after the glossary has been extracted (Phase 1.25).
-    /// Subsequent `generate()` / `generate_group()` calls will reuse the cached
-    /// prefix, skipping recomputation of attention over the shared tokens.
+    /// Prime the generator's KV-cache prefix (Ollama only).
     pub async fn prime_generator_prefix(&self, preamble: &str, glossary: &str) -> Result<()> {
         if glossary.is_empty() {
-            return Ok(()); // nothing worth caching
+            return Ok(());
         }
+        let Some(ref cache_mutex) = self.generator_prefix_cache else {
+            return Ok(()); // custom backend — no prefix cache
+        };
         let num_ctx = context_window_for_model(&self.generator_model);
-        let mut cache = self.generator_prefix_cache.lock().await;
+        let mut cache = cache_mutex.lock().await;
         cache.prime(preamble, glossary, num_ctx).await
     }
 
     /// Whether the generator prefix cache is primed and ready.
+    #[allow(dead_code)]
     pub async fn has_generator_prefix_cache(&self, preamble: &str, glossary: &str) -> bool {
-        let cache = self.generator_prefix_cache.lock().await;
+        let Some(ref cache_mutex) = self.generator_prefix_cache else {
+            return false;
+        };
+        let cache = cache_mutex.lock().await;
         cache.is_primed_for(preamble, glossary)
     }
 
     /// Send a trivial prompt to each reachable endpoint to force model loading.
-    /// This eliminates the cold-start penalty on the first real request.
+    /// Skipped for custom (cloud) backends.
     pub async fn warm_up(&self) {
+        if self.backend.is_custom() {
+            return; // hosted APIs have no cold start
+        }
+
         let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-        // Warm up generator (always present)
-        {
-            let client = self.generator_client.clone();
+        // Warm up generator (always present for Ollama)
+        if let Some(client) = &self.generator_client {
+            let client = client.clone();
             let model = self.generator_model.clone();
             handles.push(tokio::spawn(async move {
                 let agent = client.agent(&model).build();
@@ -475,8 +548,8 @@ impl AgentOrchestrator {
             }));
         }
 
-        // Warm up vision via raw HTTP (no rig agent for vision)
-        {
+        // Warm up vision via raw HTTP (always local)
+        if !self.vision_endpoint_url.is_empty() {
             let url = self.vision_endpoint_url.clone();
             let model = self.vision_model.clone();
             handles.push(tokio::spawn(async move {
@@ -496,6 +569,92 @@ impl AgentOrchestrator {
 
         for handle in handles {
             let _ = handle.await;
+        }
+    }
+
+    /// Whether this orchestrator uses a custom (non-Ollama) backend.
+    pub fn is_custom_backend(&self) -> bool {
+        self.backend.is_custom()
+    }
+
+    // ── Internal helper: dispatch chat to the right backend ──
+
+    /// Build an agent for one of the Ollama text roles and stream a chat.
+    /// `ollama_client` is the Ollama client for this role (may fall back to generator).
+    async fn run_ollama_chat(
+        ollama_client: &ollama::Client,
+        model: &str,
+        preamble: &str,
+        prompt: &str,
+        history: Vec<Message>,
+        stage_name: &str,
+        file_name: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        timeout: std::time::Duration,
+    ) -> Result<String> {
+        let num_ctx = context_window_for_model(model);
+        let agent = ollama_client
+            .agent(model)
+            .preamble(preamble)
+            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
+            .build();
+        stream_chat_with_progress(&agent, prompt, history, stage_name, file_name, status_tx, timeout).await
+    }
+
+    /// Build an agent for the OpenAI-compatible backend and stream a chat.
+    async fn run_openai_chat(
+        openai_client: &openai::CompletionsClient,
+        model: &str,
+        preamble: &str,
+        prompt: &str,
+        history: Vec<Message>,
+        stage_name: &str,
+        file_name: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        timeout: std::time::Duration,
+    ) -> Result<String> {
+        let agent = openai_client
+            .agent(model)
+            .preamble(preamble)
+            .build();
+        stream_chat_with_progress(&agent, prompt, history, stage_name, file_name, status_tx, timeout).await
+    }
+
+    /// Resolve the Ollama client for the extractor role (falls back to generator).
+    fn ollama_extractor_client(&self) -> &ollama::Client {
+        self.extractor_client
+            .as_ref()
+            .or(self.generator_client.as_ref())
+            .expect("at least generator client must exist for Ollama backend")
+    }
+
+    /// Resolve the model name for the extractor role.
+    fn effective_extractor_model(&self) -> &str {
+        if self.extractor_client.is_some() {
+            &self.extractor_model
+        } else if self.backend.is_custom() {
+            &self.extractor_model
+        } else {
+            &self.generator_model
+        }
+    }
+
+    /// Resolve the Ollama client for the reviewer role (falls back to generator).
+    fn ollama_reviewer_client(&self) -> &ollama::Client {
+        self.reviewer_client
+            .as_ref()
+            .or(self.generator_client.as_ref())
+            .expect("at least generator client must exist for Ollama backend")
+    }
+
+    /// Resolve the model name for the reviewer role.
+    fn effective_reviewer_model(&self) -> &str {
+        if self.reviewer_client.is_some() {
+            &self.reviewer_model
+        } else if self.backend.is_custom() {
+            &self.reviewer_model
+        } else {
+            &self.generator_model
         }
     }
 
@@ -558,7 +717,7 @@ impl AgentOrchestrator {
 
         // Determine which model drives the input budget (extractor in Full, generator otherwise)
         let budget_model = if self.mode == PipelineMode::Full {
-            if self.extractor_client.is_some() { &self.extractor_model } else { &self.generator_model }
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
         } else {
             &self.generator_model
         };
@@ -601,7 +760,8 @@ impl AgentOrchestrator {
         let gherkin = self.generate(file_name, &summary, &context_summary, &glossary, status_tx).await?;
 
         // ── Step 3: Review / refine (Standard and Full modes only) ──
-        let do_review = self.mode != PipelineMode::Fast && self.reviewer_client.is_some();
+        let do_review = self.mode != PipelineMode::Fast
+            && (self.reviewer_client.is_some() || self.openai_client.is_some());
         let result = if do_review {
             let _ = status_tx.send(format!(
                 "✅ [Reviewer] Validating Gherkin for {}…", file_name
@@ -636,7 +796,7 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let budget_model = if self.mode == PipelineMode::Full {
-            if self.extractor_client.is_some() { &self.extractor_model } else { &self.generator_model }
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
         } else {
             &self.generator_model
         };
@@ -746,30 +906,29 @@ impl AgentOrchestrator {
         }
 
         // Use the generator model for the merge (it's the most capable)
-        let num_ctx = context_window_for_model(&self.generator_model);
-        let agent = self.generator_client.agent(&self.generator_model)
-            .preamble(MERGE_REVIEWER_PREAMBLE)
-            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
-            .build();
-
         let history = vec![
             Message::user(combined),
         ];
+        let prompt = format!(
+            "Merge the {} Gherkin chunks above into a single cohesive Feature for '{}'.",
+            chunk_gherkins.len(),
+            file_name
+        );
 
-        stream_chat_with_progress(
-            &agent,
-            &format!(
-                "Merge the {} Gherkin chunks above into a single cohesive Feature for '{}'.",
-                chunk_gherkins.len(),
-                file_name
-            ),
-            history,
-            "Merge",
-            file_name,
-            status_tx,
-            std::time::Duration::from_secs(180),
-        )
-        .await
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, MERGE_REVIEWER_PREAMBLE,
+                &prompt, history, "Merge", file_name, status_tx,
+                std::time::Duration::from_secs(180),
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, MERGE_REVIEWER_PREAMBLE,
+                &prompt, history, "Merge", file_name, status_tx,
+                std::time::Duration::from_secs(180),
+            ).await
+        }
     }
 
     async fn extract(
@@ -779,18 +938,7 @@ impl AgentOrchestrator {
         raw_text: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        let client = self.extractor_client.as_ref().unwrap_or(&self.generator_client);
-        let model = if self.extractor_client.is_some() {
-            &self.extractor_model
-        } else {
-            &self.generator_model
-        };
-        let num_ctx = context_window_for_model(model);
-        let agent = client.agent(model)
-            .preamble(EXTRACTOR_PREAMBLE)
-            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
-            .build();
-
+        let model = self.effective_extractor_model();
         let history = vec![
             Message::user(format!(
                 "Document metadata:\nFile: {file_name}\nType: {file_type}"
@@ -800,16 +948,21 @@ impl AgentOrchestrator {
             )),
         ];
 
-        stream_chat_with_progress(
-            &agent,
-            "Produce the structured summary now.",
-            history,
-            "Extractor",
-            file_name,
-            status_tx,
-            std::time::Duration::from_secs(120),
-        )
-        .await
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, model, EXTRACTOR_PREAMBLE,
+                "Produce the structured summary now.",
+                history, "Extractor", file_name, status_tx,
+                std::time::Duration::from_secs(120),
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.ollama_extractor_client(), model, EXTRACTOR_PREAMBLE,
+                "Produce the structured summary now.",
+                history, "Extractor", file_name, status_tx,
+                std::time::Duration::from_secs(120),
+            ).await
+        }
     }
 
     async fn generate(
@@ -820,11 +973,10 @@ impl AgentOrchestrator {
         glossary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        let num_ctx = context_window_for_model(&self.generator_model);
-
-        // Try prefix-cached path first (skips recomputing shared prefix attention)
-        {
-            let cache = self.generator_prefix_cache.lock().await;
+        // Try prefix-cached path first (Ollama only — skips recomputing shared prefix attention)
+        if let Some(ref cache_mutex) = self.generator_prefix_cache {
+            let num_ctx = context_window_for_model(&self.generator_model);
+            let cache = cache_mutex.lock().await;
             if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
                 // Build per-file suffix only (glossary is in the cached prefix)
                 let mut suffix = String::new();
@@ -848,12 +1000,7 @@ impl AgentOrchestrator {
             }
         }
 
-        // Fallback: rig-core multi-turn chat
-        let agent = self.generator_client.agent(&self.generator_model)
-            .preamble(GENERATOR_PREAMBLE)
-            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
-            .build();
-
+        // Fallback: multi-turn chat via appropriate backend
         let mut history: Vec<Message> = Vec::new();
 
         if !glossary.is_empty() {
@@ -868,16 +1015,22 @@ impl AgentOrchestrator {
             "=== Structured Summary ===\n{summary}"
         )));
 
-        stream_chat_with_progress(
-            &agent,
-            &format!("Generate the Gherkin Feature for document: {file_name}"),
-            history,
-            "Generator",
-            file_name,
-            status_tx,
-            std::time::Duration::from_secs(180),
-        )
-        .await
+        let prompt = format!("Generate the Gherkin Feature for document: {file_name}");
+
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, GENERATOR_PREAMBLE,
+                &prompt, history, "Generator", file_name, status_tx,
+                std::time::Duration::from_secs(180),
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, GENERATOR_PREAMBLE,
+                &prompt, history, "Generator", file_name, status_tx,
+                std::time::Duration::from_secs(180),
+            ).await
+        }
     }
 
     async fn review(
@@ -886,32 +1039,26 @@ impl AgentOrchestrator {
         gherkin: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        let client = self.reviewer_client.as_ref().unwrap_or(&self.generator_client);
-        let model = if self.reviewer_client.is_some() {
-            &self.reviewer_model
-        } else {
-            &self.generator_model
-        };
-        let num_ctx = context_window_for_model(model);
-        let agent = client.agent(model)
-            .preamble(REVIEWER_PREAMBLE)
-            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
-            .build();
-
+        let model = self.effective_reviewer_model();
         let history = vec![
             Message::user(gherkin.to_owned()),
         ];
 
-        stream_chat_with_progress(
-            &agent,
-            "Review and correct the Gherkin Feature above. Output only the corrected Gherkin:",
-            history,
-            "Reviewer",
-            file_name,
-            status_tx,
-            std::time::Duration::from_secs(120),
-        )
-        .await
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, model, REVIEWER_PREAMBLE,
+                "Review and correct the Gherkin Feature above. Output only the corrected Gherkin:",
+                history, "Reviewer", file_name, status_tx,
+                std::time::Duration::from_secs(120),
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.ollama_reviewer_client(), model, REVIEWER_PREAMBLE,
+                "Review and correct the Gherkin Feature above. Output only the corrected Gherkin:",
+                history, "Reviewer", file_name, status_tx,
+                std::time::Duration::from_secs(120),
+            ).await
+        }
     }
 
     /// Enrich document text with AI-generated descriptions of embedded images.
@@ -1058,7 +1205,7 @@ impl AgentOrchestrator {
 
         // ── Chunk-and-merge path for oversized merged groups ──
         let budget_model = if self.mode == PipelineMode::Full {
-            if self.extractor_client.is_some() { &self.extractor_model } else { &self.generator_model }
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
         } else {
             &self.generator_model
         };
@@ -1124,7 +1271,8 @@ impl AgentOrchestrator {
             .await?;
 
         // ── Step 3: Review / refine ──
-        let do_review = self.mode != PipelineMode::Fast && self.reviewer_client.is_some();
+        let do_review = self.mode != PipelineMode::Fast
+            && (self.reviewer_client.is_some() || self.openai_client.is_some());
         let result = if do_review {
             let _ = status_tx.send(format!(
                 "✅ [Reviewer] Validating Gherkin for group {}…",
@@ -1156,22 +1304,7 @@ impl AgentOrchestrator {
         merged_text: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        let client = self
-            .extractor_client
-            .as_ref()
-            .unwrap_or(&self.generator_client);
-        let model = if self.extractor_client.is_some() {
-            &self.extractor_model
-        } else {
-            &self.generator_model
-        };
-        let num_ctx = context_window_for_model(model);
-        let agent = client
-            .agent(model)
-            .preamble(GROUP_EXTRACTOR_PREAMBLE)
-            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
-            .build();
-
+        let model = self.effective_extractor_model();
         let history = vec![
             Message::user(format!(
                 "Group: {group_name}"
@@ -1181,16 +1314,21 @@ impl AgentOrchestrator {
             )),
         ];
 
-        stream_chat_with_progress(
-            &agent,
-            "Produce a single unified structured summary for this document group.",
-            history,
-            "Extractor",
-            group_name,
-            status_tx,
-            std::time::Duration::from_secs(180),
-        )
-        .await
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, model, GROUP_EXTRACTOR_PREAMBLE,
+                "Produce a single unified structured summary for this document group.",
+                history, "Extractor", group_name, status_tx,
+                std::time::Duration::from_secs(180),
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.ollama_extractor_client(), model, GROUP_EXTRACTOR_PREAMBLE,
+                "Produce a single unified structured summary for this document group.",
+                history, "Extractor", group_name, status_tx,
+                std::time::Duration::from_secs(180),
+            ).await
+        }
     }
 
     async fn generate_group(
@@ -1201,11 +1339,10 @@ impl AgentOrchestrator {
         glossary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        let num_ctx = context_window_for_model(&self.generator_model);
-
-        // Try prefix-cached path first
-        {
-            let cache = self.generator_prefix_cache.lock().await;
+        // Try prefix-cached path first (Ollama only)
+        if let Some(ref cache_mutex) = self.generator_prefix_cache {
+            let num_ctx = context_window_for_model(&self.generator_model);
+            let cache = cache_mutex.lock().await;
             // Groups use GROUP_GENERATOR_PREAMBLE, not the standard one.
             // The prefix cache is primed with GENERATOR_PREAMBLE. If the
             // glossary matches, the cached prefix still saves glossary
@@ -1237,14 +1374,7 @@ impl AgentOrchestrator {
             }
         }
 
-        // Fallback: rig-core multi-turn chat
-        let agent = self
-            .generator_client
-            .agent(&self.generator_model)
-            .preamble(GROUP_GENERATOR_PREAMBLE)
-            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
-            .build();
-
+        // Fallback: multi-turn chat via appropriate backend
         let mut history: Vec<Message> = Vec::new();
 
         if !glossary.is_empty() {
@@ -1259,16 +1389,22 @@ impl AgentOrchestrator {
             "=== Unified Structured Summary ===\n{summary}"
         )));
 
-        stream_chat_with_progress(
-            &agent,
-            &format!("Generate a single cohesive Gherkin Feature for document group: {group_name}"),
-            history,
-            "Generator",
-            group_name,
-            status_tx,
-            std::time::Duration::from_secs(240),
-        )
-        .await
+        let prompt = format!("Generate a single cohesive Gherkin Feature for document group: {group_name}");
+
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, GROUP_GENERATOR_PREAMBLE,
+                &prompt, history, "Generator", group_name, status_tx,
+                std::time::Duration::from_secs(240),
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, GROUP_GENERATOR_PREAMBLE,
+                &prompt, history, "Generator", group_name, status_tx,
+                std::time::Duration::from_secs(240),
+            ).await
+        }
     }
 
     /// Describe a single image using the vision model via Ollama's raw HTTP API.

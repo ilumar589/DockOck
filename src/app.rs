@@ -601,7 +601,8 @@ impl DockOckApp {
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
             handle.block_on(process_files(
-                files, groups, context, gen_model, ext_model, rev_model, vis_model,
+                files, groups, context, crate::llm::ProviderBackend::Ollama,
+                gen_model, ext_model, rev_model, vis_model,
                 emb_model, mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
                 cache, force_regenerate, tx,
@@ -1636,6 +1637,7 @@ async fn process_files(
     files: Vec<PathBuf>,
     groups: Vec<FileGroup>,
     context: Arc<Mutex<ProjectContext>>,
+    backend: crate::llm::ProviderBackend,
     generator_model: String,
     extractor_model: String,
     reviewer_model: String,
@@ -1658,6 +1660,7 @@ async fn process_files(
     ));
 
     let (orchestrator, statuses) = match crate::llm::AgentOrchestrator::new(
+        backend,
         &generator_model,
         &extractor_model,
         &reviewer_model,

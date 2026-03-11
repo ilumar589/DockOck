@@ -23,6 +23,9 @@ egui = "0.33.3"
 # LLM integration (Ollama via rig-core)
 rig-core = "0.32.0"
 
+# Environment file loading
+dotenv = "0.15"
+
 # File parsing – Excel
 calamine = { version = "0.34.0", features = ["dates"] }
 
