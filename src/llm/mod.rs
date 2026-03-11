@@ -21,8 +21,10 @@ use base64::prelude::*;
 use futures::StreamExt;
 use rig::agent::{MultiTurnStreamItem, Text};
 use rig::client::{CompletionClient, Nothing};
+use rig::completion::Prompt;
 use rig::providers::ollama;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+use sha2::Digest;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
@@ -42,14 +44,42 @@ pub const DEFAULT_REVIEWER_MODEL: &str = "qwen2.5-coder:7b";
 /// moondream is ~1.7B params and runs well on CPU-only setups.
 pub const DEFAULT_VISION_MODEL: &str = "moondream";
 
-/// Maximum number of files processed through the LLM pipeline simultaneously.
-pub const MAX_CONCURRENT: usize = 3;
+/// Default maximum number of files processed through the LLM pipeline simultaneously.
+pub const DEFAULT_MAX_CONCURRENT: usize = 3;
 
 /// Maximum number of characters to send to the LLM in a single prompt.
 /// Text beyond this limit is truncated with a note.
 /// 12 000 chars ≈ 3 000 tokens — enough for a 14-page service document
 /// while staying well within typical context windows.
 const MAX_INPUT_CHARS: usize = 12_000;
+
+/// Estimate a sensible input character budget based on the model name.
+///
+/// Larger-context models get a bigger budget so we can pass more of the
+/// source document to the generator.  The returned value is in *characters*
+/// (roughly 4 chars ≈ 1 token).  We leave headroom for the system prompt
+/// and the generated output.
+fn input_budget_for_model(model: &str) -> usize {
+    let m = model.to_lowercase();
+
+    // Models with 128k context
+    if m.contains("128k") || m.contains("qwen2.5-coder:32b") || m.contains("qwen2.5:32b") {
+        // ~25 000 tokens input → 100 000 chars
+        100_000
+    }
+    // Models with 32k context
+    else if m.contains("32k") || m.contains("deepseek") || m.contains("mixtral") {
+        48_000
+    }
+    // Models with 8k context
+    else if m.contains("7b") || m.contains("8b") || m.contains("llama3") {
+        24_000
+    }
+    // Fallback — use the conservative default
+    else {
+        MAX_INPUT_CHARS
+    }
+}
 
 /// Pipeline mode — controls which LLM stages are executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,6 +252,7 @@ pub struct AgentOrchestrator {
     vision_model: String,
     pub semaphore: Arc<Semaphore>,
     pub mode: PipelineMode,
+    cache: crate::cache::DiskCache,
 }
 
 /// Result of checking which Ollama endpoints are reachable.
@@ -241,6 +272,8 @@ impl AgentOrchestrator {
         reviewer_model: &str,
         vision_model: &str,
         mode: PipelineMode,
+        max_concurrent: usize,
+        cache: crate::cache::DiskCache,
     ) -> Result<(Self, Vec<EndpointStatus>)> {
         let mut statuses = Vec::new();
 
@@ -312,7 +345,7 @@ impl AgentOrchestrator {
         };
 
         let active_count = 1 + ext_ok as usize + rev_ok as usize + vis_ok as usize;
-        let concurrency = MAX_CONCURRENT.max(active_count);
+        let concurrency = max_concurrent.max(active_count);
 
         Ok((
             Self {
@@ -326,12 +359,82 @@ impl AgentOrchestrator {
                 vision_model: vision_model.to_string(),
                 semaphore: Arc::new(Semaphore::new(concurrency)),
                 mode,
+                cache,
             },
             statuses,
         ))
     }
 
+    /// Send a trivial prompt to each reachable endpoint to force model loading.
+    /// This eliminates the cold-start penalty on the first real request.
+    pub async fn warm_up(&self) {
+        let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+        // Warm up generator (always present)
+        {
+            let client = self.generator_client.clone();
+            let model = self.generator_model.clone();
+            handles.push(tokio::spawn(async move {
+                let agent = client.agent(&model).build();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    agent.prompt("Hi"),
+                ).await;
+            }));
+        }
+
+        // Warm up extractor if available
+        if let Some(client) = &self.extractor_client {
+            let client = client.clone();
+            let model = self.extractor_model.clone();
+            handles.push(tokio::spawn(async move {
+                let agent = client.agent(&model).build();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    agent.prompt("Hi"),
+                ).await;
+            }));
+        }
+
+        // Warm up reviewer if available
+        if let Some(client) = &self.reviewer_client {
+            let client = client.clone();
+            let model = self.reviewer_model.clone();
+            handles.push(tokio::spawn(async move {
+                let agent = client.agent(&model).build();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    agent.prompt("Hi"),
+                ).await;
+            }));
+        }
+
+        // Warm up vision via raw HTTP (no rig agent for vision)
+        {
+            let url = self.vision_endpoint_url.clone();
+            let model = self.vision_model.clone();
+            handles.push(tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    client.post(format!("{}/api/generate", url))
+                        .json(&serde_json::json!({
+                            "model": model,
+                            "prompt": "Hi",
+                            "stream": false
+                        }))
+                        .send(),
+                ).await;
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
     /// Run the pipeline for one file. Stages depend on `self.mode`.
+    /// Results are cached by content hash when `force_regenerate` is false.
     pub async fn process_file(
         &self,
         file_name: &str,
@@ -340,7 +443,38 @@ impl AgentOrchestrator {
         images: &[crate::parser::ExtractedImage],
         context: &ProjectContext,
         status_tx: &std::sync::mpsc::Sender<String>,
+        force_regenerate: bool,
     ) -> Result<String> {
+        // Build LLM cache key from all inputs that affect the output
+        let context_summary = context.build_summary();
+        let images_hash = {
+            let mut h = sha2::Sha256::new();
+            for img in images {
+                sha2::Digest::update(&mut h, &img.data);
+            }
+            format!("{:x}", h.finalize())
+        };
+        let llm_cache_key = crate::cache::composite_key(&[
+            file_name.as_bytes(),
+            raw_text.as_bytes(),
+            format!("{:?}", self.mode).as_bytes(),
+            self.generator_model.as_bytes(),
+            self.extractor_model.as_bytes(),
+            self.reviewer_model.as_bytes(),
+            images_hash.as_bytes(),
+            context_summary.as_bytes(),
+        ]);
+
+        // Check LLM cache
+        if !force_regenerate {
+            if let Some(cached) = self.cache.get_text(crate::cache::NS_LLM, &llm_cache_key) {
+                let _ = status_tx.send(format!(
+                    "📦 [Cache] {} — loaded from cache", file_name
+                ));
+                return Ok(cached);
+            }
+        }
+
         // ── Step 0: Describe images with vision model ──
         let enriched_text = if !images.is_empty() {
             let _ = status_tx.send(format!(
@@ -352,6 +486,7 @@ impl AgentOrchestrator {
         };
 
         // ── Step 1: Prepare input for the generator ──
+        let budget = input_budget_for_model(&self.generator_model);
         let summary = if self.mode == PipelineMode::Full {
             // Full mode: use LLM extractor
             let _ = status_tx.send(format!(
@@ -360,14 +495,14 @@ impl AgentOrchestrator {
             self.extract(file_name, file_type, &enriched_text, status_tx).await
                 .unwrap_or_else(|e| {
                     warn!("Extraction failed for {}: {} — falling back to preprocessor", file_name, e);
-                    preprocess_text(&enriched_text, file_name, file_type)
+                    preprocess_text(&enriched_text, file_name, file_type, budget)
                 })
         } else {
             // Fast / Standard: instant Rust preprocessor (no LLM)
             let _ = status_tx.send(format!(
                 "⚡ [Preprocess] Structuring {}…", file_name
             ));
-            preprocess_text(&enriched_text, file_name, file_type)
+            preprocess_text(&enriched_text, file_name, file_type, budget)
         };
 
         // ── Step 2: Generate Gherkin ──
@@ -375,25 +510,30 @@ impl AgentOrchestrator {
             "⚙ [Generator] Creating Gherkin for {}…", file_name
         ));
 
-        let context_summary = context.build_summary();
-        let gherkin = self.generate(file_name, &summary, &context_summary, status_tx).await?;
+        let glossary = context.build_glossary();
+        let gherkin = self.generate(file_name, &summary, &context_summary, &glossary, status_tx).await?;
 
         // ── Step 3: Review / refine (Standard and Full modes only) ──
         let do_review = self.mode != PipelineMode::Fast && self.reviewer_client.is_some();
-        if do_review {
+        let result = if do_review {
             let _ = status_tx.send(format!(
                 "✅ [Reviewer] Validating Gherkin for {}…", file_name
             ));
             match self.review(file_name, &gherkin, status_tx).await {
-                Ok(refined) => Ok(refined),
+                Ok(refined) => refined,
                 Err(e) => {
                     warn!("Review failed for {}: {} — using unreviewed output", file_name, e);
-                    Ok(gherkin)
+                    gherkin
                 }
             }
         } else {
-            Ok(gherkin)
-        }
+            gherkin
+        };
+
+        // Store in LLM cache
+        self.cache.put_text(crate::cache::NS_LLM, &llm_cache_key, &result);
+
+        Ok(result)
     }
 
     async fn extract(
@@ -435,6 +575,7 @@ impl AgentOrchestrator {
         file_name: &str,
         summary: &str,
         context_summary: &str,
+        glossary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let agent = self.generator_client.agent(&self.generator_model).preamble(GENERATOR_PREAMBLE).build();
@@ -449,6 +590,7 @@ impl AgentOrchestrator {
             "Convert the following structured document summary into a Gherkin Feature file.\n\n\
              Document: {file_name}\n\n\
              {context_section}\
+             {glossary}\
              === Structured Summary ===\n\
              {summary}\n\n\
              Generate the Gherkin Feature below:",
@@ -507,40 +649,50 @@ impl AgentOrchestrator {
         file_name: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> String {
-        let mut descriptions = Vec::new();
+        let _ = status_tx.send(format!(
+            "👁 [Vision] {}: describing {} image(s) in parallel…",
+            file_name,
+            images.len(),
+        ));
 
-        for (i, image) in images.iter().enumerate() {
-            let _ = status_tx.send(format!(
-                "👁 [Vision] {}: describing image {}/{}: {}…",
-                file_name,
-                i + 1,
-                images.len(),
-                image.label
-            ));
+        // Describe all images concurrently
+        let futures: Vec<_> = images
+            .iter()
+            .enumerate()
+            .map(|(i, image)| {
+                let label = image.label.clone();
+                async move {
+                    match self.describe_image(image).await {
+                        Ok(desc) => format!(
+                            "[Image {}: {}]\n{}",
+                            i + 1,
+                            label,
+                            desc.trim()
+                        ),
+                        Err(e) => {
+                            warn!(
+                                "Failed to describe image {}: {} — using filename as fallback",
+                                label, e
+                            );
+                            format!(
+                                "[Image {}: {}]\n(Could not describe image: {})",
+                                i + 1,
+                                label,
+                                e
+                            )
+                        }
+                    }
+                }
+            })
+            .collect();
 
-            match self.describe_image(image).await {
-                Ok(desc) => {
-                    descriptions.push(format!(
-                        "[Image {}: {}]\n{}",
-                        i + 1,
-                        image.label,
-                        desc.trim()
-                    ));
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to describe image {}: {} — using filename as fallback",
-                        image.label, e
-                    );
-                    descriptions.push(format!(
-                        "[Image {}: {}]\n(Could not describe image: {})",
-                        i + 1,
-                        image.label,
-                        e
-                    ));
-                }
-            }
-        }
+        let descriptions: Vec<String> = futures::future::join_all(futures).await;
+
+        let _ = status_tx.send(format!(
+            "👁 [Vision] {}: all {} image(s) described.",
+            file_name,
+            images.len(),
+        ));
 
         if descriptions.is_empty() {
             return raw_text.to_string();
@@ -559,11 +711,42 @@ impl AgentOrchestrator {
         members: &[(String, String, String, Vec<crate::parser::ExtractedImage>)],
         context: &ProjectContext,
         status_tx: &std::sync::mpsc::Sender<String>,
+        force_regenerate: bool,
     ) -> Result<String> {
+        // Build cache key from all member content + models + mode
+        let group_cache_key = {
+            let mut parts: Vec<Vec<u8>> = Vec::new();
+            parts.push(group_name.as_bytes().to_vec());
+            for (name, ftype, text, images) in members {
+                parts.push(name.as_bytes().to_vec());
+                parts.push(ftype.as_bytes().to_vec());
+                parts.push(text.as_bytes().to_vec());
+                for img in images {
+                    parts.push(img.data.clone());
+                }
+            }
+            parts.push(format!("{:?}", self.mode).into_bytes());
+            parts.push(self.generator_model.as_bytes().to_vec());
+            parts.push(self.extractor_model.as_bytes().to_vec());
+            parts.push(self.reviewer_model.as_bytes().to_vec());
+            let refs: Vec<&[u8]> = parts.iter().map(|v| v.as_slice()).collect();
+            crate::cache::composite_key(&refs)
+        };
+
+        if !force_regenerate {
+            if let Some(cached) = self.cache.get_text(crate::cache::NS_LLM, &group_cache_key) {
+                let _ = status_tx.send(format!(
+                    "📦 [Cache] group {} — loaded from cache", group_name
+                ));
+                return Ok(cached);
+            }
+        }
+
         // ── Step 0: Build merged text and images from all members ──
+        let budget = input_budget_for_model(&self.generator_model);
         let mut merged_text = String::new();
         let mut all_images: Vec<&crate::parser::ExtractedImage> = Vec::new();
-        let chars_per_member = MAX_INPUT_CHARS / members.len().max(1);
+        let chars_per_member = budget / members.len().max(1);
 
         for (i, (file_name, file_type, raw_text, images)) in members.iter().enumerate() {
             merged_text.push_str(&format!(
@@ -608,14 +791,14 @@ impl AgentOrchestrator {
                         "Group extraction failed for {}: {} — falling back to preprocessor",
                         group_name, e
                     );
-                    preprocess_text(&merged_text, group_name, "Multi-document group")
+                    preprocess_text(&merged_text, group_name, "Multi-document group", budget)
                 })
         } else {
             let _ = status_tx.send(format!(
                 "⚡ [Preprocess] Structuring group {}…",
                 group_name
             ));
-            preprocess_text(&merged_text, group_name, "Multi-document group")
+            preprocess_text(&merged_text, group_name, "Multi-document group", budget)
         };
 
         // ── Step 2: Generate Gherkin ──
@@ -642,29 +825,34 @@ impl AgentOrchestrator {
 
         let context_summary = context.build_summary_excluding(&exclude);
         let gherkin = self
-            .generate_group(group_name, &summary, &context_summary, status_tx)
+            .generate_group(group_name, &summary, &context_summary, &context.build_glossary(), status_tx)
             .await?;
 
         // ── Step 3: Review / refine ──
         let do_review = self.mode != PipelineMode::Fast && self.reviewer_client.is_some();
-        if do_review {
+        let result = if do_review {
             let _ = status_tx.send(format!(
                 "✅ [Reviewer] Validating Gherkin for group {}…",
                 group_name
             ));
             match self.review(group_name, &gherkin, status_tx).await {
-                Ok(refined) => Ok(refined),
+                Ok(refined) => refined,
                 Err(e) => {
                     warn!(
                         "Review failed for group {}: {} — using unreviewed output",
                         group_name, e
                     );
-                    Ok(gherkin)
+                    gherkin
                 }
             }
         } else {
-            Ok(gherkin)
-        }
+            gherkin
+        };
+
+        // Store in LLM cache
+        self.cache.put_text(crate::cache::NS_LLM, &group_cache_key, &result);
+
+        Ok(result)
     }
 
     async fn extract_group(
@@ -712,6 +900,7 @@ impl AgentOrchestrator {
         group_name: &str,
         summary: &str,
         context_summary: &str,
+        glossary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let agent = self
@@ -731,6 +920,7 @@ impl AgentOrchestrator {
              related documents) into a single cohesive Gherkin Feature file.\n\n\
              Group: {group_name}\n\n\
              {context_section}\
+             {glossary}\
              === Unified Structured Summary ===\n\
              {summary}\n\n\
              Generate the Gherkin Feature below:",
@@ -748,10 +938,20 @@ impl AgentOrchestrator {
     }
 
     /// Describe a single image using the vision model via Ollama's raw HTTP API.
+    /// Results are cached by image content hash + model name.
     async fn describe_image(
         &self,
         image: &crate::parser::ExtractedImage,
     ) -> Result<String> {
+        // Check vision cache
+        let cache_key = crate::cache::composite_key(&[
+            &image.data,
+            self.vision_model.as_bytes(),
+        ]);
+        if let Some(cached) = self.cache.get_text(crate::cache::NS_VISION, &cache_key) {
+            return Ok(cached);
+        }
+
         let endpoint_url = &self.vision_endpoint_url;
 
         let b64 = BASE64_STANDARD.encode(&image.data);
@@ -775,6 +975,9 @@ impl AgentOrchestrator {
             .await
             .with_context(|| "Failed to parse vision model response")?;
 
+        // Store in cache
+        self.cache.put_text(crate::cache::NS_VISION, &cache_key, &body.response);
+
         Ok(body.response)
     }
 }
@@ -785,35 +988,142 @@ impl AgentOrchestrator {
 
 /// Instantly structure and truncate raw document text for the generator prompt.
 /// Replaces the slow LLM extractor in Fast and Standard modes.
-fn preprocess_text(raw_text: &str, file_name: &str, file_type: &str) -> String {
+///
+/// Uses semantic-aware truncation: lines are scored by relevance and
+/// high-value content (headings, tables, requirement keywords) is
+/// prioritised when the document exceeds the character budget.
+fn preprocess_text(raw_text: &str, file_name: &str, file_type: &str, char_budget: usize) -> String {
     let lines: Vec<&str> = raw_text.lines().collect();
     let total_lines = lines.len();
 
-    // Collect non-empty lines, trim whitespace
-    let meaningful: Vec<&str> = lines
+    // Collect non-empty lines with their original index, trimmed.
+    let meaningful: Vec<(usize, &str)> = lines
         .iter()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
+        .enumerate()
+        .map(|(i, l)| (i, l.trim()))
+        .filter(|(_, l)| !l.is_empty())
         .collect();
 
-    // Build a structured output
-    let mut result = format!(
+    let header = format!(
         "Document: {file_name}\nType: {file_type}\nTotal lines: {total_lines}\n\n"
     );
 
-    // Take content up to the char limit
-    let mut chars_used = result.len();
-    for line in &meaningful {
-        if chars_used + line.len() + 1 > MAX_INPUT_CHARS {
-            result.push_str("\n[… content truncated …]\n");
-            break;
+    let budget = char_budget.saturating_sub(header.len() + 40); // reserve room for truncation note
+
+    // If it fits without truncation, output everything in order.
+    let total_chars: usize = meaningful.iter().map(|(_, l)| l.len() + 1).sum();
+    if total_chars <= budget {
+        let mut result = header;
+        for (_, line) in &meaningful {
+            result.push_str(line);
+            result.push('\n');
+        }
+        return result;
+    }
+
+    // Score each line for semantic relevance.
+    let scored: Vec<(usize, &str, u32)> = meaningful
+        .iter()
+        .map(|&(idx, line)| (idx, line, score_line(line)))
+        .collect();
+
+    // Greedily pick lines by score (descending), then by original position.
+    let mut indices_by_score: Vec<usize> = (0..scored.len()).collect();
+    indices_by_score.sort_by(|&a, &b| {
+        scored[b].2.cmp(&scored[a].2).then(scored[a].0.cmp(&scored[b].0))
+    });
+
+    let mut selected = Vec::new();
+    let mut chars_used: usize = 0;
+    for i in indices_by_score {
+        let line_cost = scored[i].1.len() + 1;
+        if chars_used + line_cost > budget {
+            continue;
+        }
+        selected.push(i);
+        chars_used += line_cost;
+    }
+
+    // Restore original document order.
+    selected.sort_unstable();
+
+    let mut result = header;
+    let mut prev_orig_idx: Option<usize> = None;
+    for sel_idx in &selected {
+        let (orig_idx, line, _) = scored[*sel_idx];
+        // Insert separator when lines were skipped.
+        if let Some(prev) = prev_orig_idx {
+            if orig_idx > prev + 1 {
+                result.push_str("[…]\n");
+            }
         }
         result.push_str(line);
         result.push('\n');
-        chars_used += line.len() + 1;
+        prev_orig_idx = Some(orig_idx);
+    }
+
+    if selected.len() < scored.len() {
+        result.push_str("\n[… content truncated — high-relevance lines retained …]\n");
     }
 
     result
+}
+
+/// Heuristic relevance score for a single line (higher = more important).
+fn score_line(line: &str) -> u32 {
+    let lower = line.to_lowercase();
+    let mut score: u32 = 1; // base score
+
+    // Headings / section markers
+    if line.starts_with('#') || lower.starts_with("section") || lower.starts_with("chapter") {
+        score += 10;
+    }
+
+    // Numbered section headings: "1.", "1.2", "2.3.4 Something"
+    if line.len() > 1 && line.as_bytes()[0].is_ascii_digit() && line.contains('.') {
+        score += 6;
+    }
+
+    // Requirement keywords
+    for kw in &["shall", "must", "require", "mandatory", "precondition", "postcondition"] {
+        if lower.contains(kw) {
+            score += 8;
+            break;
+        }
+    }
+
+    // Action / behaviour keywords
+    for kw in &["when", "then", "given", "if", "validate", "verify", "ensure", "submit", "click", "display"] {
+        if lower.contains(kw) {
+            score += 4;
+            break;
+        }
+    }
+
+    // Actor keywords
+    for kw in &["user", "system", "admin", "actor", "service", "module", "role"] {
+        if lower.contains(kw) {
+            score += 3;
+            break;
+        }
+    }
+
+    // Table-like or structured data (pipes, tabs, separators)
+    if line.contains('|') || line.contains('\t') {
+        score += 5;
+    }
+
+    // Bullet / list items
+    if line.starts_with('-') || line.starts_with('*') || line.starts_with("•") {
+        score += 3;
+    }
+
+    // Very short lines are usually noise / blank separators — penalise
+    if line.len() < 5 {
+        score = score.saturating_sub(2);
+    }
+
+    score
 }
 
 // ─────────────────────────────────────────────

@@ -225,6 +225,10 @@ pub struct DockOckApp {
     openspec_ok: Option<bool>,
     /// OpenSpec export results keyed by change name
     openspec_results: HashMap<String, crate::openspec::OpenSpecExportResult>,
+    /// Maximum number of concurrent LLM tasks
+    max_concurrent: usize,
+    /// Force re-generation even if cache has valid entries
+    force_regenerate: bool,
 }
 
 impl DockOckApp {
@@ -261,6 +265,8 @@ impl DockOckApp {
             openspec_url: crate::openspec::DEFAULT_OPENSPEC_URL.to_string(),
             openspec_ok: None,
             openspec_results: HashMap::new(),
+            max_concurrent: crate::llm::DEFAULT_MAX_CONCURRENT,
+            force_regenerate: false,
         }
     }
 
@@ -470,15 +476,19 @@ impl DockOckApp {
         let vis_model = self.vision_model.clone();
         let handle = self.runtime.clone();
         let mode = self.pipeline_mode;
+        let max_concurrent = self.max_concurrent;
         let openspec_enabled = self.openspec_enabled;
         let openspec_url = self.openspec_url.clone();
         let openspec_output_dir = self.output_dir.clone();
+        let cache = crate::cache::DiskCache::new(self.output_dir.as_deref());
+        let force_regenerate = self.force_regenerate;
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
             handle.block_on(process_files(
                 files, groups, context, gen_model, ext_model, rev_model, vis_model, mode,
-                openspec_enabled, openspec_url, openspec_output_dir, tx,
+                max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
+                cache, force_regenerate, tx,
             ));
         });
     }
@@ -650,6 +660,13 @@ impl DockOckApp {
                         ui.selectable_value(&mut self.pipeline_mode, mode, mode.to_string());
                     }
                 });
+            ui.separator();
+            ui.label("∥");
+            ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=8).speed(0.1))
+                .on_hover_text("Max concurrent LLM tasks");
+            ui.separator();
+            ui.checkbox(&mut self.force_regenerate, "🔄 Force")
+                .on_hover_text("Force re-generation, bypassing cache");
             ui.separator();
             ui.checkbox(&mut self.openspec_enabled, "📦 OpenSpec");
             if self.openspec_enabled {
@@ -1244,9 +1261,12 @@ async fn process_files(
     reviewer_model: String,
     vision_model: String,
     mode: crate::llm::PipelineMode,
+    max_concurrent: usize,
     openspec_enabled: bool,
     openspec_url: String,
     openspec_output_dir: Option<PathBuf>,
+    cache: crate::cache::DiskCache,
+    force_regenerate: bool,
     tx: Sender<ProcessingEvent>,
 ) {
     let total = files.len();
@@ -1262,6 +1282,8 @@ async fn process_files(
         &reviewer_model,
         &vision_model,
         mode,
+        max_concurrent,
+        cache.clone(),
     ).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -1281,6 +1303,15 @@ async fn process_files(
         )));
     }
 
+    // Warm up all models in parallel (forces model loading, eliminates cold-start)
+    let _ = tx.send(ProcessingEvent::Status(
+        "🔥 Warming up models…".to_string(),
+    ));
+    orchestrator.warm_up().await;
+    let _ = tx.send(ProcessingEvent::Status(
+        "✅ Models warmed up.".to_string(),
+    ));
+
     let orchestrator = Arc::new(orchestrator);
 
     // ── Phase 1: Parse ALL files in parallel (CPU/IO bound, no LLM) ──
@@ -1291,23 +1322,45 @@ async fn process_files(
     let mut parse_handles = Vec::with_capacity(total);
     for path in &files {
         let p = path.clone();
+        let cache = cache.clone();
         parse_handles.push(tokio::task::spawn_blocking(move || {
-            crate::parser::parse_file(&p).map(|r| (p, r))
+            // Check parsed file cache first
+            let file_bytes = std::fs::read(&p).ok();
+            let cache_key = file_bytes
+                .as_ref()
+                .map(|b| crate::cache::content_hash(b));
+
+            if let Some(ref key) = cache_key {
+                if let Some(cached) = cache.get::<crate::parser::ParseResult>(crate::cache::NS_PARSED, key) {
+                    return Ok((p, cached, true));
+                }
+            }
+
+            crate::parser::parse_file(&p).map(|r| {
+                // Store in cache
+                if let Some(ref key) = cache_key {
+                    cache.put(crate::cache::NS_PARSED, key, &r);
+                }
+                (p, r, false)
+            })
         }));
     }
 
     // Collect parsed results into a lookup
     let mut parsed_map: HashMap<PathBuf, (String, String, Vec<crate::parser::ExtractedImage>)> =
         HashMap::new();
+    let mut cache_hits = 0usize;
     for handle in parse_handles {
         match handle.await {
-            Ok(Ok((path, result))) => {
+            Ok(Ok((path, result, from_cache))) => {
                 let name = path.file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 let img_count = result.images.len();
+                let cache_label = if from_cache { " (cached)" } else { "" };
+                if from_cache { cache_hits += 1; }
                 let _ = tx.send(ProcessingEvent::Status(format!(
-                    "📄 Parsed: {} ({} images found)", name, img_count
+                    "📄 Parsed: {} ({} images found){}", name, img_count, cache_label
                 )));
 
                 // Store in shared context
@@ -1333,11 +1386,30 @@ async fn process_files(
         }
     }
 
+    if cache_hits > 0 {
+        let _ = tx.send(ProcessingEvent::Status(format!(
+            "📦 Cache: {}/{} files loaded from cache", cache_hits, total
+        )));
+    }
+
     let _ = tx.send(ProcessingEvent::Status(format!(
         "✅ Parsed {}/{} files. Starting multi-agent pipeline…",
         parsed_map.len(),
         total
     )));
+
+    // ── Phase 1.25: Extract entity glossary from all parsed content ──
+    {
+        if let Ok(mut ctx) = context.lock() {
+            ctx.extract_entities();
+            let entity_count = ctx.entities.len();
+            if entity_count > 0 {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "🏷 Extracted {} entities for project glossary", entity_count
+                )));
+            }
+        }
+    }
 
     // ── Phase 1.5: Build work items (groups vs ungrouped singles) ──
     let grouped_paths: std::collections::HashSet<PathBuf> = groups
@@ -1381,6 +1453,7 @@ async fn process_files(
             let tx = tx.clone();
             let ctx = ctx_snapshot.clone();
             let gdocs = Arc::clone(&gherkin_docs);
+            let force_regen = force_regenerate;
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await;
@@ -1396,7 +1469,7 @@ async fn process_files(
                 });
 
                 let result = orch
-                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx)
+                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen)
                     .await;
 
                 drop(status_tx);
@@ -1441,6 +1514,7 @@ async fn process_files(
         let tx = tx.clone();
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
+        let force_regen = force_regenerate;
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
@@ -1463,7 +1537,7 @@ async fn process_files(
                 members_data;
 
             let result = orch
-                .process_group(&group_name, &members_ref, &ctx, &status_tx)
+                .process_group(&group_name, &members_ref, &ctx, &status_tx, force_regen)
                 .await;
 
             drop(status_tx);
@@ -1512,6 +1586,7 @@ async fn process_files(
         let tx = tx.clone();
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
+        let force_regen = force_regenerate;
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1531,7 +1606,7 @@ async fn process_files(
             });
 
             let result = orch
-                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx)
+                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen)
                 .await;
 
             drop(status_tx);
