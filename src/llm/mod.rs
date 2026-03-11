@@ -81,6 +81,31 @@ fn input_budget_for_model(model: &str) -> usize {
     }
 }
 
+/// Return the Ollama `num_ctx` value (in tokens) appropriate for the model.
+///
+/// Ollama defaults to 4096 which silently truncates long prompts.
+/// We set this explicitly to match the model's true capability.
+pub fn context_window_for_model(model: &str) -> u64 {
+    let m = model.to_lowercase();
+
+    if m.contains("qwen2.5-coder:32b") || m.contains("qwen2.5:32b") || m.contains("128k") {
+        32_768
+    } else if m.contains("deepseek") || m.contains("mixtral") || m.contains("32k")
+        || m.contains("mistral-small")
+    {
+        32_768
+    } else if m.contains("7b") || m.contains("8b") || m.contains("3b") || m.contains("mini") {
+        16_384
+    } else if m.contains("llama3") || m.contains("gemma") || m.contains("phi3") {
+        16_384
+    } else if m.contains("codellama") {
+        16_384
+    } else {
+        // Safe default — 8k tokens, well above the 4096 Ollama default
+        8_192
+    }
+}
+
 /// Pipeline mode — controls which LLM stages are executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PipelineMode {
@@ -554,7 +579,11 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
-        let agent = client.agent(model).preamble(EXTRACTOR_PREAMBLE).build();
+        let num_ctx = context_window_for_model(model);
+        let agent = client.agent(model)
+            .preamble(EXTRACTOR_PREAMBLE)
+            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
+            .build();
 
         let prompt = format!(
             "Analyse the following {file_type} document and produce a structured summary.\n\n\
@@ -583,7 +612,11 @@ impl AgentOrchestrator {
         glossary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        let agent = self.generator_client.agent(&self.generator_model).preamble(GENERATOR_PREAMBLE).build();
+        let num_ctx = context_window_for_model(&self.generator_model);
+        let agent = self.generator_client.agent(&self.generator_model)
+            .preamble(GENERATOR_PREAMBLE)
+            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
+            .build();
 
         let context_section = if context_summary.contains("No prior files") {
             String::new()
@@ -624,7 +657,11 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
-        let agent = client.agent(model).preamble(REVIEWER_PREAMBLE).build();
+        let num_ctx = context_window_for_model(model);
+        let agent = client.agent(model)
+            .preamble(REVIEWER_PREAMBLE)
+            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
+            .build();
 
         let prompt = format!(
             "Review and correct the following Gherkin Feature:\n\n\
@@ -880,9 +917,11 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
+        let num_ctx = context_window_for_model(model);
         let agent = client
             .agent(model)
             .preamble(GROUP_EXTRACTOR_PREAMBLE)
+            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
             .build();
 
         let prompt = format!(
@@ -913,10 +952,12 @@ impl AgentOrchestrator {
         glossary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
+        let num_ctx = context_window_for_model(&self.generator_model);
         let agent = self
             .generator_client
             .agent(&self.generator_model)
             .preamble(GROUP_GENERATOR_PREAMBLE)
+            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
             .build();
 
         let context_section = if context_summary.contains("No prior files") {

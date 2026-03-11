@@ -642,6 +642,7 @@ impl DockOckApp {
                     current_gherkin, instruction
                 );
 
+                let num_ctx = crate::llm::context_window_for_model(&model);
                 let client = reqwest::Client::new();
                 let resp = client
                     .post(format!("{}/api/generate", crate::llm::ENDPOINT_GENERATOR.url))
@@ -649,6 +650,7 @@ impl DockOckApp {
                         "model": model,
                         "prompt": prompt,
                         "stream": false,
+                        "options": { "num_ctx": num_ctx },
                     }))
                     .send()
                     .await;
