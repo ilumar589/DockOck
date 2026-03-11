@@ -244,6 +244,19 @@ Describe this image in detail for a business analyst. Focus on:
 - UI wireframes or screenshots
 Be concise but capture all business-relevant information. Output plain text only.";
 
+const MERGE_REVIEWER_PREAMBLE: &str = r#"You are a Gherkin merge specialist.
+You will receive Gherkin output generated from multiple overlapping sections of the same document.
+Your task is to merge them into a single cohesive Gherkin Feature.
+
+Rules:
+1. Output ONLY valid Gherkin syntax starting with "Feature:".
+2. Combine all unique Scenarios — remove exact or near-duplicate scenarios.
+3. If multiple chunks produced a Background, unify into one Background.
+4. Preserve all unique business logic — do not drop scenarios.
+5. Use consistent step wording and naming throughout.
+6. Do not add explanatory prose outside the Gherkin block.
+7. Always end with a blank line after the last Scenario."#;
+
 /// Response from Ollama's `/api/generate` endpoint (non-streaming).
 #[derive(serde::Deserialize)]
 struct OllamaGenerateResponse {
@@ -515,6 +528,22 @@ impl AgentOrchestrator {
             raw_text.to_string()
         };
 
+        // Determine which model drives the input budget (extractor in Full, generator otherwise)
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+
+        // ── Chunk-and-merge path for oversized documents ──
+        if needs_chunking(&enriched_text, budget_model) {
+            let result = self.process_file_chunked(
+                file_name, file_type, &enriched_text, context, rag_context, status_tx,
+            ).await?;
+            self.cache.put_text(crate::cache::NS_LLM, &llm_cache_key, &result);
+            return Ok(result);
+        }
+
         // ── Step 1: Prepare input for the generator ──
         let budget = input_budget_for_model(&self.generator_model);
         let summary = if self.mode == PipelineMode::Full {
@@ -564,6 +593,155 @@ impl AgentOrchestrator {
         self.cache.put_text(crate::cache::NS_LLM, &llm_cache_key, &result);
 
         Ok(result)
+    }
+
+    /// Chunked pipeline for documents that exceed the model's context window.
+    /// Splits text into overlapping windows, processes each chunk through
+    /// extract/preprocess → generate, then merges all Gherkin via a merge-review pass.
+    async fn process_file_chunked(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        enriched_text: &str,
+        context: &ProjectContext,
+        rag_context: Option<&str>,
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+        let chunks = chunk_for_llm(enriched_text, budget_model);
+        let n = chunks.len();
+
+        let _ = status_tx.send(format!(
+            "📐 [Chunked] {}: splitting into {} chunks (exceeds context window)",
+            file_name, n
+        ));
+
+        // Phase 1: Extract/preprocess each chunk (can run concurrently)
+        let budget = input_budget_for_model(&self.generator_model);
+        let mut summaries: Vec<String> = Vec::with_capacity(n);
+
+        for chunk in &chunks {
+            let chunk_label = format!("{} [{}/{}]", file_name, chunk.index + 1, chunk.total);
+
+            let summary = if self.mode == PipelineMode::Full {
+                let _ = status_tx.send(format!(
+                    "🔍 [Extractor] Analysing {}…", chunk_label
+                ));
+                self.extract(&chunk_label, file_type, &chunk.text, status_tx)
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!("Extraction failed for {}: {} — falling back to preprocessor", chunk_label, e);
+                        preprocess_text(&chunk.text, &chunk_label, file_type, budget)
+                    })
+            } else {
+                let _ = status_tx.send(format!(
+                    "⚡ [Preprocess] Structuring {}…", chunk_label
+                ));
+                preprocess_text(&chunk.text, &chunk_label, file_type, budget)
+            };
+            summaries.push(summary);
+        }
+
+        // Phase 2: Generate Gherkin for each chunk, with prior summaries as context hints
+        let glossary = context.build_glossary();
+        let context_summary = match rag_context {
+            Some(rc) => rc.to_string(),
+            None => context.build_summary(),
+        };
+        let mut chunk_gherkins: Vec<String> = Vec::with_capacity(n);
+
+        for (i, summary) in summaries.iter().enumerate() {
+            let chunk_label = format!("{} [{}/{}]", file_name, i + 1, n);
+            let _ = status_tx.send(format!(
+                "⚙ [Generator] Creating Gherkin for {}…", chunk_label
+            ));
+
+            // Build a context hint from other chunks' summaries
+            let mut other_summaries = String::new();
+            for (j, s) in summaries.iter().enumerate() {
+                if j != i {
+                    other_summaries.push_str(&format!(
+                        "--- Summary from part {}/{} ---\n{}\n\n",
+                        j + 1, n, &s[..s.len().min(500)]
+                    ));
+                }
+            }
+            let chunk_context = if other_summaries.is_empty() {
+                context_summary.clone()
+            } else {
+                format!(
+                    "{}\n\n=== Summaries from other parts of the same document ===\n{}",
+                    context_summary, other_summaries
+                )
+            };
+
+            let gherkin = self.generate(
+                &chunk_label, summary, &chunk_context, &glossary, status_tx,
+            ).await?;
+            chunk_gherkins.push(gherkin);
+        }
+
+        // Phase 3: Merge all chunk Gherkin via merge-reviewer
+        self.merge_chunk_gherkin(file_name, &chunk_gherkins, status_tx).await
+    }
+
+    /// Merge Gherkin from multiple chunks of the same document into one cohesive Feature.
+    async fn merge_chunk_gherkin(
+        &self,
+        file_name: &str,
+        chunk_gherkins: &[String],
+        status_tx: &std::sync::mpsc::Sender<String>,
+    ) -> Result<String> {
+        // If only one chunk, no merge needed
+        if chunk_gherkins.len() == 1 {
+            return Ok(chunk_gherkins[0].clone());
+        }
+
+        let _ = status_tx.send(format!(
+            "🔀 [Merge] {}: merging {} chunks into single Feature…",
+            file_name,
+            chunk_gherkins.len()
+        ));
+
+        let mut combined = String::new();
+        for (i, g) in chunk_gherkins.iter().enumerate() {
+            combined.push_str(&format!(
+                "=== Gherkin from Part {}/{} ===\n{}\n\n",
+                i + 1,
+                chunk_gherkins.len(),
+                g
+            ));
+        }
+
+        // Use the generator model for the merge (it's the most capable)
+        let num_ctx = context_window_for_model(&self.generator_model);
+        let agent = self.generator_client.agent(&self.generator_model)
+            .preamble(MERGE_REVIEWER_PREAMBLE)
+            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
+            .build();
+
+        let history = vec![
+            Message::user(combined),
+        ];
+
+        stream_chat_with_progress(
+            &agent,
+            &format!(
+                "Merge the {} Gherkin chunks above into a single cohesive Feature for '{}'.",
+                chunk_gherkins.len(),
+                file_name
+            ),
+            history,
+            "Merge",
+            file_name,
+            status_tx,
+            std::time::Duration::from_secs(180),
+        )
+        .await
     }
 
     async fn extract(
@@ -820,6 +998,20 @@ impl AgentOrchestrator {
             merged_text =
                 self.enrich_text_with_images(&merged_text, &owned_images, group_name, status_tx)
                     .await;
+        }
+
+        // ── Chunk-and-merge path for oversized merged groups ──
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+        if needs_chunking(&merged_text, budget_model) {
+            let result = self.process_file_chunked(
+                group_name, "Multi-document group", &merged_text, context, rag_context, status_tx,
+            ).await?;
+            self.cache.put_text(crate::cache::NS_LLM, &group_cache_key, &result);
+            return Ok(result);
         }
 
         // ── Step 1: Prepare input for the generator ──
@@ -1174,6 +1366,77 @@ fn score_line(line: &str) -> u32 {
     }
 
     score
+}
+
+// ─────────────────────────────────────────────
+// Chunk-and-merge for oversized documents
+// ─────────────────────────────────────────────
+
+struct LlmChunk {
+    index: usize,
+    total: usize,
+    text: String,
+}
+
+/// Returns `true` when the document text exceeds the model's character budget.
+fn needs_chunking(text: &str, model: &str) -> bool {
+    text.len() > input_budget_for_model(model)
+}
+
+/// Split text into overlapping windows that fit within the model's input budget.
+/// Breaks are snapped to line boundaries to avoid cutting mid-sentence.
+fn chunk_for_llm(text: &str, model: &str) -> Vec<LlmChunk> {
+    let budget = input_budget_for_model(model);
+    if text.len() <= budget {
+        return vec![LlmChunk { index: 0, total: 1, text: text.to_string() }];
+    }
+
+    let overlap = budget / 5; // 20% overlap for continuity
+    let step = budget - overlap;
+    let chars: Vec<char> = text.chars().collect();
+    let total_chars = chars.len();
+
+    let mut chunks = Vec::new();
+    let mut offset = 0usize;
+
+    while offset < total_chars {
+        let end = (offset + budget).min(total_chars);
+        let chunk_text: String = chars[offset..end].iter().collect();
+
+        // Snap to line boundary if we're not at the very end
+        let actual = if end < total_chars {
+            snap_to_line_boundary_llm(&chunk_text)
+        } else {
+            chunk_text
+        };
+
+        if !actual.trim().is_empty() {
+            chunks.push(LlmChunk {
+                index: chunks.len(),
+                total: 0, // patched below
+                text: actual,
+            });
+        }
+
+        offset += step;
+    }
+
+    let total = chunks.len();
+    for c in &mut chunks {
+        c.total = total;
+    }
+    chunks
+}
+
+/// Snap to the last newline in the final 20% of the text to avoid mid-line splits.
+fn snap_to_line_boundary_llm(text: &str) -> String {
+    let len = text.len();
+    let search_start = len.saturating_sub(len / 5);
+    if let Some(pos) = text[search_start..].rfind('\n') {
+        text[..search_start + pos + 1].to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 // ─────────────────────────────────────────────
