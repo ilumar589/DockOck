@@ -21,7 +21,7 @@ use base64::prelude::*;
 use futures::StreamExt;
 use rig::agent::{MultiTurnStreamItem, Text};
 use rig::client::{CompletionClient, Nothing};
-use rig::completion::Prompt;
+use rig::completion::{Message, Prompt};
 use rig::providers::ollama;
 use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use sha2::Digest;
@@ -585,17 +585,19 @@ impl AgentOrchestrator {
             .additional_params(serde_json::json!({"num_ctx": num_ctx}))
             .build();
 
-        let prompt = format!(
-            "Analyse the following {file_type} document and produce a structured summary.\n\n\
-             Document: {file_name}\n\n\
-             === Document Content ===\n\
-             {raw_text}\n\n\
-             Structured summary:",
-        );
+        let history = vec![
+            Message::user(format!(
+                "Document metadata:\nFile: {file_name}\nType: {file_type}"
+            )),
+            Message::user(format!(
+                "=== Document Content ===\n{raw_text}"
+            )),
+        ];
 
-        stream_with_progress(
+        stream_chat_with_progress(
             &agent,
-            &prompt,
+            "Produce the structured summary now.",
+            history,
             "Extractor",
             file_name,
             status_tx,
@@ -618,25 +620,24 @@ impl AgentOrchestrator {
             .additional_params(serde_json::json!({"num_ctx": num_ctx}))
             .build();
 
-        let context_section = if context_summary.contains("No prior files") {
-            String::new()
-        } else {
-            format!("{}\n", context_summary)
-        };
+        let mut history: Vec<Message> = Vec::new();
 
-        let prompt = format!(
-            "Convert the following structured document summary into a Gherkin Feature file.\n\n\
-             Document: {file_name}\n\n\
-             {context_section}\
-             {glossary}\
-             === Structured Summary ===\n\
-             {summary}\n\n\
-             Generate the Gherkin Feature below:",
-        );
+        if !glossary.is_empty() {
+            history.push(Message::user(glossary.to_owned()));
+        }
 
-        stream_with_progress(
+        if !context_summary.contains("No prior files") && !context_summary.is_empty() {
+            history.push(Message::user(context_summary.to_owned()));
+        }
+
+        history.push(Message::user(format!(
+            "=== Structured Summary ===\n{summary}"
+        )));
+
+        stream_chat_with_progress(
             &agent,
-            &prompt,
+            &format!("Generate the Gherkin Feature for document: {file_name}"),
+            history,
             "Generator",
             file_name,
             status_tx,
@@ -663,15 +664,14 @@ impl AgentOrchestrator {
             .additional_params(serde_json::json!({"num_ctx": num_ctx}))
             .build();
 
-        let prompt = format!(
-            "Review and correct the following Gherkin Feature:\n\n\
-             {gherkin}\n\n\
-             Corrected Gherkin:",
-        );
+        let history = vec![
+            Message::user(gherkin.to_owned()),
+        ];
 
-        stream_with_progress(
+        stream_chat_with_progress(
             &agent,
-            &prompt,
+            "Review and correct the Gherkin Feature above. Output only the corrected Gherkin:",
+            history,
             "Reviewer",
             file_name,
             status_tx,
@@ -924,18 +924,19 @@ impl AgentOrchestrator {
             .additional_params(serde_json::json!({"num_ctx": num_ctx}))
             .build();
 
-        let prompt = format!(
-            "Analyse the following group of related documents and produce a single unified \
-             structured summary.\n\n\
-             Group: {group_name}\n\n\
-             === Merged Document Content ===\n\
-             {merged_text}\n\n\
-             Unified structured summary:",
-        );
+        let history = vec![
+            Message::user(format!(
+                "Group: {group_name}"
+            )),
+            Message::user(format!(
+                "=== Merged Document Content ===\n{merged_text}"
+            )),
+        ];
 
-        stream_with_progress(
+        stream_chat_with_progress(
             &agent,
-            &prompt,
+            "Produce a single unified structured summary for this document group.",
+            history,
             "Extractor",
             group_name,
             status_tx,
@@ -960,26 +961,24 @@ impl AgentOrchestrator {
             .additional_params(serde_json::json!({"num_ctx": num_ctx}))
             .build();
 
-        let context_section = if context_summary.contains("No prior files") {
-            String::new()
-        } else {
-            format!("{}\n", context_summary)
-        };
+        let mut history: Vec<Message> = Vec::new();
 
-        let prompt = format!(
-            "Convert the following unified structured summary (synthesised from multiple \
-             related documents) into a single cohesive Gherkin Feature file.\n\n\
-             Group: {group_name}\n\n\
-             {context_section}\
-             {glossary}\
-             === Unified Structured Summary ===\n\
-             {summary}\n\n\
-             Generate the Gherkin Feature below:",
-        );
+        if !glossary.is_empty() {
+            history.push(Message::user(glossary.to_owned()));
+        }
 
-        stream_with_progress(
+        if !context_summary.contains("No prior files") && !context_summary.is_empty() {
+            history.push(Message::user(context_summary.to_owned()));
+        }
+
+        history.push(Message::user(format!(
+            "=== Unified Structured Summary ===\n{summary}"
+        )));
+
+        stream_chat_with_progress(
             &agent,
-            &prompt,
+            &format!("Generate a single cohesive Gherkin Feature for document group: {group_name}"),
+            history,
             "Generator",
             group_name,
             status_tx,
@@ -1181,11 +1180,14 @@ fn score_line(line: &str) -> u32 {
 // Streaming helper
 // ─────────────────────────────────────────────
 
-/// Stream a prompt to an agent, accumulating the full response text and sending
-/// periodic progress updates via `status_tx`.
-async fn stream_with_progress<M, P>(
+/// Stream a prompt with structured chat history to an agent, accumulating the
+/// full response text and sending periodic progress updates via `status_tx`.
+/// The model sees each history message as a distinct turn, giving it clearer
+/// separation between glossary / context / document content.
+async fn stream_chat_with_progress<M, P>(
     agent: &rig::agent::Agent<M, P>,
     prompt: &str,
+    chat_history: Vec<Message>,
     stage_name: &str,
     file_name: &str,
     status_tx: &std::sync::mpsc::Sender<String>,
@@ -1196,9 +1198,12 @@ where
     M::StreamingResponse: rig::completion::GetTokenUsage,
     P: rig::agent::PromptHook<M> + 'static,
 {
-    let mut stream = tokio::time::timeout(timeout, agent.stream_prompt(prompt))
-        .await
-        .with_context(|| format!("{stage_name} timed out after {}s", timeout.as_secs()))?;
+    let mut stream = tokio::time::timeout(
+        timeout,
+        agent.stream_prompt(prompt).with_history(chat_history),
+    )
+    .await
+    .with_context(|| format!("{stage_name} timed out after {}s", timeout.as_secs()))?;
 
     let mut accumulated = String::new();
     let mut token_count: usize = 0;
@@ -1210,7 +1215,6 @@ where
             )) => {
                 accumulated.push_str(&text);
                 token_count += 1;
-                // Send progress every 20 tokens
                 if token_count % 20 == 0 {
                     let _ = status_tx.send(format!(
                         "🔄 [{stage_name}] {file_name}: {token_count} tokens…"
