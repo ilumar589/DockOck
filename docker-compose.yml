@@ -91,6 +91,21 @@ services:
         ollama pull qwen2.5-coder:7b || true
         wait $$OLLAMA_PID
 
+  # OpenSpec artifact generator service (port 11438)
+  openspec:
+    build:
+      context: ./openspec-service
+      dockerfile: Dockerfile
+    container_name: dockock-openspec
+    ports:
+      - "11438:3000"
+    environment:
+      - OLLAMA_URL=http://ollama-generator:11434
+      - OLLAMA_MODEL=qwen2.5-coder:32b
+    volumes:
+      - openspec_workspace:/workspace
+    restart: unless-stopped
+
 volumes:
   ollama_data_generator:
     driver: local
@@ -99,4 +114,6 @@ volumes:
   ollama_data_reviewer:
     driver: local
   ollama_data_vision:
+    driver: local
+  openspec_workspace:
     driver: local

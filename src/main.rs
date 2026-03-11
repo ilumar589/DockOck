@@ -17,6 +17,7 @@ mod app;
 mod context;
 mod gherkin;
 mod llm;
+mod openspec;
 mod parser;
 
 fn main() -> eframe::Result<()> {

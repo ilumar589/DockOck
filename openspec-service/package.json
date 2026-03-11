@@ -1,0 +1,13 @@
+{
+  "name": "dockock-openspec-service",
+  "version": "1.0.0",
+  "description": "HTTP wrapper around OpenSpec CLI for DockOck integration",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@fission-ai/openspec": "latest"
+  }
+}

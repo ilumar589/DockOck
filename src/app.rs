@@ -130,6 +130,15 @@ pub enum ProcessingEvent {
     },
     /// All files have been processed (or an error terminated the run)
     Done(Result<(), String>),
+    /// OpenSpec export started
+    OpenSpecStarted,
+    /// OpenSpec export completed for one document
+    OpenSpecResult {
+        change_name: String,
+        result: crate::openspec::OpenSpecExportResult,
+    },
+    /// OpenSpec export phase finished
+    OpenSpecDone(Result<usize, String>),
 }
 
 // ─────────────────────────────────────────────
@@ -208,6 +217,14 @@ pub struct DockOckApp {
     new_group_name: String,
     /// Whether the new-group input is shown
     show_new_group_input: bool,
+    /// Whether OpenSpec export is enabled (optional final phase)
+    openspec_enabled: bool,
+    /// Base URL for the OpenSpec service
+    openspec_url: String,
+    /// OpenSpec service status: None = not checked, Some(true) = reachable
+    openspec_ok: Option<bool>,
+    /// OpenSpec export results keyed by change name
+    openspec_results: HashMap<String, crate::openspec::OpenSpecExportResult>,
 }
 
 impl DockOckApp {
@@ -240,6 +257,10 @@ impl DockOckApp {
             file_groups: Vec::new(),
             new_group_name: String::new(),
             show_new_group_input: false,
+            openspec_enabled: false,
+            openspec_url: crate::openspec::DEFAULT_OPENSPEC_URL.to_string(),
+            openspec_ok: None,
+            openspec_results: HashMap::new(),
         }
     }
 
@@ -334,6 +355,7 @@ impl DockOckApp {
         self.progress = (0, 0);
         self.files_started = 0;
         self.file_groups.clear();
+        self.openspec_results.clear();
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -448,11 +470,15 @@ impl DockOckApp {
         let vis_model = self.vision_model.clone();
         let handle = self.runtime.clone();
         let mode = self.pipeline_mode;
+        let openspec_enabled = self.openspec_enabled;
+        let openspec_url = self.openspec_url.clone();
+        let openspec_output_dir = self.output_dir.clone();
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
             handle.block_on(process_files(
-                files, groups, context, gen_model, ext_model, rev_model, vis_model, mode, tx,
+                files, groups, context, gen_model, ext_model, rev_model, vis_model, mode,
+                openspec_enabled, openspec_url, openspec_output_dir, tx,
             ));
         });
     }
@@ -512,17 +538,45 @@ impl DockOckApp {
                     self.group_results.insert(group_name, gherkin);
                 }
                 ProcessingEvent::Done(result) => {
-                    self.event_rx = None;
-                    self.state = AppState::Done;
                     match result {
                         Ok(()) => {
                             self.log(LogLevel::Success, format!(
                                 "✅ All {} files processed successfully.",
                                 self.progress.1
                             ));
+                        }
+                        Err(e) => {
+                            self.log(LogLevel::Error, format!("❌ Processing failed: {}", e));
+                            self.event_rx = None;
+                            self.state = AppState::Done;
+                        }
+                    }
+                }
+                ProcessingEvent::OpenSpecStarted => {
+                    self.log(LogLevel::Info, "📦 Starting OpenSpec export phase…");
+                }
+                ProcessingEvent::OpenSpecResult { change_name, result } => {
+                    self.log(LogLevel::Success, format!(
+                        "📦 OpenSpec exported: {} ({} artifacts)",
+                        change_name,
+                        result.artifacts.len()
+                    ));
+                    self.openspec_results.insert(change_name, result);
+                }
+                ProcessingEvent::OpenSpecDone(result) => {
+                    self.event_rx = None;
+                    self.state = AppState::Done;
+                    match result {
+                        Ok(count) => {
+                            self.log(LogLevel::Success, format!(
+                                "✅ Processing complete. {} OpenSpec export(s) saved.", count
+                            ));
                             self.toast = Some(("Processing complete!".to_string(), 4.0));
                         }
-                        Err(e) => self.log(LogLevel::Error, format!("❌ Processing failed: {}", e)),
+                        Err(e) => {
+                            self.log(LogLevel::Error, format!("❌ OpenSpec export failed: {}", e));
+                            self.toast = Some(("Processing complete (OpenSpec errors)".to_string(), 4.0));
+                        }
                     }
                 }
             }
@@ -596,6 +650,21 @@ impl DockOckApp {
                         ui.selectable_value(&mut self.pipeline_mode, mode, mode.to_string());
                     }
                 });
+            ui.separator();
+            ui.checkbox(&mut self.openspec_enabled, "📦 OpenSpec");
+            if self.openspec_enabled {
+                match self.openspec_ok {
+                    Some(true) => {
+                        ui.colored_label(egui::Color32::GREEN, "●");
+                    }
+                    Some(false) => {
+                        ui.colored_label(egui::Color32::RED, "●");
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::GRAY, "○");
+                    }
+                }
+            }
             ui.separator();
             ui.label("📁 Output:");
             if let Some(dir) = &self.output_dir {
@@ -965,6 +1034,47 @@ impl DockOckApp {
                                 .font(egui::TextStyle::Monospace)
                                 .desired_width(f32::INFINITY),
                         );
+
+                        // ── OpenSpec artifacts (if available) ──
+                        let openspec_key = match &self.selection {
+                            Some(Selection::File(idx)) => self
+                                .selected_files
+                                .get(*idx)
+                                .and_then(|p| p.file_stem())
+                                .map(|s| s.to_string_lossy().to_string()),
+                            Some(Selection::Group(name)) => Some(name.clone()),
+                            None => None,
+                        };
+                        if let Some(key) = openspec_key {
+                            if let Some(export) = self.openspec_results.get(&key) {
+                                ui.add_space(12.0);
+                                ui.separator();
+                                ui.heading("📦 OpenSpec Artifacts");
+                                ui.add_space(4.0);
+
+                                let mut artifact_names: Vec<&String> =
+                                    export.artifacts.keys().collect();
+                                artifact_names.sort();
+
+                                for name in artifact_names {
+                                    if let Some(content) = export.artifacts.get(name) {
+                                        egui::CollapsingHeader::new(
+                                            egui::RichText::new(format!("📄 {}", name)).strong(),
+                                        )
+                                        .default_open(false)
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                egui::TextEdit::multiline(
+                                                    &mut content.as_str(),
+                                                )
+                                                .font(egui::TextStyle::Monospace)
+                                                .desired_width(f32::INFINITY),
+                                            );
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     });
             }
             None => {
@@ -1134,6 +1244,9 @@ async fn process_files(
     reviewer_model: String,
     vision_model: String,
     mode: crate::llm::PipelineMode,
+    openspec_enabled: bool,
+    openspec_url: String,
+    openspec_output_dir: Option<PathBuf>,
     tx: Sender<ProcessingEvent>,
 ) {
     let total = files.len();
@@ -1237,6 +1350,9 @@ async fn process_files(
 
     let mut llm_handles = Vec::new();
 
+    // Shared collection for OpenSpec: (change_name, gherkin_feature_text)
+    let gherkin_docs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
     // ── Dispatch group work items ──
     for group in &groups {
         // Collect parsed data for each member
@@ -1264,6 +1380,7 @@ async fn process_files(
             let sem = Arc::clone(&orchestrator.semaphore);
             let tx = tx.clone();
             let ctx = ctx_snapshot.clone();
+            let gdocs = Arc::clone(&gherkin_docs);
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await;
@@ -1292,6 +1409,13 @@ async fn process_files(
                             &raw_gherkin,
                             &file_name,
                         );
+                        let feature_text = doc.to_feature_string();
+                        if let Ok(mut docs) = gdocs.lock() {
+                            let stem = member_path.file_stem()
+                                .map(|s| s.to_string_lossy().to_string())
+                                .unwrap_or_else(|| file_name.clone());
+                            docs.push((stem, feature_text));
+                        }
                         let _ = tx.send(ProcessingEvent::FileResult {
                             path: member_path,
                             gherkin: doc,
@@ -1316,6 +1440,7 @@ async fn process_files(
         let sem = Arc::clone(&orchestrator.semaphore);
         let tx = tx.clone();
         let ctx = ctx_snapshot.clone();
+        let gdocs = Arc::clone(&gherkin_docs);
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
@@ -1351,6 +1476,10 @@ async fn process_files(
                         &raw_gherkin,
                         &group_name,
                     );
+                    let feature_text = doc.to_feature_string();
+                    if let Ok(mut docs) = gdocs.lock() {
+                        docs.push((group_name.clone(), feature_text));
+                    }
                     let _ = tx.send(ProcessingEvent::GroupResult {
                         group_name,
                         gherkin: doc,
@@ -1382,6 +1511,7 @@ async fn process_files(
         let sem = Arc::clone(&orchestrator.semaphore);
         let tx = tx.clone();
         let ctx = ctx_snapshot.clone();
+        let gdocs = Arc::clone(&gherkin_docs);
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1414,6 +1544,13 @@ async fn process_files(
                         &raw_gherkin,
                         &file_name,
                     );
+                    let feature_text = doc.to_feature_string();
+                    if let Ok(mut docs) = gdocs.lock() {
+                        let stem = path.file_stem()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| file_name.clone());
+                        docs.push((stem, feature_text));
+                    }
                     let _ = tx.send(ProcessingEvent::FileResult {
                         path: path.clone(),
                         gherkin: doc,
@@ -1438,4 +1575,85 @@ async fn process_files(
     }
 
     let _ = tx.send(ProcessingEvent::Done(Ok(())));
+
+    // ── Phase 3 (optional): OpenSpec export ──
+    if !openspec_enabled {
+        let _ = tx.send(ProcessingEvent::OpenSpecDone(Ok(0)));
+        return;
+    }
+
+    let _ = tx.send(ProcessingEvent::OpenSpecStarted);
+
+    // Check service availability
+    if let Err(e) = crate::openspec::check_service(&openspec_url).await {
+        let _ = tx.send(ProcessingEvent::Status(format!("⚠ {}", e)));
+        let _ = tx.send(ProcessingEvent::OpenSpecDone(Err(e)));
+        return;
+    }
+
+    // Retrieve collected Gherkin docs
+    let docs = gherkin_docs.lock().map(|d| d.clone()).unwrap_or_default();
+    if docs.is_empty() {
+        let _ = tx.send(ProcessingEvent::OpenSpecDone(Ok(0)));
+        return;
+    }
+
+    if openspec_output_dir.is_none() {
+        let _ = tx.send(ProcessingEvent::Status(
+            "⚠ No output directory set — OpenSpec artifacts will only be available in-app, not saved to disk.".to_string()
+        ));
+    }
+
+    let mut ok_count = 0usize;
+    for (change_name, gherkin_text) in &docs {
+        let _ = tx.send(ProcessingEvent::Status(format!(
+            "📦 Exporting to OpenSpec: {}…", change_name
+        )));
+
+        match crate::openspec::generate(&openspec_url, change_name, gherkin_text, true).await {
+            Ok(resp) => {
+                // Save to disk if output directory is set
+                let saved_paths = if let Some(ref dir) = openspec_output_dir {
+                    match crate::openspec::save_artifacts(dir, &resp) {
+                        Ok(paths) => {
+                            let save_dir = dir.join("openspec").join(&resp.change_name);
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "💾 Saved {} OpenSpec artifacts to: {}",
+                                paths.len(),
+                                save_dir.display()
+                            )));
+                            paths
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Failed to save OpenSpec artifacts for {}: {}", change_name, e
+                            )));
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                let result = crate::openspec::OpenSpecExportResult {
+                    change_name: resp.change_name.clone(),
+                    feature_title: resp.feature_title,
+                    artifacts: resp.artifacts,
+                    saved_paths,
+                };
+                let _ = tx.send(ProcessingEvent::OpenSpecResult {
+                    change_name: resp.change_name,
+                    result,
+                });
+                ok_count += 1;
+            }
+            Err(e) => {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "⚠ OpenSpec export failed for {}: {}", change_name, e
+                )));
+            }
+        }
+    }
+
+    let _ = tx.send(ProcessingEvent::OpenSpecDone(Ok(ok_count)));
 }
