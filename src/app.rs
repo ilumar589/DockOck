@@ -65,6 +65,40 @@ fn now_timestamp() -> String {
 }
 
 // ─────────────────────────────────────────────
+// Known model presets
+// ─────────────────────────────────────────────
+
+const KNOWN_MODELS: &[&str] = &[
+    "qwen2.5-coder:32b",
+    "qwen2.5-coder:7b",
+    "qwen2.5-coder:3b",
+    "deepseek-coder-v2:16b",
+    "codellama:34b",
+    "codellama:13b",
+    "codellama:7b",
+    "mistral-small:24b",
+    "phi3:14b",
+    "phi3:mini",
+    "gemma2:9b",
+    "gemma2:2b",
+    "llama3.2",
+    "llama3.1:8b",
+    "llama3.1:70b",
+];
+
+/// Editable combo box for model selection — pick from presets or type a custom name.
+fn model_combo(ui: &mut egui::Ui, id: &str, model: &mut String) {
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(model.as_str())
+        .width(160.0)
+        .show_ui(ui, |ui| {
+            for &name in KNOWN_MODELS {
+                ui.selectable_value(model, name.to_string(), name);
+            }
+        });
+}
+
+// ─────────────────────────────────────────────
 // Events sent from background thread → UI
 // ─────────────────────────────────────────────
 
@@ -79,6 +113,7 @@ pub enum ProcessingEvent {
     FileResult {
         path: PathBuf,
         gherkin: GherkinDocument,
+        elapsed: std::time::Duration,
     },
     /// All files have been processed (or an error terminated the run)
     Done(Result<(), String>),
@@ -105,14 +140,20 @@ pub struct DockOckApp {
     selected_index: Option<usize>,
     /// Generated Gherkin documents keyed by file path
     results: HashMap<PathBuf, GherkinDocument>,
+    /// Elapsed generation time per file
+    elapsed_times: HashMap<PathBuf, std::time::Duration>,
     /// Current status / log messages
     log_entries: Vec<LogEntry>,
     /// Current processing state
     state: AppState,
     /// Ollama status: None = not checked, Some(true) = reachable, Some(false) = unreachable
     ollama_ok: Option<bool>,
-    /// Ollama model name to use
-    model_name: String,
+    /// Ollama model name for the generator agent
+    generator_model: String,
+    /// Ollama model name for the extractor agent
+    extractor_model: String,
+    /// Ollama model name for the reviewer agent
+    reviewer_model: String,
     /// Channel receiver for background processing events
     event_rx: Option<Receiver<ProcessingEvent>>,
     /// Shared context accumulator (wrapped in Arc<Mutex<>> so background thread can write)
@@ -140,10 +181,13 @@ impl DockOckApp {
             selected_files: Vec::new(),
             selected_index: None,
             results: HashMap::new(),
+            elapsed_times: HashMap::new(),
             log_entries: Vec::new(),
             state: AppState::Idle,
             ollama_ok: None,
-            model_name: crate::llm::DEFAULT_MODEL.to_string(),
+            generator_model: crate::llm::DEFAULT_GENERATOR_MODEL.to_string(),
+            extractor_model: crate::llm::DEFAULT_EXTRACTOR_MODEL.to_string(),
+            reviewer_model: crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
             event_rx: None,
             context: Arc::new(Mutex::new(ProjectContext::new())),
             runtime,
@@ -200,6 +244,7 @@ impl DockOckApp {
     fn clear_all(&mut self) {
         self.selected_files.clear();
         self.results.clear();
+        self.elapsed_times.clear();
         self.log_entries.clear();
         self.selected_index = None;
         self.state = AppState::Idle;
@@ -262,6 +307,7 @@ impl DockOckApp {
 
         self.state = AppState::Processing;
         self.results.clear();
+        self.elapsed_times.clear();
         self.log_entries.clear();
         self.progress = (0, self.selected_files.len());
         self.files_started = 0;
@@ -274,13 +320,15 @@ impl DockOckApp {
 
         let files = self.selected_files.clone();
         let context = Arc::clone(&self.context);
-        let model = self.model_name.clone();
+        let gen_model = self.generator_model.clone();
+        let ext_model = self.extractor_model.clone();
+        let rev_model = self.reviewer_model.clone();
         let handle = self.runtime.clone();
         let mode = self.pipeline_mode;
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
-            handle.block_on(process_files(files, context, model, mode, tx));
+            handle.block_on(process_files(files, context, gen_model, ext_model, rev_model, mode, tx));
         });
     }
 
@@ -300,16 +348,24 @@ impl DockOckApp {
                 ProcessingEvent::FileStarted(_path) => {
                     self.files_started += 1;
                 }
-                ProcessingEvent::FileResult { path, gherkin } => {
+                ProcessingEvent::FileResult { path, gherkin, elapsed } => {
                     self.progress.0 += 1;
+                    let secs = elapsed.as_secs_f64();
+                    let elapsed_str = if secs >= 60.0 {
+                        format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                    } else {
+                        format!("{:.1}s", secs)
+                    };
                     self.log(LogLevel::Success, format!(
-                        "✓ Generated Gherkin for: {} ({}/{})",
+                        "✓ Generated Gherkin for: {} ({}/{}) in {}",
                         path.file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default(),
                         self.progress.0,
                         self.progress.1,
+                        elapsed_str,
                     ));
+                    self.elapsed_times.insert(path.clone(), elapsed);
                     self.results.insert(path, gherkin);
                 }
                 ProcessingEvent::Done(result) => {
@@ -379,8 +435,13 @@ impl DockOckApp {
                 }
             }
             ui.separator();
-            ui.label("Model:");
-            ui.text_edit_singleline(&mut self.model_name);
+            ui.label("Models:");
+            ui.label("Gen:");
+            model_combo(ui, "gen_model", &mut self.generator_model);
+            ui.label("Ext:");
+            model_combo(ui, "ext_model", &mut self.extractor_model);
+            ui.label("Rev:");
+            model_combo(ui, "rev_model", &mut self.reviewer_model);
             ui.separator();
             ui.label("Pipeline:");
             egui::ComboBox::from_id_salt("pipeline_mode")
@@ -462,7 +523,17 @@ impl DockOckApp {
 
                     let has_result = self.results.contains_key(path);
                     let label = if has_result {
-                        format!("✓ {}", name)
+                        if let Some(dur) = self.elapsed_times.get(path) {
+                            let secs = dur.as_secs_f64();
+                            let elapsed_str = if secs >= 60.0 {
+                                format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                            } else {
+                                format!("{:.1}s", secs)
+                            };
+                            format!("✓ {} ({})", name, elapsed_str)
+                        } else {
+                            format!("✓ {}", name)
+                        }
                     } else {
                         name.clone()
                     };
@@ -489,6 +560,7 @@ impl DockOckApp {
                 if let Some(idx) = to_remove {
                     let path = self.selected_files.remove(idx);
                     self.results.remove(&path);
+                    self.elapsed_times.remove(&path);
                     if self.selected_index == Some(idx) {
                         self.selected_index = None;
                     }
@@ -709,7 +781,9 @@ impl eframe::App for DockOckApp {
 async fn process_files(
     files: Vec<PathBuf>,
     context: Arc<Mutex<ProjectContext>>,
-    model: String,
+    generator_model: String,
+    extractor_model: String,
+    reviewer_model: String,
     mode: crate::llm::PipelineMode,
     tx: Sender<ProcessingEvent>,
 ) {
@@ -720,7 +794,12 @@ async fn process_files(
         "🔌 Probing Ollama instances…".to_string(),
     ));
 
-    let (orchestrator, statuses) = match crate::llm::AgentOrchestrator::new(&model, mode).await {
+    let (orchestrator, statuses) = match crate::llm::AgentOrchestrator::new(
+        &generator_model,
+        &extractor_model,
+        &reviewer_model,
+        mode,
+    ).await {
         Ok(pair) => pair,
         Err(e) => {
             let _ = tx.send(ProcessingEvent::Done(Err(e.to_string())));
@@ -814,6 +893,7 @@ async fn process_files(
 
             // Signal the UI that this file has started LLM processing
             let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
+            let file_start = std::time::Instant::now();
 
             // Create a status channel that wraps strings into ProcessingEvent::Status
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
@@ -832,6 +912,8 @@ async fn process_files(
             drop(status_tx); // signal forwarder to stop
             let _ = fwd.join();
 
+            let file_elapsed = file_start.elapsed();
+
             match result {
                 Ok(raw_gherkin) => {
                     let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
@@ -841,6 +923,7 @@ async fn process_files(
                     let _ = tx.send(ProcessingEvent::FileResult {
                         path: path.clone(),
                         gherkin: doc,
+                        elapsed: file_elapsed,
                     });
                 }
                 Err(e) => {

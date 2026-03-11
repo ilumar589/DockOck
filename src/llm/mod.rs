@@ -28,8 +28,14 @@ use tracing::{info, warn};
 
 use crate::context::ProjectContext;
 
-/// Default model used when none is specified.
-pub const DEFAULT_MODEL: &str = "llama3.2";
+/// Default model used for the generator agent.
+pub const DEFAULT_GENERATOR_MODEL: &str = "qwen2.5-coder:32b";
+
+/// Default model used for the extractor agent.
+pub const DEFAULT_EXTRACTOR_MODEL: &str = "qwen2.5-coder:7b";
+
+/// Default model used for the reviewer agent.
+pub const DEFAULT_REVIEWER_MODEL: &str = "qwen2.5-coder:7b";
 
 /// Maximum number of files processed through the LLM pipeline simultaneously.
 pub const MAX_CONCURRENT: usize = 3;
@@ -155,7 +161,9 @@ pub struct AgentOrchestrator {
     extractor_client: Option<ollama::Client>,
     generator_client: ollama::Client,
     reviewer_client: Option<ollama::Client>,
-    model: String,
+    generator_model: String,
+    extractor_model: String,
+    reviewer_model: String,
     pub semaphore: Arc<Semaphore>,
     pub mode: PipelineMode,
 }
@@ -171,7 +179,12 @@ pub struct EndpointStatus {
 impl AgentOrchestrator {
     /// Create the orchestrator, probing all endpoints.
     /// At minimum the generator (port 11434) must be reachable.
-    pub async fn new(model: &str, mode: PipelineMode) -> Result<(Self, Vec<EndpointStatus>)> {
+    pub async fn new(
+        generator_model: &str,
+        extractor_model: &str,
+        reviewer_model: &str,
+        mode: PipelineMode,
+    ) -> Result<(Self, Vec<EndpointStatus>)> {
         let mut statuses = Vec::new();
 
         // Check each endpoint
@@ -230,7 +243,9 @@ impl AgentOrchestrator {
                 extractor_client,
                 generator_client,
                 reviewer_client,
-                model: model.to_string(),
+                generator_model: generator_model.to_string(),
+                extractor_model: extractor_model.to_string(),
+                reviewer_model: reviewer_model.to_string(),
                 semaphore: Arc::new(Semaphore::new(concurrency)),
                 mode,
             },
@@ -300,7 +315,12 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let client = self.extractor_client.as_ref().unwrap_or(&self.generator_client);
-        let agent = client.agent(&self.model).preamble(EXTRACTOR_PREAMBLE).build();
+        let model = if self.extractor_client.is_some() {
+            &self.extractor_model
+        } else {
+            &self.generator_model
+        };
+        let agent = client.agent(model).preamble(EXTRACTOR_PREAMBLE).build();
 
         let prompt = format!(
             "Analyse the following {file_type} document and produce a structured summary.\n\n\
@@ -328,7 +348,7 @@ impl AgentOrchestrator {
         context_summary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
-        let agent = self.generator_client.agent(&self.model).preamble(GENERATOR_PREAMBLE).build();
+        let agent = self.generator_client.agent(&self.generator_model).preamble(GENERATOR_PREAMBLE).build();
 
         let context_section = if context_summary.contains("No prior files") {
             String::new()
@@ -363,7 +383,12 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let client = self.reviewer_client.as_ref().unwrap_or(&self.generator_client);
-        let agent = client.agent(&self.model).preamble(REVIEWER_PREAMBLE).build();
+        let model = if self.reviewer_client.is_some() {
+            &self.reviewer_model
+        } else {
+            &self.generator_model
+        };
+        let agent = client.agent(model).preamble(REVIEWER_PREAMBLE).build();
 
         let prompt = format!(
             "Review and correct the following Gherkin Feature:\n\n\

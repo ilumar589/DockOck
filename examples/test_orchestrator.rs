@@ -8,7 +8,12 @@ async fn main() -> Result<()> {
         .init();
 
     println!("=== Creating AgentOrchestrator ===");
-    let (orch, statuses) = dockock::llm::AgentOrchestrator::new("llama3.2").await?;
+    let (orch, statuses) = dockock::llm::AgentOrchestrator::new(
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:7b",
+        "qwen2.5-coder:7b",
+        dockock::llm::PipelineMode::default(),
+    ).await?;
 
     for st in &statuses {
         println!("  {} ({}): {}", st.name, st.url, if st.reachable { "online" } else { "offline" });

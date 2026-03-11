@@ -16,13 +16,13 @@ ENV OLLAMA_HOST=0.0.0.0
 
 # Pull the default model during image build so the first run is instant.
 # The model is downloaded into the image layer; this makes the image large
-# (~2 GB for llama3.2) but avoids a slow first-start download.
+# (~20 GB for qwen2.5-coder:32b) but avoids a slow first-start download.
 #
 # Comment this out if you prefer a smaller image and are happy to wait for
 # the model pull on first run.
 RUN ollama serve &\
     sleep 5 &&\
-    ollama pull llama3.2 &&\
+    ollama pull qwen2.5-coder:32b &&\
     pkill ollama || true
 
 CMD ["serve"]

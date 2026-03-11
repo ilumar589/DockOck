@@ -9,6 +9,14 @@ services:
       - ollama_data_generator:/root/.ollama
     environment:
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -17,8 +25,8 @@ services:
         OLLAMA_PID=$$!
         echo "Waiting for Ollama (generator) to start..."
         sleep 5
-        echo "Pulling llama3.2 model..."
-        ollama pull llama3.2 || true
+        echo "Pulling qwen2.5-coder:32b model..."
+        ollama pull qwen2.5-coder:32b || true
         wait $$OLLAMA_PID
 
   # Second instance – Document extractor / summariser (port 11435)
@@ -31,6 +39,14 @@ services:
       - ollama_data_extractor:/root/.ollama
     environment:
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -39,8 +55,8 @@ services:
         OLLAMA_PID=$$!
         echo "Waiting for Ollama (extractor) to start..."
         sleep 5
-        echo "Pulling llama3.2 model..."
-        ollama pull llama3.2 || true
+        echo "Pulling qwen2.5-coder:7b model..."
+        ollama pull qwen2.5-coder:7b || true
         wait $$OLLAMA_PID
 
   # Third instance – Gherkin reviewer / validator (port 11436)
@@ -53,6 +69,14 @@ services:
       - ollama_data_reviewer:/root/.ollama
     environment:
       - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_PARALLEL=4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c"]
     command:
@@ -61,8 +85,8 @@ services:
         OLLAMA_PID=$$!
         echo "Waiting for Ollama (reviewer) to start..."
         sleep 5
-        echo "Pulling llama3.2 model..."
-        ollama pull llama3.2 || true
+        echo "Pulling qwen2.5-coder:7b model..."
+        ollama pull qwen2.5-coder:7b || true
         wait $$OLLAMA_PID
 
 volumes:
