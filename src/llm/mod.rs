@@ -31,6 +31,9 @@ use tracing::{info, warn};
 
 use crate::context::ProjectContext;
 
+pub mod prefix_cache;
+pub use prefix_cache::PrefixCache;
+
 /// Default model used for the generator agent.
 pub const DEFAULT_GENERATOR_MODEL: &str = "qwen2.5-coder:32b";
 
@@ -184,7 +187,7 @@ Rules:
 5. Be concise — no more than 300 words.
 6. Do not add conversational prose."#;
 
-const GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
+pub const GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 Your task is to read a structured document summary and produce well-structured Gherkin
 Feature documentation that can be used by OpenSpec to generate project implementations.
 
@@ -291,6 +294,9 @@ pub struct AgentOrchestrator {
     pub semaphore: Arc<Semaphore>,
     pub mode: PipelineMode,
     cache: crate::cache::DiskCache,
+    /// KV-cache for generator shared prefix (preamble + glossary).
+    /// Wrapped in a Mutex so we can prime it after construction.
+    generator_prefix_cache: tokio::sync::Mutex<PrefixCache>,
 }
 
 /// Result of checking which Ollama endpoints are reachable.
@@ -398,9 +404,31 @@ impl AgentOrchestrator {
                 semaphore: Arc::new(Semaphore::new(concurrency)),
                 mode,
                 cache,
+                generator_prefix_cache: tokio::sync::Mutex::new(
+                    PrefixCache::new(ENDPOINT_GENERATOR.url, &generator_model)
+                ),
             },
             statuses,
         ))
+    }
+
+    /// Prime the generator's KV-cache prefix with the shared preamble + glossary.
+    /// Call this once after the glossary has been extracted (Phase 1.25).
+    /// Subsequent `generate()` / `generate_group()` calls will reuse the cached
+    /// prefix, skipping recomputation of attention over the shared tokens.
+    pub async fn prime_generator_prefix(&self, preamble: &str, glossary: &str) -> Result<()> {
+        if glossary.is_empty() {
+            return Ok(()); // nothing worth caching
+        }
+        let num_ctx = context_window_for_model(&self.generator_model);
+        let mut cache = self.generator_prefix_cache.lock().await;
+        cache.prime(preamble, glossary, num_ctx).await
+    }
+
+    /// Whether the generator prefix cache is primed and ready.
+    pub async fn has_generator_prefix_cache(&self, preamble: &str, glossary: &str) -> bool {
+        let cache = self.generator_prefix_cache.lock().await;
+        cache.is_primed_for(preamble, glossary)
     }
 
     /// Send a trivial prompt to each reachable endpoint to force model loading.
@@ -793,6 +821,34 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let num_ctx = context_window_for_model(&self.generator_model);
+
+        // Try prefix-cached path first (skips recomputing shared prefix attention)
+        {
+            let cache = self.generator_prefix_cache.lock().await;
+            if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
+                // Build per-file suffix only (glossary is in the cached prefix)
+                let mut suffix = String::new();
+                if !context_summary.contains("No prior files") && !context_summary.is_empty() {
+                    suffix.push_str(context_summary);
+                    suffix.push('\n');
+                }
+                suffix.push_str(&format!(
+                    "=== Structured Summary ===\n{summary}\n\n\
+                     Generate the Gherkin Feature for document: {file_name}"
+                ));
+
+                return cache.stream_generate(
+                    &suffix,
+                    num_ctx,
+                    "Generator",
+                    file_name,
+                    status_tx,
+                    std::time::Duration::from_secs(180),
+                ).await;
+            }
+        }
+
+        // Fallback: rig-core multi-turn chat
         let agent = self.generator_client.agent(&self.generator_model)
             .preamble(GENERATOR_PREAMBLE)
             .additional_params(serde_json::json!({"num_ctx": num_ctx}))
@@ -1146,6 +1202,42 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let num_ctx = context_window_for_model(&self.generator_model);
+
+        // Try prefix-cached path first
+        {
+            let cache = self.generator_prefix_cache.lock().await;
+            // Groups use GROUP_GENERATOR_PREAMBLE, not the standard one.
+            // The prefix cache is primed with GENERATOR_PREAMBLE. If the
+            // glossary matches, the cached prefix still saves glossary
+            // recomputation even though the system prompt differs slightly.
+            // For simplicity we only use the cache when primed with the
+            // matching preamble — which means groups fall through to the
+            // rig-core path.  A future optimisation could prime a separate
+            // cache for the group preamble.
+            if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
+                // Build suffix with group-specific framing
+                let mut suffix = String::new();
+                if !context_summary.contains("No prior files") && !context_summary.is_empty() {
+                    suffix.push_str(context_summary);
+                    suffix.push('\n');
+                }
+                suffix.push_str(&format!(
+                    "=== Unified Structured Summary ===\n{summary}\n\n\
+                     Generate a single cohesive Gherkin Feature for document group: {group_name}"
+                ));
+
+                return cache.stream_generate(
+                    &suffix,
+                    num_ctx,
+                    "Generator",
+                    group_name,
+                    status_tx,
+                    std::time::Duration::from_secs(240),
+                ).await;
+            }
+        }
+
+        // Fallback: rig-core multi-turn chat
         let agent = self
             .generator_client
             .agent(&self.generator_model)

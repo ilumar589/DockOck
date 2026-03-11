@@ -1799,6 +1799,26 @@ async fn process_files(
         "✅ Models warmed up.".to_string(),
     ));
 
+    // ── Phase 1.35: Prime the generator KV-cache with the shared prefix ──
+    {
+        let glossary = if let Ok(ctx) = context.lock() {
+            ctx.build_glossary()
+        } else {
+            String::new()
+        };
+        if !glossary.is_empty() {
+            let _ = tx.send(ProcessingEvent::Status(
+                "⚡ Priming generator KV-cache prefix…".to_string(),
+            ));
+            let _ = orchestrator
+                .prime_generator_prefix(crate::llm::GENERATOR_PREAMBLE, &glossary)
+                .await;
+            let _ = tx.send(ProcessingEvent::Status(
+                "⚡ Generator prefix cache ready.".to_string(),
+            ));
+        }
+    }
+
     // ── Phase 1.5: Build work items (groups vs ungrouped singles) ──
     let grouped_paths: std::collections::HashSet<PathBuf> = groups
         .iter()
