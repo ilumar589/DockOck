@@ -1808,7 +1808,7 @@ async fn process_files(
         "🧠 [RAG] Embedding document chunks…".to_string(),
     ));
     let mut rag_engine = crate::rag::RagEngine::new(
-        crate::llm::ENDPOINT_GENERATOR.url,
+        crate::llm::ENDPOINT_EXTRACTOR.url,
         &embedding_model,
         cache.clone(),
     );

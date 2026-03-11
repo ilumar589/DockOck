@@ -43,6 +43,8 @@ services:
         sleep 5
         echo "Pulling qwen2.5-coder:7b model..."
         ollama pull qwen2.5-coder:7b || true
+        echo "Pulling nomic-embed-text embedding model..."
+        ollama pull nomic-embed-text || true
         wait $$OLLAMA_PID
 
   # Fourth instance – Vision / image description (port 11437)
