@@ -1,8 +1,15 @@
 //! Parser for Microsoft Word `.docx` files.
 //!
 //! A `.docx` file is a ZIP archive containing XML files.  The main text lives
-//! in `word/document.xml`.  This parser unzips that entry and extracts all
-//! `<w:t>` (text run) elements, preserving paragraph breaks.
+//! in `word/document.xml`.  This parser unzips that entry and extracts:
+//!
+//! * **Paragraphs** – plain text, with Markdown-style heading markers
+//!   (`# ` / `## ` / `### `) for `Title`, `Heading1`, `Heading2` … styles.
+//! * **Tables** – rendered as pipe-delimited rows (`| cell | cell |`) so the
+//!   LLM receives structured tabular data instead of a jumbled text stream.
+//! * **Images** – represented by an `[Image: <alt-text>]` placeholder extracted
+//!   from the `<wp:docPr descr>` (or `name`) attribute of every drawing.  The
+//!   pixel data is not sent to the LLM, only the human-readable description.
 
 use anyhow::{Context, Result};
 use std::io::{Cursor, Read};
@@ -41,51 +48,216 @@ fn read_zip_entry<R: Read + std::io::Seek>(
     String::from_utf8(buf).with_context(|| format!("Entry '{}' is not valid UTF-8", name))
 }
 
-/// Walk the `<w:t>` nodes in the document XML and collect their text.
+// ─────────────────────────────────────────────────────────────────────────────
+// Top-level XML walker
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Walk the body of `word/document.xml` and produce readable plain text.
 ///
-/// Paragraph (`<w:p>`) boundaries are converted to newlines so that the output
-/// is readable plain text.
+/// Top-level body children are processed in document order:
+/// * `<w:p>`   → [`extract_paragraph`]
+/// * `<w:tbl>` → [`extract_table`]
+///
+/// Nested structures (e.g. a paragraph inside a table cell) are handled
+/// recursively by the per-element helpers.
 fn extract_text_from_xml(xml: &str) -> Result<String> {
     let doc = roxmltree::Document::parse(xml)
         .with_context(|| "Failed to parse word/document.xml as XML")?;
 
+    let body = doc
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "body")
+        .ok_or_else(|| anyhow::anyhow!("No <w:body> element found in document.xml"))?;
+
     let mut output = String::new();
-    let mut prev_para = None::<roxmltree::NodeId>;
 
-    for node in doc.descendants() {
-        if node.is_element() {
-            let local = node.tag_name().name();
-
-            if local == "p" {
-                // Each new paragraph gets a newline separator before it
-                // (but not before the very first paragraph).
-                if prev_para.is_some() {
+    for child in body.children() {
+        if !child.is_element() {
+            continue;
+        }
+        match child.tag_name().name() {
+            "p" => {
+                let text = extract_paragraph(&child);
+                if !text.is_empty() {
+                    output.push_str(&text);
                     output.push('\n');
                 }
-                prev_para = Some(node.id());
             }
-
-            if local == "t" {
-                if let Some(text) = node.text() {
-                    if !text.trim().is_empty() {
-                        output.push_str(text);
-                        output.push(' ');
-                    }
+            "tbl" => {
+                let table = extract_table(&child);
+                if !table.is_empty() {
+                    output.push('\n');
+                    output.push_str(&table);
+                    output.push('\n');
                 }
             }
+            _ => {}
         }
     }
 
     Ok(output.trim().to_string())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Paragraph helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Return the `w:val` of the first `<w:pStyle>` found inside a paragraph's
+/// `<w:pPr>` element, if any.
+fn paragraph_style(para: &roxmltree::Node) -> Option<String> {
+    para.children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "pPr")
+        .flat_map(|ppr| ppr.children())
+        .filter(|n| n.is_element() && n.tag_name().name() == "pStyle")
+        .find_map(|n| {
+            // The style value lives in the `w:val` attribute; roxmltree exposes
+            // it via the local name "val" regardless of namespace prefix.
+            n.attributes()
+                .find(|a: &roxmltree::Attribute| a.name() == "val")
+                .map(|a| a.value().to_string())
+        })
+}
+
+/// Collect the text content (and image placeholders) from a single paragraph.
+///
+/// The returned string already includes a Markdown-style heading prefix when
+/// the paragraph style starts with `"Heading"` or equals `"Title"`.
+fn extract_paragraph(para: &roxmltree::Node) -> String {
+    let style = paragraph_style(para);
+
+    let mut parts: Vec<String> = Vec::new();
+
+    for node in para.descendants() {
+        if !node.is_element() {
+            continue;
+        }
+        match node.tag_name().name() {
+            // Text run
+            "t" => {
+                if let Some(text) = node.text() {
+                    if !text.trim().is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+            // Drawing / image — extract the human-readable description
+            "docPr" => {
+                let descr = node.attribute("descr").unwrap_or("").trim().to_string();
+                let name = node.attribute("name").unwrap_or("").trim().to_string();
+                let label = if !descr.is_empty() { descr } else { name };
+                if !label.is_empty() {
+                    parts.push(format!("[Image: {}]", label));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if parts.is_empty() {
+        return String::new();
+    }
+
+    // Join with a space so that adjacent text runs don't run together.
+    // The trim() removes any leading/trailing whitespace introduced by the join.
+    let combined = parts.join(" ").trim().to_string();
+
+    // Apply Markdown-style heading prefix based on paragraph style
+    match style.as_deref() {
+        Some("Title") | Some("title") => format!("# {}", combined),
+        Some(s) if s.eq_ignore_ascii_case("Heading1") || s == "1" => {
+            format!("# {}", combined)
+        }
+        Some(s) if s.eq_ignore_ascii_case("Heading2") || s == "2" => {
+            format!("## {}", combined)
+        }
+        Some(s) if s.eq_ignore_ascii_case("Heading3") || s == "3" => {
+            format!("### {}", combined)
+        }
+        Some(s) if s.to_ascii_lowercase().starts_with("heading") => {
+            format!("#### {}", combined)
+        }
+        _ => combined,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Table helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Collect all text (and image placeholders) from a single table cell.
+///
+/// Paragraphs within the cell are joined with a space; nested tables produce
+/// their own inline text without extra delimiters.
+fn collect_cell_text(cell: &roxmltree::Node) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    for node in cell.descendants() {
+        if !node.is_element() {
+            continue;
+        }
+        match node.tag_name().name() {
+            "t" => {
+                if let Some(text) = node.text() {
+                    parts.push(text.to_string());
+                }
+            }
+            "docPr" => {
+                let descr = node.attribute("descr").unwrap_or("").trim().to_string();
+                let name = node.attribute("name").unwrap_or("").trim().to_string();
+                let label = if !descr.is_empty() { descr } else { name };
+                if !label.is_empty() {
+                    parts.push(format!("[Image: {}]", label));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Join with a space so that adjacent text runs don't run together.
+    parts.join(" ").trim().to_string()
+}
+
+/// Render a `<w:tbl>` element as pipe-delimited rows.
+///
+/// Empty rows (all cells blank) are skipped.  The result looks like:
+///
+/// ```text
+/// | Header A | Header B | Header C |
+/// | value 1  | value 2  | value 3  |
+/// ```
+fn extract_table(table: &roxmltree::Node) -> String {
+    let mut rows_output: Vec<String> = Vec::new();
+
+    for row in table
+        .children()
+        .filter(|n| n.is_element() && n.tag_name().name() == "tr")
+    {
+        let cells: Vec<String> = row
+            .children()
+            .filter(|n| n.is_element() && n.tag_name().name() == "tc")
+            .map(|cell| collect_cell_text(&cell))
+            .collect();
+
+        if !cells.is_empty() && cells.iter().any(|c| !c.is_empty()) {
+            rows_output.push(format!("| {} |", cells.join(" | ")));
+        }
+    }
+
+    rows_output.join("\n")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ── Basic paragraph text ──────────────────────────────────────────────
+
     #[test]
-    fn test_extract_text_from_xml() {
-        // Minimal document XML fragment
+    fn test_extract_text_from_xml_paragraphs() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
   <w:body>
@@ -103,5 +275,173 @@ mod tests {
         assert!(text.contains("Hello"));
         assert!(text.contains("World"));
         assert!(text.contains("Second paragraph"));
+    }
+
+    // ── Heading styles ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_heading_style_prefix() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Introduction</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading2"/></w:pPr>
+      <w:r><w:t>Background</w:t></w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:t>Normal text here</w:t></w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+
+        let text = extract_text_from_xml(xml).unwrap();
+        assert!(text.contains("# Introduction"), "H1 should get single #");
+        assert!(text.contains("## Background"), "H2 should get double ##");
+        assert!(text.contains("Normal text here"));
+    }
+
+    // ── Table extraction ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_table_extraction() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Name</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Value</w:t></w:r></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Field A</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>123</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+
+        let text = extract_text_from_xml(xml).unwrap();
+        assert!(text.contains("| Name | Value |"), "header row should be pipe-delimited");
+        assert!(text.contains("| Field A | 123 |"), "data row should be pipe-delimited");
+    }
+
+    #[test]
+    fn test_empty_table_rows_are_skipped() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p></w:p></w:tc>
+        <w:tc><w:p></w:p></w:tc>
+      </w:tr>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Data</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Value</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>"#;
+
+        let text = extract_text_from_xml(xml).unwrap();
+        // Empty row should not produce a pipe line
+        let pipe_lines: Vec<&str> = text.lines().filter(|l| l.starts_with('|')).collect();
+        assert_eq!(pipe_lines.len(), 1, "only the non-empty row should appear");
+        assert!(text.contains("| Data | Value |"));
+    }
+
+    // ── Image alt-text ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_image_alt_text_extraction() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+  <w:body>
+    <w:p>
+      <w:r>
+        <w:drawing>
+          <wp:inline>
+            <wp:docPr id="1" name="Figure 1" descr="Process flow diagram showing the disconnection steps"/>
+          </wp:inline>
+        </w:drawing>
+      </w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+
+        let text = extract_text_from_xml(xml).unwrap();
+        assert!(
+            text.contains("[Image: Process flow diagram showing the disconnection steps]"),
+            "descr attribute should be used as alt text: {text}"
+        );
+    }
+
+    #[test]
+    fn test_image_falls_back_to_name_when_no_descr() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+  <w:body>
+    <w:p>
+      <w:r>
+        <w:drawing>
+          <wp:inline>
+            <wp:docPr id="2" name="Architecture diagram"/>
+          </wp:inline>
+        </w:drawing>
+      </w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+
+        let text = extract_text_from_xml(xml).unwrap();
+        assert!(
+            text.contains("[Image: Architecture diagram]"),
+            "name attribute should be used when descr is absent: {text}"
+        );
+    }
+
+    // ── Mixed content ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mixed_paragraphs_tables_images() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document
+  xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+  xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+  <w:body>
+    <w:p>
+      <w:pPr><w:pStyle w:val="Heading1"/></w:pPr>
+      <w:r><w:t>Service Description</w:t></w:r>
+    </w:p>
+    <w:tbl>
+      <w:tr>
+        <w:tc><w:p><w:r><w:t>Trigger</w:t></w:r></w:p></w:tc>
+        <w:tc><w:p><w:r><w:t>Customer request</w:t></w:r></w:p></w:tc>
+      </w:tr>
+    </w:tbl>
+    <w:p>
+      <w:r>
+        <w:drawing>
+          <wp:inline>
+            <wp:docPr id="1" name="fig1" descr="Conceptual data model"/>
+          </wp:inline>
+        </w:drawing>
+      </w:r>
+    </w:p>
+  </w:body>
+</w:document>"#;
+
+        let text = extract_text_from_xml(xml).unwrap();
+        assert!(text.contains("# Service Description"));
+        assert!(text.contains("| Trigger | Customer request |"));
+        assert!(text.contains("[Image: Conceptual data model]"));
     }
 }
