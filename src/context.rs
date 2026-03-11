@@ -22,7 +22,7 @@ pub struct FileContent {
 
 /// A named collection of files whose content is merged into a single
 /// aggregated context before Gherkin generation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileGroup {
     /// Human-readable group label (e.g. "D028_Requirements")
     pub name: String,

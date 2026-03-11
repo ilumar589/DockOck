@@ -82,7 +82,7 @@ fn input_budget_for_model(model: &str) -> usize {
 }
 
 /// Pipeline mode — controls which LLM stages are executed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PipelineMode {
     /// Preprocess (fast) → Generate.  1 LLM call.
     Fast,
@@ -435,6 +435,7 @@ impl AgentOrchestrator {
 
     /// Run the pipeline for one file. Stages depend on `self.mode`.
     /// Results are cached by content hash when `force_regenerate` is false.
+    /// If `rag_context` is provided, it replaces the default cross-file excerpt context.
     pub async fn process_file(
         &self,
         file_name: &str,
@@ -442,11 +443,15 @@ impl AgentOrchestrator {
         raw_text: &str,
         images: &[crate::parser::ExtractedImage],
         context: &ProjectContext,
+        rag_context: Option<&str>,
         status_tx: &std::sync::mpsc::Sender<String>,
         force_regenerate: bool,
     ) -> Result<String> {
         // Build LLM cache key from all inputs that affect the output
-        let context_summary = context.build_summary();
+        let context_summary = match rag_context {
+            Some(rc) => rc.to_string(),
+            None => context.build_summary(),
+        };
         let images_hash = {
             let mut h = sha2::Sha256::new();
             for img in images {
@@ -705,11 +710,13 @@ impl AgentOrchestrator {
     }
 
     /// Run the pipeline for a group of related files, producing a single merged Gherkin output.
+    /// If `rag_context` is provided, it replaces the default cross-file excerpt context.
     pub async fn process_group(
         &self,
         group_name: &str,
         members: &[(String, String, String, Vec<crate::parser::ExtractedImage>)],
         context: &ProjectContext,
+        rag_context: Option<&str>,
         status_tx: &std::sync::mpsc::Sender<String>,
         force_regenerate: bool,
     ) -> Result<String> {
@@ -823,7 +830,10 @@ impl AgentOrchestrator {
             .cloned()
             .collect();
 
-        let context_summary = context.build_summary_excluding(&exclude);
+        let context_summary = match rag_context {
+            Some(rc) => rc.to_string(),
+            None => context.build_summary_excluding(&exclude),
+        };
         let gherkin = self
             .generate_group(group_name, &summary, &context_summary, &context.build_glossary(), status_tx)
             .await?;

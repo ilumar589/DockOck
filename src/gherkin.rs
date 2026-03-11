@@ -13,14 +13,14 @@
 //! ```
 
 /// A single Gherkin step (Given / When / Then / And / But).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Step {
     pub keyword: StepKeyword,
     pub text: String,
 }
 
 /// Gherkin step keywords.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum StepKeyword {
     Given,
     When,
@@ -42,7 +42,7 @@ impl StepKeyword {
 }
 
 /// A Gherkin Scenario (or Scenario Outline).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Scenario {
     pub title: String,
     pub steps: Vec<Step>,
@@ -51,7 +51,7 @@ pub struct Scenario {
 }
 
 /// A complete Gherkin Feature document.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GherkinDocument {
     pub feature_title: String,
     pub description: String,

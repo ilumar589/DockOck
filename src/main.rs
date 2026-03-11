@@ -20,6 +20,8 @@ mod gherkin;
 mod llm;
 mod openspec;
 mod parser;
+mod rag;
+mod session;
 
 fn main() -> eframe::Result<()> {
     // Initialise tracing for debug logs

@@ -191,6 +191,8 @@ pub struct DockOckApp {
     reviewer_model: String,
     /// Ollama model name for the vision agent (image description)
     vision_model: String,
+    /// Ollama model name for the embedding agent (RAG)
+    embedding_model: String,
     /// Channel receiver for background processing events
     event_rx: Option<Receiver<ProcessingEvent>>,
     /// Shared context accumulator (wrapped in Arc<Mutex<>> so background thread can write)
@@ -229,6 +231,18 @@ pub struct DockOckApp {
     max_concurrent: usize,
     /// Force re-generation even if cache has valid entries
     force_regenerate: bool,
+    /// User quality ratings keyed by file path string or group name
+    ratings: HashMap<String, crate::session::Rating>,
+    /// Previous results for diffing (before last regeneration)
+    previous_results: HashMap<PathBuf, GherkinDocument>,
+    /// Previous group results for diffing
+    previous_group_results: HashMap<String, GherkinDocument>,
+    /// Whether the diff view is active for the current selection
+    show_diff: bool,
+    /// Per-selection refinement instruction text
+    refinement_input: String,
+    /// Whether a session restore prompt should be shown
+    session_restore_pending: bool,
 }
 
 impl DockOckApp {
@@ -248,6 +262,7 @@ impl DockOckApp {
             extractor_model: crate::llm::DEFAULT_EXTRACTOR_MODEL.to_string(),
             reviewer_model: crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
             vision_model: crate::llm::DEFAULT_VISION_MODEL.to_string(),
+            embedding_model: crate::rag::DEFAULT_EMBEDDING_MODEL.to_string(),
             event_rx: None,
             context: Arc::new(Mutex::new(ProjectContext::new())),
             runtime,
@@ -267,6 +282,12 @@ impl DockOckApp {
             openspec_results: HashMap::new(),
             max_concurrent: crate::llm::DEFAULT_MAX_CONCURRENT,
             force_regenerate: false,
+            ratings: HashMap::new(),
+            previous_results: HashMap::new(),
+            previous_group_results: HashMap::new(),
+            show_diff: false,
+            refinement_input: String::new(),
+            session_restore_pending: false,
         }
     }
 
@@ -435,6 +456,96 @@ impl DockOckApp {
         }
     }
 
+    /// Build a `SessionData` snapshot of the current state.
+    fn build_session_data(&self) -> crate::session::SessionData {
+        // Convert PathBuf-keyed results to String-keyed for serialization
+        let results: HashMap<String, GherkinDocument> = self
+            .results
+            .iter()
+            .map(|(p, d)| (p.to_string_lossy().to_string(), d.clone()))
+            .collect();
+        let previous: HashMap<String, GherkinDocument> = self
+            .previous_results
+            .iter()
+            .map(|(p, d)| (p.to_string_lossy().to_string(), d.clone()))
+            .collect();
+        crate::session::SessionData {
+            files: self.selected_files.clone(),
+            groups: self.file_groups.clone(),
+            results,
+            group_results: self.group_results.clone(),
+            ratings: self.ratings.clone(),
+            generator_model: self.generator_model.clone(),
+            extractor_model: self.extractor_model.clone(),
+            reviewer_model: self.reviewer_model.clone(),
+            vision_model: self.vision_model.clone(),
+            embedding_model: self.embedding_model.clone(),
+            pipeline_mode: self.pipeline_mode,
+            max_concurrent: self.max_concurrent,
+            output_dir: self.output_dir.clone(),
+            previous_results: previous,
+            previous_group_results: self.previous_group_results.clone(),
+        }
+    }
+
+    /// Auto-save session to disk (no-op if no output directory set).
+    fn auto_save_session(&mut self) {
+        if let Some(dir) = &self.output_dir {
+            let data = self.build_session_data();
+            if let Err(e) = crate::session::save(dir, &data) {
+                self.log(LogLevel::Warning, format!("Session save failed: {}", e));
+            }
+        }
+    }
+
+    /// Restore state from a session file.
+    fn restore_session(&mut self, data: crate::session::SessionData) {
+        self.selected_files = data.files;
+        self.file_groups = data.groups;
+        self.results = data
+            .results
+            .into_iter()
+            .map(|(k, v)| (PathBuf::from(k), v))
+            .collect();
+        self.group_results = data.group_results;
+        self.ratings = data.ratings;
+        self.generator_model = data.generator_model;
+        self.extractor_model = data.extractor_model;
+        self.reviewer_model = data.reviewer_model;
+        self.vision_model = data.vision_model;
+        self.embedding_model = data.embedding_model;
+        self.pipeline_mode = data.pipeline_mode;
+        self.max_concurrent = data.max_concurrent;
+        self.previous_results = data
+            .previous_results
+            .into_iter()
+            .map(|(k, v)| (PathBuf::from(k), v))
+            .collect();
+        self.previous_group_results = data.previous_group_results;
+        if !self.results.is_empty() || !self.group_results.is_empty() {
+            self.state = AppState::Done;
+        }
+        let file_count = self.selected_files.len();
+        let result_count = self.results.len() + self.group_results.len();
+        self.log(
+            LogLevel::Success,
+            format!("Session restored: {} files, {} results", file_count, result_count),
+        );
+        self.toast = Some(("Session restored".to_string(), 3.0));
+    }
+
+    /// Get the rating key for the current selection.
+    fn selection_rating_key(&self) -> Option<String> {
+        match &self.selection {
+            Some(Selection::File(idx)) => self
+                .selected_files
+                .get(*idx)
+                .map(|p| p.to_string_lossy().to_string()),
+            Some(Selection::Group(name)) => Some(name.clone()),
+            None => None,
+        }
+    }
+
     /// Kick off background processing for all selected files.
     fn start_processing(&mut self) {
         if self.selected_files.is_empty() {
@@ -443,6 +554,9 @@ impl DockOckApp {
         }
 
         self.state = AppState::Processing;
+        // Snapshot current results for diffing after regeneration
+        self.previous_results = self.results.clone();
+        self.previous_group_results = self.group_results.clone();
         self.results.clear();
         self.group_results.clear();
         self.elapsed_times.clear();
@@ -474,6 +588,7 @@ impl DockOckApp {
         let ext_model = self.extractor_model.clone();
         let rev_model = self.reviewer_model.clone();
         let vis_model = self.vision_model.clone();
+        let emb_model = self.embedding_model.clone();
         let handle = self.runtime.clone();
         let mode = self.pipeline_mode;
         let max_concurrent = self.max_concurrent;
@@ -486,10 +601,112 @@ impl DockOckApp {
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
             handle.block_on(process_files(
-                files, groups, context, gen_model, ext_model, rev_model, vis_model, mode,
+                files, groups, context, gen_model, ext_model, rev_model, vis_model,
+                emb_model, mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
                 cache, force_regenerate, tx,
             ));
+        });
+    }
+
+    /// Kick off a targeted refinement of the currently selected Gherkin output.
+    fn start_refinement(&mut self, current_gherkin: String) {
+        let instruction = self.refinement_input.trim().to_string();
+        if instruction.is_empty() {
+            return;
+        }
+        self.refinement_input.clear();
+
+        let selection = self.selection.clone();
+        let model = self.generator_model.clone();
+        let handle = self.runtime.clone();
+
+        let (tx, rx): (Sender<ProcessingEvent>, Receiver<ProcessingEvent>) = mpsc::channel();
+        self.event_rx = Some(rx);
+        self.state = AppState::Processing;
+
+        let _ = tx.send(ProcessingEvent::Status(format!(
+            "✏ Refining: {}…", instruction
+        )));
+
+        std::thread::spawn(move || {
+            handle.block_on(async move {
+                let prompt = format!(
+                    "You are a Gherkin expert. The user has generated the following Gherkin feature file \
+                     and wants you to refine it.\n\n\
+                     === CURRENT GHERKIN ===\n{}\n\n\
+                     === USER INSTRUCTION ===\n{}\n\n\
+                     Output ONLY the complete, revised Gherkin feature file. \
+                     Keep the Feature title and overall structure. \
+                     Apply the user's instruction precisely.",
+                    current_gherkin, instruction
+                );
+
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post(format!("{}/api/generate", crate::llm::ENDPOINT_GENERATOR.url))
+                    .json(&serde_json::json!({
+                        "model": model,
+                        "prompt": prompt,
+                        "stream": false,
+                    }))
+                    .send()
+                    .await;
+
+                match resp {
+                    Ok(r) => {
+                        if let Ok(body) = r.json::<serde_json::Value>().await {
+                            if let Some(text) = body["response"].as_str() {
+                                let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                                    text,
+                                    "refinement",
+                                );
+
+                                match selection {
+                                    Some(Selection::File(idx)) => {
+                                        // We need the path but we don't have selected_files here.
+                                        // Send as a status + re-use the FileResult event with a
+                                        // placeholder path that will be resolved by the UI.
+                                        let _ = tx.send(ProcessingEvent::Status(format!(
+                                            "✏ Refinement complete (file index {})", idx
+                                        )));
+                                        // Use a synthetic path marker
+                                        let _ = tx.send(ProcessingEvent::FileResult {
+                                            path: PathBuf::from(format!("__refine_file_{}", idx)),
+                                            gherkin: doc,
+                                            elapsed: std::time::Duration::ZERO,
+                                        });
+                                    }
+                                    Some(Selection::Group(name)) => {
+                                        let _ = tx.send(ProcessingEvent::GroupResult {
+                                            group_name: name,
+                                            gherkin: doc,
+                                            elapsed: std::time::Duration::ZERO,
+                                        });
+                                    }
+                                    None => {}
+                                }
+                            } else {
+                                let _ = tx.send(ProcessingEvent::Status(
+                                    "⚠ Refinement: unexpected LLM response format".to_string(),
+                                ));
+                            }
+                        } else {
+                            let _ = tx.send(ProcessingEvent::Status(
+                                "⚠ Refinement: failed to parse LLM response".to_string(),
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Refinement failed: {}", e
+                        )));
+                    }
+                }
+
+                let _ = tx.send(ProcessingEvent::Done(Ok(())));
+                let _ = tx.send(ProcessingEvent::OpenSpecDone(Ok(0)));
+            });
         });
     }
 
@@ -510,6 +727,17 @@ impl DockOckApp {
                     self.files_started += 1;
                 }
                 ProcessingEvent::FileResult { path, gherkin, elapsed } => {
+                    // Handle refinement results with synthetic path markers
+                    let actual_path = if let Some(idx_str) = path.to_string_lossy().strip_prefix("__refine_file_") {
+                        if let Ok(idx) = idx_str.parse::<usize>() {
+                            self.selected_files.get(idx).cloned().unwrap_or(path.clone())
+                        } else {
+                            path.clone()
+                        }
+                    } else {
+                        path.clone()
+                    };
+
                     self.progress.0 += 1;
                     let secs = elapsed.as_secs_f64();
                     let elapsed_str = if secs >= 60.0 {
@@ -519,15 +747,15 @@ impl DockOckApp {
                     };
                     self.log(LogLevel::Success, format!(
                         "✓ Generated Gherkin for: {} ({}/{}) in {}",
-                        path.file_name()
+                        actual_path.file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default(),
                         self.progress.0,
                         self.progress.1,
                         elapsed_str,
                     ));
-                    self.elapsed_times.insert(path.clone(), elapsed);
-                    self.results.insert(path, gherkin);
+                    self.elapsed_times.insert(actual_path.clone(), elapsed);
+                    self.results.insert(actual_path, gherkin);
                 }
                 ProcessingEvent::GroupResult { group_name, gherkin, elapsed } => {
                     self.progress.0 += 1;
@@ -554,6 +782,7 @@ impl DockOckApp {
                                 "✅ All {} files processed successfully.",
                                 self.progress.1
                             ));
+                            self.auto_save_session();
                         }
                         Err(e) => {
                             self.log(LogLevel::Error, format!("❌ Processing failed: {}", e));
@@ -588,6 +817,7 @@ impl DockOckApp {
                             self.toast = Some(("Processing complete (OpenSpec errors)".to_string(), 4.0));
                         }
                     }
+                    self.auto_save_session();
                 }
             }
         }
@@ -651,6 +881,8 @@ impl DockOckApp {
             model_combo(ui, "rev_model", &mut self.reviewer_model);
             ui.label("Vis:");
             model_combo(ui, "vis_model", &mut self.vision_model);
+            ui.label("Emb:");
+            model_combo(ui, "emb_model", &mut self.embedding_model);
             ui.separator();
             ui.label("Pipeline:");
             egui::ComboBox::from_id_salt("pipeline_mode")
@@ -696,7 +928,11 @@ impl DockOckApp {
             if ui.button("Browse…").clicked() {
                 if let Some(dir) = rfd::FileDialog::new().pick_folder() {
                     self.log(LogLevel::Info, format!("Output directory: {}", dir.display()));
-                    self.output_dir = Some(dir);
+                    self.output_dir = Some(dir.clone());
+                    // Check for existing session
+                    if crate::session::exists(&dir) {
+                        self.session_restore_pending = true;
+                    }
                 }
             }
         });
@@ -1004,8 +1240,25 @@ impl DockOckApp {
             None => None,
         };
 
+        // Check for previous result (for diff view)
+        let prev_content = match &self.selection {
+            Some(Selection::File(idx)) => self
+                .selected_files
+                .get(*idx)
+                .and_then(|p| self.previous_results.get(p))
+                .map(|doc| doc.to_feature_string()),
+            Some(Selection::Group(name)) => self
+                .previous_group_results
+                .get(name)
+                .map(|doc| doc.to_feature_string()),
+            None => None,
+        };
+
+        let has_diff = prev_content.is_some() && content.is_some();
+
         match content {
             Some(text) => {
+                // ── Button bar ──
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy").clicked() {
                         ui.ctx().copy_text(text.clone());
@@ -1041,16 +1294,97 @@ impl DockOckApp {
                     {
                         self.save_all_feature_files();
                     }
+
+                    ui.separator();
+
+                    // ── Rating buttons ──
+                    let rating_key = self.selection_rating_key();
+                    if let Some(ref key) = rating_key {
+                        let current_rating = self.ratings.get(key).copied();
+                        let up_color = if current_rating == Some(crate::session::Rating::ThumbsUp) {
+                            egui::Color32::from_rgb(80, 200, 80)
+                        } else {
+                            egui::Color32::from_rgb(160, 160, 160)
+                        };
+                        let down_color = if current_rating == Some(crate::session::Rating::ThumbsDown) {
+                            egui::Color32::from_rgb(220, 80, 80)
+                        } else {
+                            egui::Color32::from_rgb(160, 160, 160)
+                        };
+                        if ui
+                            .button(egui::RichText::new("👍").color(up_color))
+                            .on_hover_text("Rate as good")
+                            .clicked()
+                        {
+                            let key = key.clone();
+                            if current_rating == Some(crate::session::Rating::ThumbsUp) {
+                                self.ratings.remove(&key);
+                            } else {
+                                self.ratings.insert(key, crate::session::Rating::ThumbsUp);
+                            }
+                            self.auto_save_session();
+                        }
+                        if ui
+                            .button(egui::RichText::new("👎").color(down_color))
+                            .on_hover_text("Rate as needs improvement")
+                            .clicked()
+                        {
+                            let key = key.clone();
+                            if current_rating == Some(crate::session::Rating::ThumbsDown) {
+                                self.ratings.remove(&key);
+                            } else {
+                                self.ratings.insert(key, crate::session::Rating::ThumbsDown);
+                            }
+                            self.auto_save_session();
+                        }
+                    }
+
+                    // ── Diff toggle ──
+                    if has_diff {
+                        ui.separator();
+                        let diff_label = if self.show_diff { "📊 Hide Diff" } else { "📊 Show Diff" };
+                        if ui.button(diff_label).on_hover_text("Compare with previous generation").clicked() {
+                            self.show_diff = !self.show_diff;
+                        }
+                    }
                 });
                 ui.add_space(4.0);
+
+                // ── Main content area ──
                 egui::ScrollArea::vertical()
                     .id_salt("gherkin_scroll")
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut text.as_str())
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(f32::INFINITY),
-                        );
+                        // Show diff view or normal view
+                        if self.show_diff && has_diff {
+                            if let Some(ref prev) = prev_content {
+                                let diff = crate::session::diff_gherkin(prev, &text);
+                                for line in &diff {
+                                    match line {
+                                        crate::session::DiffLine::Unchanged(s) => {
+                                            ui.monospace(s);
+                                        }
+                                        crate::session::DiffLine::Added(s) => {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(80, 200, 80),
+                                                egui::RichText::new(format!("+ {}", s)).monospace(),
+                                            );
+                                        }
+                                        crate::session::DiffLine::Removed(s) => {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 80, 80),
+                                                egui::RichText::new(format!("- {}", s)).monospace(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut text.as_str())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        }
 
                         // ── OpenSpec artifacts (if available) ──
                         let openspec_key = match &self.selection {
@@ -1093,6 +1427,27 @@ impl DockOckApp {
                             }
                         }
                     });
+
+                // ── Iterative refinement input ──
+                ui.add_space(4.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("✏ Refine:");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.refinement_input)
+                            .hint_text("e.g. 'Add error handling scenarios', 'Make steps more specific'")
+                            .desired_width(ui.available_width() - 80.0),
+                    );
+                    let can_refine = !self.refinement_input.trim().is_empty()
+                        && self.state != AppState::Processing;
+                    if ui.add_enabled(can_refine, egui::Button::new("▶ Apply")).clicked()
+                        || (response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && can_refine)
+                    {
+                        self.start_refinement(text);
+                    }
+                });
             }
             None => {
                 ui.vertical_centered(|ui| {
@@ -1212,6 +1567,32 @@ impl eframe::App for DockOckApp {
             ctx.request_repaint();
         }
 
+        // Session restore prompt
+        if self.session_restore_pending {
+            egui::Window::new("Restore Session?")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label("A previous session was found in this directory.");
+                    ui.label("Would you like to restore it?");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("✔ Restore").clicked() {
+                            if let Some(dir) = &self.output_dir {
+                                if let Some(data) = crate::session::load(dir) {
+                                    self.restore_session(data);
+                                }
+                            }
+                            self.session_restore_pending = false;
+                        }
+                        if ui.button("✖ Skip").clicked() {
+                            self.session_restore_pending = false;
+                        }
+                    });
+                });
+        }
+
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             self.render_top_bar(ui, ctx);
         });
@@ -1260,6 +1641,7 @@ async fn process_files(
     extractor_model: String,
     reviewer_model: String,
     vision_model: String,
+    embedding_model: String,
     mode: crate::llm::PipelineMode,
     max_concurrent: usize,
     openspec_enabled: bool,
@@ -1304,17 +1686,18 @@ async fn process_files(
     }
 
     // Warm up all models in parallel (forces model loading, eliminates cold-start)
+    // Run warm-up concurrently with file parsing to overlap I/O.
     let _ = tx.send(ProcessingEvent::Status(
         "🔥 Warming up models…".to_string(),
     ));
-    orchestrator.warm_up().await;
-    let _ = tx.send(ProcessingEvent::Status(
-        "✅ Models warmed up.".to_string(),
-    ));
-
     let orchestrator = Arc::new(orchestrator);
+    let warmup_orch = Arc::clone(&orchestrator);
+    let warmup_handle = tokio::spawn(async move {
+        warmup_orch.warm_up().await;
+    });
 
     // ── Phase 1: Parse ALL files in parallel (CPU/IO bound, no LLM) ──
+    // Runs concurrently with model warm-up above.
     let _ = tx.send(ProcessingEvent::Status(format!(
         "📄 Parsing {} files in parallel…", total
     )));
@@ -1411,11 +1794,57 @@ async fn process_files(
         }
     }
 
+    // Ensure model warm-up has finished before starting LLM tasks
+    let _ = warmup_handle.await;
+    let _ = tx.send(ProcessingEvent::Status(
+        "✅ Models warmed up.".to_string(),
+    ));
+
     // ── Phase 1.5: Build work items (groups vs ungrouped singles) ──
     let grouped_paths: std::collections::HashSet<PathBuf> = groups
         .iter()
         .flat_map(|g| g.members.iter().cloned())
         .collect();
+
+    // ── Phase 1.3: RAG — chunk and embed all parsed files ──
+    let _ = tx.send(ProcessingEvent::Status(
+        "🧠 [RAG] Embedding document chunks…".to_string(),
+    ));
+    let mut rag_engine = crate::rag::RagEngine::new(
+        crate::llm::ENDPOINT_GENERATOR.url,
+        &embedding_model,
+        cache.clone(),
+    );
+    let mut rag_ok = true;
+    for (path, (file_type, text, _images)) in &parsed_map {
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        match rag_engine.index_file(&fname, file_type, text).await {
+            Ok(chunk_count) => {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "🧠 [RAG] {} → {} chunks embedded", fname, chunk_count
+                )));
+            }
+            Err(e) => {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "⚠ [RAG] Embedding failed for {}: {} — falling back to excerpt context", fname, e
+                )));
+                rag_ok = false;
+                break;
+            }
+        }
+    }
+    if rag_ok {
+        let _ = tx.send(ProcessingEvent::Status(format!(
+            "✅ [RAG] {} chunks indexed across {} files",
+            rag_engine.chunk_count(),
+            parsed_map.len(),
+        )));
+    }
+    let rag_engine = Arc::new(rag_engine);
+    let rag_available = rag_ok && rag_engine.chunk_count() > 0;
 
     // Take a snapshot of context now (after all files are parsed)
     let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
@@ -1454,11 +1883,29 @@ async fn process_files(
             let ctx = ctx_snapshot.clone();
             let gdocs = Arc::clone(&gherkin_docs);
             let force_regen = force_regenerate;
+            let rag = Arc::clone(&rag_engine);
+            let rag_on = rag_available;
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await;
                 let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
                 let file_start = std::time::Instant::now();
+
+                // Build RAG cross-file context if available
+                let rag_ctx = if rag_on {
+                    let query = crate::rag::build_query_text(&raw_text, &file_name);
+                    match rag.build_cross_file_context(&query, &file_name).await {
+                        Ok(ctx_str) => Some(ctx_str),
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ [RAG] Retrieval failed for {}: {} — using excerpt context", file_name, e
+                            )));
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
                 let tx_fwd = tx.clone();
@@ -1469,7 +1916,7 @@ async fn process_files(
                 });
 
                 let result = orch
-                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen)
+                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, rag_ctx.as_deref(), &status_tx, force_regen)
                     .await;
 
                 drop(status_tx);
@@ -1515,6 +1962,8 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
+        let rag = Arc::clone(&rag_engine);
+        let rag_on = rag_available;
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
@@ -1524,6 +1973,28 @@ async fn process_files(
                 let _ = tx.send(ProcessingEvent::FileStarted(first.clone()));
             }
             let group_start = std::time::Instant::now();
+
+            // Build RAG cross-file context for the group (query from merged member text)
+            let rag_ctx = if rag_on {
+                let merged_query: String = members_data.iter()
+                    .map(|(name, _, text, _)| crate::rag::build_query_text(text, name))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                // Exclude all member files from retrieval
+                // Use first member as exclude (the vector store filters by file_name)
+                // We'll just pass group_name as exclude — members are named individually
+                match rag.build_cross_file_context(&merged_query, &group_name).await {
+                    Ok(ctx_str) => Some(ctx_str),
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ [RAG] Retrieval failed for group {}: {} — using excerpt context", group_name, e
+                        )));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();
@@ -1537,7 +2008,7 @@ async fn process_files(
                 members_data;
 
             let result = orch
-                .process_group(&group_name, &members_ref, &ctx, &status_tx, force_regen)
+                .process_group(&group_name, &members_ref, &ctx, rag_ctx.as_deref(), &status_tx, force_regen)
                 .await;
 
             drop(status_tx);
@@ -1587,6 +2058,8 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
+        let rag = Arc::clone(&rag_engine);
+        let rag_on = rag_available;
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -1597,6 +2070,22 @@ async fn process_files(
             let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
             let file_start = std::time::Instant::now();
 
+            // Build RAG cross-file context if available
+            let rag_ctx = if rag_on {
+                let query = crate::rag::build_query_text(&raw_text, &file_name);
+                match rag.build_cross_file_context(&query, &file_name).await {
+                    Ok(ctx_str) => Some(ctx_str),
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ [RAG] Retrieval failed for {}: {} — using excerpt context", file_name, e
+                        )));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();
             let fwd = std::thread::spawn(move || {
@@ -1606,7 +2095,7 @@ async fn process_files(
             });
 
             let result = orch
-                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen)
+                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, rag_ctx.as_deref(), &status_tx, force_regen)
                 .await;
 
             drop(status_tx);

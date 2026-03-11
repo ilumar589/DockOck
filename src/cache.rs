@@ -134,3 +134,4 @@ pub const NS_PARSED: &str = "parsed";
 pub const NS_VISION: &str = "vision";
 pub const NS_LLM: &str = "llm";
 pub const NS_OPENSPEC: &str = "openspec";
+pub const NS_EMBEDDING: &str = "embedding";

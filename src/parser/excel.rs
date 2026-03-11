@@ -16,6 +16,9 @@ use calamine::{Data, Reader, open_workbook_auto};
 use std::path::Path;
 
 /// Extract all text from every worksheet in the workbook.
+///
+/// A structural outline is prepended showing sheet names and row counts,
+/// followed by the full content of each sheet.
 pub fn parse(path: &Path) -> Result<String> {
     let mut workbook = open_workbook_auto(path)
         .with_context(|| format!("Failed to open spreadsheet: {}", path.display()))?;
@@ -26,18 +29,33 @@ pub fn parse(path: &Path) -> Result<String> {
         return Ok("(Workbook contains no sheets)".to_string());
     }
 
+    // ── First pass: collect per-sheet row counts for structure outline ──
+    let mut sheet_row_counts: Vec<usize> = Vec::new();
+    for sheet_name in &sheet_names {
+        let count = match workbook.worksheet_range(sheet_name) {
+            Ok(range) => range
+                .rows()
+                .filter(|row| row.iter().map(cell_to_string).any(|c| !c.is_empty()))
+                .count(),
+            Err(_) => 0,
+        };
+        sheet_row_counts.push(count);
+    }
+
     let mut output = String::new();
 
-    // ── Workbook summary ────────────────────────────────────────────────
-    // Prepend a brief map so the LLM understands the overall structure
-    // before reading any individual sheet.
-    if sheet_names.len() > 1 {
+    // ── Structural outline ──
+    output.push_str("=== WORKBOOK STRUCTURE ===\n");
+    output.push_str(&format!("Sheets: {}\n", sheet_names.len()));
+    for (i, (name, rows)) in sheet_names.iter().zip(&sheet_row_counts).enumerate() {
         output.push_str(&format!(
-            "Workbook contains {} sheets: {}\n\n",
-            sheet_names.len(),
-            sheet_names.join(", ")
+            "  {}. {} ({} rows)\n",
+            i + 1,
+            name,
+            rows,
         ));
     }
+    output.push_str("\n=== SHEET CONTENT ===\n\n");
 
     // ── Per-sheet content ────────────────────────────────────────────────
     for sheet_name in &sheet_names {
