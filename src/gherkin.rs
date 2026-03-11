@@ -46,6 +46,8 @@ impl StepKeyword {
 pub struct Scenario {
     pub title: String,
     pub steps: Vec<Step>,
+    /// `true` when the original source used `Scenario Outline:`.
+    pub is_outline: bool,
 }
 
 /// A complete Gherkin Feature document.
@@ -53,7 +55,9 @@ pub struct Scenario {
 pub struct GherkinDocument {
     pub feature_title: String,
     pub description: String,
-    pub scenarios: Vec<Scenario>
+    pub scenarios: Vec<Scenario>,
+    /// The file that was the source of this document (e.g. `"D028.docx"`).
+    pub source_file: String,
 }
 
 impl GherkinDocument {
@@ -67,7 +71,8 @@ impl GherkinDocument {
             out.push('\n');
         }
         for scenario in &self.scenarios {
-            out.push_str(&format!("  Scenario: {}\n", scenario.title));
+            let keyword = if scenario.is_outline { "Scenario Outline" } else { "Scenario" };
+            out.push_str(&format!("  {}: {}\n", keyword, scenario.title));
             for step in &scenario.steps {
                 out.push_str(&format!("    {} {}\n", step.keyword.as_str(), step.text));
             }
@@ -80,7 +85,8 @@ impl GherkinDocument {
     ///
     /// This is a best-effort parser – it handles the most common output shapes
     /// produced by instruction-tuned models without requiring perfect formatting.
-    pub fn parse_from_llm_output(raw: &str, _source_file: &str) -> Self {
+    /// Both `Scenario:` and `Scenario Outline:` are recognised.
+    pub fn parse_from_llm_output(raw: &str, source_file: &str) -> Self {
         let mut feature_title = String::from("Generated Feature");
         let mut description_lines: Vec<String> = Vec::new();
         let mut scenarios: Vec<Scenario> = Vec::new();
@@ -96,13 +102,25 @@ impl GherkinDocument {
                 continue;
             }
 
-            if let Some(title) = trimmed.strip_prefix("Scenario:") {
+            // Scenario Outline must be checked before plain Scenario so that
+            // the longer prefix matches first.
+            let (scenario_title, is_outline) =
+                if let Some(t) = trimmed.strip_prefix("Scenario Outline:") {
+                    (Some(t.trim().to_string()), true)
+                } else if let Some(t) = trimmed.strip_prefix("Scenario:") {
+                    (Some(t.trim().to_string()), false)
+                } else {
+                    (None, false)
+                };
+
+            if let Some(title) = scenario_title {
                 if let Some(s) = current_scenario.take() {
                     scenarios.push(s);
                 }
                 current_scenario = Some(Scenario {
-                    title: title.trim().to_string(),
+                    title,
                     steps: Vec::new(),
+                    is_outline,
                 });
                 in_description = false;
                 continue;
@@ -132,6 +150,7 @@ impl GherkinDocument {
             feature_title,
             description: description_lines.join("\n"),
             scenarios,
+            source_file: source_file.to_string(),
         }
     }
 }
@@ -167,6 +186,7 @@ mod tests {
             description: "Handles authentication".to_string(),
             scenarios: vec![Scenario {
                 title: "Successful login".to_string(),
+                is_outline: false,
                 steps: vec![
                     Step {
                         keyword: StepKeyword::Given,
@@ -187,7 +207,9 @@ mod tests {
 
         let feature = doc.to_feature_string();
         assert!(feature.contains("Feature: User login"));
+        // is_outline: false → must render as "Scenario:", not "Scenario Outline:"
         assert!(feature.contains("Scenario: Successful login"));
+        assert!(!feature.contains("Scenario Outline:"), "non-outline must not use Scenario Outline:");
         assert!(feature.contains("Given a registered user"));
         assert!(feature.contains("When they submit valid credentials"));
         assert!(feature.contains("Then they are redirected to the dashboard"));
@@ -207,5 +229,22 @@ mod tests {
         assert_eq!(doc.feature_title, "Order processing");
         assert_eq!(doc.scenarios.len(), 1);
         assert_eq!(doc.scenarios[0].steps.len(), 3);
+        assert!(!doc.scenarios[0].is_outline);
+        assert_eq!(doc.source_file, "orders.docx");
+    }
+
+    #[test]
+    fn test_parse_scenario_outline() {
+        let raw = r#"Feature: D028 - IUS - XML Disconnection Notification
+  Scenario Outline: Generate Disconnection Notification even with all 3 llms
+    Given a valid disconnection request for <customer>
+    When the XML notification is generated
+    Then the output matches the expected schema
+"#;
+        let doc = GherkinDocument::parse_from_llm_output(raw, "D028.docx");
+        assert_eq!(doc.scenarios.len(), 1);
+        assert!(doc.scenarios[0].is_outline, "should be recognised as Scenario Outline");
+        assert_eq!(doc.scenarios[0].steps.len(), 3);
+        assert!(doc.to_feature_string().contains("Scenario Outline:"));
     }
 }

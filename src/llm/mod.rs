@@ -36,7 +36,9 @@ pub const MAX_CONCURRENT: usize = 3;
 
 /// Maximum number of characters to send to the LLM in a single prompt.
 /// Text beyond this limit is truncated with a note.
-const MAX_INPUT_CHARS: usize = 4000;
+/// 12 000 chars ≈ 3 000 tokens — enough for a 14-page service document
+/// while staying well within typical context windows.
+const MAX_INPUT_CHARS: usize = 12_000;
 
 /// Pipeline mode — controls which LLM stages are executed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

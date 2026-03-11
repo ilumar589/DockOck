@@ -73,6 +73,8 @@ fn now_timestamp() -> String {
 pub enum ProcessingEvent {
     /// Progress update message
     Status(String),
+    /// A file has started LLM processing (used to animate the progress bar)
+    FileStarted(PathBuf),
     /// A single file has been fully processed
     FileResult {
         path: PathBuf,
@@ -121,6 +123,8 @@ pub struct DockOckApp {
     output_dir: Option<PathBuf>,
     /// Processing progress: (files_completed, total_files)
     progress: (usize, usize),
+    /// Number of files that have started LLM processing (for sub-unit progress)
+    files_started: usize,
     /// Whether the log panel is expanded
     show_log_panel: bool,
     /// Toast-style notification message and remaining display time
@@ -145,6 +149,7 @@ impl DockOckApp {
             runtime,
             output_dir: None,
             progress: (0, 0),
+            files_started: 0,
             show_log_panel: true,
             toast: None,
             pipeline_mode: crate::llm::PipelineMode::default(),
@@ -199,6 +204,7 @@ impl DockOckApp {
         self.selected_index = None;
         self.state = AppState::Idle;
         self.progress = (0, 0);
+        self.files_started = 0;
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -258,6 +264,7 @@ impl DockOckApp {
         self.results.clear();
         self.log_entries.clear();
         self.progress = (0, self.selected_files.len());
+        self.files_started = 0;
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -289,6 +296,9 @@ impl DockOckApp {
             match event {
                 ProcessingEvent::Status(msg) => {
                     self.push_status(msg);
+                }
+                ProcessingEvent::FileStarted(_path) => {
+                    self.files_started += 1;
                 }
                 ProcessingEvent::FileResult { path, gherkin } => {
                     self.progress.0 += 1;
@@ -424,7 +434,12 @@ impl DockOckApp {
         // Progress bar during processing
         if self.state == AppState::Processing && self.progress.1 > 0 {
             ui.add_space(4.0);
-            let fraction = self.progress.0 as f32 / self.progress.1 as f32;
+            // Each file contributes 1 unit when complete and 0.5 when started.
+            // This ensures the bar is non-zero as soon as LLM processing begins.
+            let completed = self.progress.0 as f32;
+            let started = self.files_started.saturating_sub(self.progress.0) as f32;
+            let total = self.progress.1 as f32;
+            let fraction = ((completed + started * 0.5) / total).clamp(0.0, 1.0);
             let bar = egui::ProgressBar::new(fraction)
                 .text(format!("{}/{} files", self.progress.0, self.progress.1))
                 .animate(true);
@@ -569,7 +584,10 @@ impl DockOckApp {
             if is_processing {
                 ui.spinner();
                 let pct = if self.progress.1 > 0 {
-                    (self.progress.0 as f32 / self.progress.1 as f32 * 100.0) as u32
+                    let completed = self.progress.0 as f32;
+                    let started = self.files_started.saturating_sub(self.progress.0) as f32;
+                    let total = self.progress.1 as f32;
+                    ((completed + started * 0.5) / total * 100.0).clamp(0.0, 100.0) as u32
                 } else {
                     0
                 };
@@ -793,6 +811,9 @@ async fn process_files(
         let handle = tokio::spawn(async move {
             // Acquire semaphore permit to limit concurrency
             let _permit = sem.acquire().await;
+
+            // Signal the UI that this file has started LLM processing
+            let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
 
             // Create a status channel that wraps strings into ProcessingEvent::Status
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
