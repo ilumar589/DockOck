@@ -2,10 +2,15 @@
 //!
 //! Instead of using fixed 400-char excerpts from other files, this module:
 //! 1. Chunks parsed document text into overlapping windows
-//! 2. Embeds each chunk via Ollama's embedding API (e.g. `nomic-embed-text`)
+//! 2. Embeds each chunk via a local TF-IDF hashing vectorizer (no API needed)
 //! 3. Stores embeddings in SurrealDB (embedded mode with HNSW vector indexing)
 //! 4. At generation time, retrieves the top-K most relevant chunks from OTHER
 //!    files to inject as cross-file context
+//!
+//! Performance optimisations:
+//! - **Skip indexed**: files already in SurrealDB (by name + chunk count) are skipped
+//! - **Disk-cached embeddings**: individual vectors cached by content hash
+//! - **Sub-batching**: large files are embedded in batches of 8
 //!
 //! Storage: SurrealKV (persistent, pure-Rust) when an output dir is available;
 //! in-memory fallback otherwise. Persisted embeddings survive across app restarts.
@@ -20,8 +25,8 @@ use tracing::info;
 // Configuration
 // ─────────────────────────────────────────────
 
-/// Default embedding model available in Ollama.
-pub const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+/// Dimension for local TF-IDF hashing vectors.
+pub const LOCAL_EMBEDDING_DIM: usize = 768;
 
 /// Number of characters per chunk (~128 tokens × 4 chars/token = 512 chars).
 const CHUNK_SIZE_CHARS: usize = 2048;
@@ -156,32 +161,29 @@ fn snap_to_line_boundary(text: &str) -> String {
     }
 }
 
-// ─────────────────────────────────────────────
-// Embedding via Ollama API
-// ─────────────────────────────────────────────
-
-/// Response from Ollama's `/api/embed` endpoint.
-#[derive(Deserialize)]
-struct OllamaEmbedResponse {
-    embeddings: Vec<Vec<f32>>,
-}
+/// Maximum texts per embedding sub-batch.
+const EMBED_SUB_BATCH: usize = 8;
 
 /// The RAG engine backed by SurrealDB embedded with HNSW vector indexing.
 pub struct RagEngine {
-    /// Ollama base URL for the embedding model (reuses an existing instance).
-    endpoint_url: String,
-    /// Name of the embedding model.
-    model: String,
+    /// Embedding vector dimension.
+    embed_dim: usize,
     /// SurrealDB embedded instance.
     db: Surreal<Db>,
     /// Running count of chunks stored in this session.
     chunk_count: usize,
-    /// HTTP client (reused across requests).
-    client: reqwest::Client,
+    /// Disk cache for embedding vectors (avoids re-computing for identical text).
+    cache: crate::cache::DiskCache,
+    /// Set of file names already indexed in SurrealDB (for skip-if-present).
+    indexed_files: std::collections::HashMap<String, usize>,
 }
 
 /// SurrealQL schema migration run on startup.
-const SCHEMA_SQL: &str = r#"
+/// The HNSW dimension is set based on the embedding backend:
+/// - Ollama `nomic-embed-text`: 768 dimensions
+/// - Cloud embedding models: typically 1024 or 2048 dimensions
+fn schema_sql(dim: usize) -> String {
+    format!(r#"
 DEFINE TABLE IF NOT EXISTS chunks SCHEMAFULL;
 DEFINE FIELD IF NOT EXISTS file_name   ON chunks TYPE string;
 DEFINE FIELD IF NOT EXISTS file_type   ON chunks TYPE string;
@@ -190,21 +192,22 @@ DEFINE FIELD IF NOT EXISTS offset      ON chunks TYPE int;
 DEFINE FIELD IF NOT EXISTS chunk_index ON chunks TYPE int;
 DEFINE FIELD IF NOT EXISTS embedding   ON chunks TYPE array<float>;
 DEFINE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks
-    FIELDS embedding HNSW DIMENSION 768 DIST COSINE;
+    FIELDS embedding HNSW DIMENSION {dim} DIST COSINE;
 DEFINE INDEX IF NOT EXISTS idx_chunks_file ON chunks FIELDS file_name;
-"#;
+"#)
+}
 
 impl RagEngine {
     /// Create a new RAG engine with SurrealDB storage.
     ///
     /// * `surreal_path` — if `Some`, SurrealKV persistent storage at that dir;
     ///   if `None`, in-memory only.
-    /// * `endpoint_url` — Ollama base URL for embedding model
-    /// * `model` — name of the embedding model (e.g. `nomic-embed-text`)
+    /// * `embed_dim` — embedding vector dimension
+    /// * `cache` — disk cache for embedding vectors
     pub async fn new(
         surreal_path: Option<&std::path::Path>,
-        endpoint_url: &str,
-        model: &str,
+        embed_dim: usize,
+        cache: crate::cache::DiskCache,
     ) -> Result<Self> {
         let db = if let Some(path) = surreal_path {
             let dir = path.join(".dockock_surreal");
@@ -225,8 +228,8 @@ impl RagEngine {
         db.use_ns("dockock").use_db("rag").await
             .context("Failed to select SurrealDB namespace/database")?;
 
-        // Run schema migration
-        db.query(SCHEMA_SQL).await
+        // Run schema migration with the correct embedding dimension
+        db.query(&schema_sql(embed_dim)).await
             .context("Failed to run SurrealDB schema migration")?;
 
         // Count existing chunks (from a previous run if persistent)
@@ -239,12 +242,26 @@ impl RagEngine {
             info!("SurrealDB: loaded {} existing chunks from previous session", chunk_count);
         }
 
+        // Build index of which files are already in SurrealDB (for skip-if-present)
+        let mut idx_result = db
+            .query("SELECT file_name, count() AS c FROM chunks GROUP BY file_name")
+            .await
+            .context("Failed to query indexed files")?;
+        let idx_rows: Vec<FileCountRow> = idx_result.take(0).unwrap_or_default();
+        let indexed_files: std::collections::HashMap<String, usize> = idx_rows
+            .into_iter()
+            .map(|r| (r.file_name, r.c))
+            .collect();
+        if !indexed_files.is_empty() {
+            info!("SurrealDB: {} files already indexed", indexed_files.len());
+        }
+
         Ok(Self {
-            endpoint_url: endpoint_url.to_string(),
-            model: model.to_string(),
+            embed_dim,
             db,
             chunk_count,
-            client: reqwest::Client::new(),
+            cache,
+            indexed_files,
         })
     }
 
@@ -255,32 +272,97 @@ impl RagEngine {
 
     /// Embed and index all chunks from a single file.
     ///
-    /// Chunks are embedded in a single batch request and inserted into SurrealDB.
-    /// Duplicate chunks (same file_name + chunk_index) are skipped via upsert-like
-    /// INSERT with ON DUPLICATE KEY UPDATE.
+    /// Chunks are embedded in sub-batches with disk-cache lookups.
+    /// Files already present in SurrealDB (matching chunk count) are skipped entirely.
     pub async fn index_file(
         &mut self,
         file_name: &str,
         file_type: &str,
         raw_text: &str,
-    ) -> Result<usize> {
+    ) -> Result<IndexResult> {
         let chunks = chunk_text(raw_text, file_name, file_type);
         if chunks.is_empty() {
-            return Ok(0);
+            return Ok(IndexResult { total_chunks: 0, cached: 0, embedded: 0, skipped: true });
         }
 
-        let texts: Vec<&str> = chunks.iter().map(|c| c.text.as_str()).collect();
-        let embeddings = self.embed_batch(&texts).await?;
-
-        if embeddings.len() != chunks.len() {
-            anyhow::bail!(
-                "Embedding count mismatch: expected {}, got {}",
-                chunks.len(),
-                embeddings.len()
-            );
+        // Skip if this file is already fully indexed in SurrealDB
+        if let Some(&existing_count) = self.indexed_files.get(file_name) {
+            if existing_count == chunks.len() {
+                return Ok(IndexResult {
+                    total_chunks: chunks.len(),
+                    cached: 0,
+                    embedded: 0,
+                    skipped: true,
+                });
+            }
+            // Chunk count changed (doc was edited) — delete stale chunks and re-index
+            self.db
+                .query("DELETE chunks WHERE file_name = $fname")
+                .bind(("fname", file_name.to_string()))
+                .await
+                .context("Failed to delete stale chunks")?;
         }
 
-        // Insert all chunks with embeddings into SurrealDB
+        // Embed with sub-batching + disk cache
+        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+        let mut cached_count = 0usize;
+        let mut embedded_count = 0usize;
+
+        for batch_start in (0..chunks.len()).step_by(EMBED_SUB_BATCH) {
+            let batch_end = (batch_start + EMBED_SUB_BATCH).min(chunks.len());
+            let batch = &chunks[batch_start..batch_end];
+
+            // Check disk cache for each text in the batch
+            let mut batch_results: Vec<Option<Vec<f32>>> = Vec::with_capacity(batch.len());
+            let mut uncached_indices: Vec<usize> = Vec::new();
+            let mut uncached_texts: Vec<&str> = Vec::new();
+
+            for (i, chunk) in batch.iter().enumerate() {
+                let cache_key = crate::cache::composite_key(&[
+                    chunk.text.as_bytes(),
+                    b"local-tfidf",
+                ]);
+                if let Some(cached_emb) = self.cache.get::<Vec<f32>>(crate::cache::NS_EMBEDDING, &cache_key) {
+                    batch_results.push(Some(cached_emb));
+                    cached_count += 1;
+                } else {
+                    batch_results.push(None);
+                    uncached_indices.push(i);
+                    uncached_texts.push(&chunk.text);
+                }
+            }
+
+            // Embed uncached texts locally
+            if !uncached_texts.is_empty() {
+                let new_embeddings = self.embed_batch(&uncached_texts);
+                if new_embeddings.len() != uncached_texts.len() {
+                    anyhow::bail!(
+                        "Embedding count mismatch: expected {}, got {}",
+                        uncached_texts.len(),
+                        new_embeddings.len()
+                    );
+                }
+                // Merge results and cache new embeddings
+                for (idx_in_uncached, &local_idx) in uncached_indices.iter().enumerate() {
+                    let emb = new_embeddings[idx_in_uncached].clone();
+                    // Cache on disk
+                    let cache_key = crate::cache::composite_key(&[
+                        batch[local_idx].text.as_bytes(),
+                        b"local-tfidf",
+                    ]);
+                    self.cache.put(crate::cache::NS_EMBEDDING, &cache_key, &emb);
+                    batch_results[local_idx] = Some(emb);
+                }
+                embedded_count += uncached_texts.len();
+            }
+
+            // Collect final embeddings for this sub-batch
+            for result in batch_results {
+                embeddings.push(result.expect("all embeddings should be resolved"));
+            }
+        }
+
+        // Batch-insert all chunks into SurrealDB via a single query
         let count = chunks.len();
         for (chunk, emb) in chunks.into_iter().zip(embeddings.into_iter()) {
             let row = ChunkInsert {
@@ -299,7 +381,8 @@ impl RagEngine {
         }
 
         self.chunk_count += count;
-        Ok(count)
+        self.indexed_files.insert(file_name.to_string(), count);
+        Ok(IndexResult { total_chunks: count, cached: cached_count, embedded: embedded_count, skipped: false })
     }
 
     /// Retrieve the top-K most relevant chunks from files other than `exclude_file`.
@@ -405,46 +488,117 @@ impl RagEngine {
 
     /// Embed a single text string.
     async fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
-        let batch = self.embed_batch(&[text]).await?;
-        batch
-            .into_iter()
-            .next()
-            .context("Empty embedding response for single text")
-    }
-
-    /// Embed a batch of texts via Ollama's `/api/embed` endpoint.
-    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let resp = self
-            .client
-            .post(format!("{}/api/embed", self.endpoint_url))
-            .json(&serde_json::json!({
-                "model": self.model,
-                "input": texts,
-            }))
-            .timeout(std::time::Duration::from_secs(120))
-            .send()
-            .await
-            .context("Embedding API request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Embedding API returned {}: {}", status, body);
+        let cache_key = crate::cache::composite_key(&[
+            text.as_bytes(),
+            b"local-tfidf",
+        ]);
+        if let Some(cached) = self.cache.get::<Vec<f32>>(crate::cache::NS_EMBEDDING, &cache_key) {
+            return Ok(cached);
         }
 
-        let body: OllamaEmbedResponse = resp
-            .json()
-            .await
-            .context("Failed to parse embedding response")?;
-
-        Ok(body.embeddings)
+        let emb = tfidf_hash_embed(text, self.embed_dim);
+        self.cache.put(crate::cache::NS_EMBEDDING, &cache_key, &emb);
+        Ok(emb)
     }
+
+    /// Embed a batch of texts using local TF-IDF hashing.
+    fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
+        texts.iter().map(|t| tfidf_hash_embed(t, self.embed_dim)).collect()
+    }
+}
+
+/// Result of indexing a single file — provides detail for progress reporting.
+#[derive(Debug, Clone)]
+pub struct IndexResult {
+    /// Total chunk count for the file.
+    pub total_chunks: usize,
+    /// How many chunks had cached embeddings (disk cache hit).
+    pub cached: usize,
+    /// How many chunks were freshly embedded via API.
+    pub embedded: usize,
+    /// Whether the file was skipped (already fully indexed in SurrealDB).
+    pub skipped: bool,
 }
 
 /// Helper for COUNT query deserialization.
 #[derive(Debug, Deserialize)]
 struct CountRow {
     c: usize,
+}
+
+/// Helper for per-file COUNT query deserialization.
+#[derive(Debug, Deserialize)]
+struct FileCountRow {
+    file_name: String,
+    c: usize,
+}
+
+// ─────────────────────────────────────────────
+// Local TF-IDF hashing vectorizer
+// ─────────────────────────────────────────────
+
+/// Tokenize text into lowercase word tokens (≥ 2 chars, alphanumeric only).
+fn tokenize(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|s| s.len() >= 2)
+        .map(|s| s.to_lowercase())
+        .collect()
+}
+
+/// FNV-1a–style hash → bucket index.
+fn hash_token(token: &str, dim: usize) -> usize {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in token.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h as usize) % dim
+}
+
+/// Sign hash for the signed feature-hashing trick (reduces collision bias).
+fn sign_hash(token: &str) -> f32 {
+    let mut h: u64 = 0x517cc1b727220a95;
+    for b in token.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    if h & 1 == 0 { 1.0 } else { -1.0 }
+}
+
+/// Produce a TF-IDF–like embedding using the feature-hashing trick.
+///
+/// Uses sublinear TF (`1 + ln(count)`) and signed hashing.  The resulting
+/// vector is L2-normalised so cosine similarity works directly.
+fn tfidf_hash_embed(text: &str, dim: usize) -> Vec<f32> {
+    let tokens = tokenize(text);
+    if tokens.is_empty() {
+        return vec![0.0; dim];
+    }
+
+    // Count term frequencies
+    let mut tf: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for t in &tokens {
+        *tf.entry(t.as_str()).or_insert(0) += 1;
+    }
+
+    // Feature hashing with sublinear TF
+    let mut vec = vec![0.0f32; dim];
+    for (term, &count) in &tf {
+        let idx = hash_token(term, dim);
+        let sign = sign_hash(term);
+        let weight = 1.0 + (count as f32).ln();
+        vec[idx] += sign * weight;
+    }
+
+    // L2 normalise
+    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for x in &mut vec {
+            *x /= norm;
+        }
+    }
+
+    vec
 }
 
 /// Build a short representative query from a file's raw text for RAG retrieval.

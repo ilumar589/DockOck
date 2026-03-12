@@ -203,8 +203,6 @@ pub struct DockOckApp {
     reviewer_model: String,
     /// Ollama model name for the vision agent (image description)
     vision_model: String,
-    /// Ollama model name for the embedding agent (RAG)
-    embedding_model: String,
     /// Channel receiver for background processing events
     event_rx: Option<Receiver<ProcessingEvent>>,
     /// Shared context accumulator (wrapped in Arc<Mutex<>> so background thread can write)
@@ -260,7 +258,7 @@ pub struct DockOckApp {
     /// Loaded custom provider configurations from custom_providers.json
     custom_providers: Vec<crate::llm::CustomProviderConfig>,
     /// Saved Ollama model selections (restored when switching back from custom)
-    saved_ollama_models: (String, String, String),
+    saved_ollama_models: (String, String, String, String),
 }
 
 impl DockOckApp {
@@ -280,7 +278,6 @@ impl DockOckApp {
             extractor_model: crate::llm::DEFAULT_EXTRACTOR_MODEL.to_string(),
             reviewer_model: crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
             vision_model: crate::llm::DEFAULT_VISION_MODEL.to_string(),
-            embedding_model: crate::rag::DEFAULT_EMBEDDING_MODEL.to_string(),
             event_rx: None,
             context: Arc::new(Mutex::new(ProjectContext::new())),
             runtime,
@@ -314,6 +311,7 @@ impl DockOckApp {
                 crate::llm::DEFAULT_GENERATOR_MODEL.to_string(),
                 crate::llm::DEFAULT_EXTRACTOR_MODEL.to_string(),
                 crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
+                crate::llm::DEFAULT_VISION_MODEL.to_string(),
             ),
         }
     }
@@ -506,7 +504,6 @@ impl DockOckApp {
             extractor_model: self.extractor_model.clone(),
             reviewer_model: self.reviewer_model.clone(),
             vision_model: self.vision_model.clone(),
-            embedding_model: self.embedding_model.clone(),
             pipeline_mode: self.pipeline_mode,
             max_concurrent: self.max_concurrent,
             output_dir: self.output_dir.clone(),
@@ -540,7 +537,6 @@ impl DockOckApp {
         self.extractor_model = data.extractor_model;
         self.reviewer_model = data.reviewer_model;
         self.vision_model = data.vision_model;
-        self.embedding_model = data.embedding_model;
         self.pipeline_mode = data.pipeline_mode;
         self.max_concurrent = data.max_concurrent;
         self.previous_results = data
@@ -615,7 +611,6 @@ impl DockOckApp {
         let ext_model = self.extractor_model.clone();
         let rev_model = self.reviewer_model.clone();
         let vis_model = self.vision_model.clone();
-        let emb_model = self.embedding_model.clone();
         let handle = self.runtime.clone();
         let mode = self.pipeline_mode;
         let max_concurrent = self.max_concurrent;
@@ -631,7 +626,7 @@ impl DockOckApp {
             handle.block_on(process_files(
                 files, groups, context, backend,
                 gen_model, ext_model, rev_model, vis_model,
-                emb_model, mode,
+                mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
                 cache, force_regenerate, tx,
             ));
@@ -1015,19 +1010,22 @@ impl DockOckApp {
                     self.generator_model.clone(),
                     self.extractor_model.clone(),
                     self.reviewer_model.clone(),
+                    self.vision_model.clone(),
                 );
                 if let Some(cfg) = self.custom_providers.first() {
                     let models: Vec<String> = cfg.models.keys().cloned().collect();
                     let first = models.first().cloned().unwrap_or_default();
                     self.generator_model = cfg.defaults.generator.clone().unwrap_or_else(|| first.clone());
                     self.extractor_model = cfg.defaults.extractor.clone().unwrap_or_else(|| first.clone());
-                    self.reviewer_model = cfg.defaults.reviewer.clone().unwrap_or(first);
+                    self.reviewer_model = cfg.defaults.reviewer.clone().unwrap_or_else(|| first.clone());
+                    self.vision_model = cfg.defaults.vision.clone().unwrap_or(first);
                 }
             } else if !is_custom && was_custom {
                 // Switching BACK to Ollama — restore saved models
                 self.generator_model = self.saved_ollama_models.0.clone();
                 self.extractor_model = self.saved_ollama_models.1.clone();
                 self.reviewer_model = self.saved_ollama_models.2.clone();
+                self.vision_model = self.saved_ollama_models.3.clone();
             }
 
             // API key indicator for custom providers
@@ -1064,12 +1062,13 @@ impl DockOckApp {
                 model_combo(ui, "rev_model", &mut self.reviewer_model);
             }
 
-            // Vision & Embedding always use local Ollama models
+            // Vision uses cloud models when custom provider selected, local otherwise
             ui.label("Vis:");
-            model_combo(ui, "vis_model", &mut self.vision_model);
-            ui.label("Emb:");
-            model_combo(ui, "emb_model", &mut self.embedding_model);
-
+            if self.backend.is_custom() {
+                custom_model_combo(ui, "vis_model", &mut self.vision_model, &custom_models);
+            } else {
+                model_combo(ui, "vis_model", &mut self.vision_model);
+            }
             ui.separator();
             ui.label("Pipeline:");
             egui::ComboBox::from_id_salt("pipeline_mode")
@@ -1789,7 +1788,6 @@ async fn process_files(
     extractor_model: String,
     reviewer_model: String,
     vision_model: String,
-    embedding_model: String,
     mode: crate::llm::PipelineMode,
     max_concurrent: usize,
     openspec_enabled: bool,
@@ -1807,7 +1805,7 @@ async fn process_files(
     ));
 
     let (orchestrator, statuses) = match crate::llm::AgentOrchestrator::new(
-        backend,
+        backend.clone(),
         &generator_model,
         &extractor_model,
         &reviewer_model,
@@ -1979,11 +1977,18 @@ async fn process_files(
     let _ = tx.send(ProcessingEvent::Status(
         "🧠 [RAG] Embedding document chunks…".to_string(),
     ));
+
+    // Always use local TF-IDF embeddings (no external API needed)
+    let _ = tx.send(ProcessingEvent::Status(
+        "🧠 [RAG] Using local TF-IDF embeddings".to_string(),
+    ));
+    let embed_dim = crate::rag::LOCAL_EMBEDDING_DIM;
+
     let surreal_path = openspec_output_dir.as_deref();
     let mut rag_engine = match crate::rag::RagEngine::new(
         surreal_path,
-        crate::llm::ENDPOINT_EXTRACTOR.url,
-        &embedding_model,
+        embed_dim,
+        cache.clone(),
     ).await {
         Ok(engine) => engine,
         Err(e) => {
@@ -1991,7 +1996,7 @@ async fn process_files(
                 "⚠ [RAG] SurrealDB init failed: {} — RAG disabled", e
             )));
             // Create a fallback in-memory engine so we can continue without RAG
-            crate::rag::RagEngine::new(None, crate::llm::ENDPOINT_EXTRACTOR.url, &embedding_model)
+            crate::rag::RagEngine::new(None, embed_dim, cache.clone())
                 .await
                 .expect("in-memory SurrealDB should not fail")
         }
@@ -2003,10 +2008,18 @@ async fn process_files(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
         match rag_engine.index_file(&fname, file_type, text).await {
-            Ok(chunk_count) => {
-                let _ = tx.send(ProcessingEvent::Status(format!(
-                    "🧠 [RAG] {} → {} chunks embedded", fname, chunk_count
-                )));
+            Ok(result) => {
+                if result.skipped {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "🧠 [RAG] {} → {} chunks (already indexed, skipped)",
+                        fname, result.total_chunks
+                    )));
+                } else {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "🧠 [RAG] {} → {} chunks ({} cached, {} embedded)",
+                        fname, result.total_chunks, result.cached, result.embedded
+                    )));
+                }
             }
             Err(e) => {
                 let _ = tx.send(ProcessingEvent::Status(format!(
