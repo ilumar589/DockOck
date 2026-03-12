@@ -617,7 +617,10 @@ impl DockOckApp {
         let openspec_enabled = self.openspec_enabled;
         let openspec_url = self.openspec_url.clone();
         let openspec_output_dir = self.output_dir.clone();
-        let cache = crate::cache::DiskCache::new(self.output_dir.as_deref());
+        // Use a LOCAL temp directory for the disk cache so we never do
+        // synchronous I/O against a (potentially network-mounted) output dir.
+        let local_cache_root = std::env::temp_dir().join("dockock");
+        let cache = crate::cache::DiskCache::new(Some(&local_cache_root));
         let force_regenerate = self.force_regenerate;
         let backend = self.backend.clone();
 
@@ -1973,72 +1976,9 @@ async fn process_files(
         .flat_map(|g| g.members.iter().cloned())
         .collect();
 
-    // ── Phase 1.3: RAG — chunk and embed all parsed files ──
-    let _ = tx.send(ProcessingEvent::Status(
-        "🧠 [RAG] Embedding document chunks…".to_string(),
-    ));
-
-    // Always use local TF-IDF embeddings (no external API needed)
-    let _ = tx.send(ProcessingEvent::Status(
-        "🧠 [RAG] Using local TF-IDF embeddings".to_string(),
-    ));
-    let embed_dim = crate::rag::LOCAL_EMBEDDING_DIM;
-
-    let surreal_path = openspec_output_dir.as_deref();
-    let mut rag_engine = match crate::rag::RagEngine::new(
-        surreal_path,
-        embed_dim,
-        cache.clone(),
-    ).await {
-        Ok(engine) => engine,
-        Err(e) => {
-            let _ = tx.send(ProcessingEvent::Status(format!(
-                "⚠ [RAG] SurrealDB init failed: {} — RAG disabled", e
-            )));
-            // Create a fallback in-memory engine so we can continue without RAG
-            crate::rag::RagEngine::new(None, embed_dim, cache.clone())
-                .await
-                .expect("in-memory SurrealDB should not fail")
-        }
-    };
-    let mut rag_ok = true;
-    for (path, (file_type, text, _images)) in &parsed_map {
-        let fname = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        match rag_engine.index_file(&fname, file_type, text).await {
-            Ok(result) => {
-                if result.skipped {
-                    let _ = tx.send(ProcessingEvent::Status(format!(
-                        "🧠 [RAG] {} → {} chunks (already indexed, skipped)",
-                        fname, result.total_chunks
-                    )));
-                } else {
-                    let _ = tx.send(ProcessingEvent::Status(format!(
-                        "🧠 [RAG] {} → {} chunks ({} cached, {} embedded)",
-                        fname, result.total_chunks, result.cached, result.embedded
-                    )));
-                }
-            }
-            Err(e) => {
-                let _ = tx.send(ProcessingEvent::Status(format!(
-                    "⚠ [RAG] Embedding failed for {}: {} — falling back to excerpt context", fname, e
-                )));
-                rag_ok = false;
-                break;
-            }
-        }
-    }
-    if rag_ok {
-        let _ = tx.send(ProcessingEvent::Status(format!(
-            "✅ [RAG] {} chunks indexed across {} files",
-            rag_engine.chunk_count(),
-            parsed_map.len(),
-        )));
-    }
-    let rag_engine = Arc::new(rag_engine);
-    let rag_available = rag_ok && rag_engine.chunk_count() > 0;
+    // ── Phase 1.3: RAG disabled ──
+    // RAG cross-file context has been removed to avoid runtime hangs.
+    // The pipeline uses excerpt-based context instead.
 
     // Take a snapshot of context now (after all files are parsed)
     let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
@@ -2047,6 +1987,11 @@ async fn process_files(
 
     // Shared collection for OpenSpec: (change_name, gherkin_feature_text)
     let gherkin_docs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let _ = tx.send(ProcessingEvent::Status(format!(
+        "🔧 Dispatching {} groups + ungrouped files (concurrency: {})…",
+        groups.len(), max_concurrent
+    )));
 
     // ── Dispatch group work items ──
     for group in &groups {
@@ -2077,29 +2022,13 @@ async fn process_files(
             let ctx = ctx_snapshot.clone();
             let gdocs = Arc::clone(&gherkin_docs);
             let force_regen = force_regenerate;
-            let rag = Arc::clone(&rag_engine);
-            let rag_on = rag_available;
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await;
                 let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
                 let file_start = std::time::Instant::now();
 
-                // Build RAG cross-file context if available
-                let rag_ctx = if rag_on {
-                    let query = crate::rag::build_query_text(&raw_text, &file_name);
-                    match rag.build_cross_file_context(&query, &file_name).await {
-                        Ok(ctx_str) => Some(ctx_str),
-                        Err(e) => {
-                            let _ = tx.send(ProcessingEvent::Status(format!(
-                                "⚠ [RAG] Retrieval failed for {}: {} — using excerpt context", file_name, e
-                            )));
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
+                let rag_ctx: Option<String> = None;
 
                 let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
                 let tx_fwd = tx.clone();
@@ -2156,8 +2085,6 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
-        let rag = Arc::clone(&rag_engine);
-        let rag_on = rag_available;
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
@@ -2168,27 +2095,7 @@ async fn process_files(
             }
             let group_start = std::time::Instant::now();
 
-            // Build RAG cross-file context for the group (query from merged member text)
-            let rag_ctx = if rag_on {
-                let merged_query: String = members_data.iter()
-                    .map(|(name, _, text, _)| crate::rag::build_query_text(text, name))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // Exclude all member files from retrieval
-                // Use first member as exclude (the vector store filters by file_name)
-                // We'll just pass group_name as exclude — members are named individually
-                match rag.build_cross_file_context(&merged_query, &group_name).await {
-                    Ok(ctx_str) => Some(ctx_str),
-                    Err(e) => {
-                        let _ = tx.send(ProcessingEvent::Status(format!(
-                            "⚠ [RAG] Retrieval failed for group {}: {} — using excerpt context", group_name, e
-                        )));
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            let rag_ctx: Option<String> = None;
 
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();
@@ -2236,6 +2143,11 @@ async fn process_files(
         llm_handles.push(handle);
     }
 
+    let _ = tx.send(ProcessingEvent::Status(format!(
+        "🔧 Dispatched {} group tasks, now spawning ungrouped file tasks…",
+        llm_handles.len()
+    )));
+
     // ── Dispatch ungrouped single-file work items ──
     for (path, (file_type, raw_text, images)) in &parsed_map {
         if grouped_paths.contains(path) {
@@ -2252,8 +2164,6 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
-        let rag = Arc::clone(&rag_engine);
-        let rag_on = rag_available;
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2262,23 +2172,12 @@ async fn process_files(
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
             let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
+            let _ = tx.send(ProcessingEvent::Status(format!(
+                "🚀 Starting pipeline for {}…", file_name
+            )));
             let file_start = std::time::Instant::now();
 
-            // Build RAG cross-file context if available
-            let rag_ctx = if rag_on {
-                let query = crate::rag::build_query_text(&raw_text, &file_name);
-                match rag.build_cross_file_context(&query, &file_name).await {
-                    Ok(ctx_str) => Some(ctx_str),
-                    Err(e) => {
-                        let _ = tx.send(ProcessingEvent::Status(format!(
-                            "⚠ [RAG] Retrieval failed for {}: {} — using excerpt context", file_name, e
-                        )));
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+            let rag_ctx: Option<String> = None;
 
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();
@@ -2326,6 +2225,11 @@ async fn process_files(
 
         llm_handles.push(handle);
     }
+
+    let _ = tx.send(ProcessingEvent::Status(format!(
+        "⏳ All {} tasks spawned — waiting for LLM results…",
+        llm_handles.len()
+    )));
 
     // Wait for all LLM tasks to complete
     for handle in llm_handles {

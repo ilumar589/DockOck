@@ -95,6 +95,52 @@ impl DiskCache {
         }
     }
 
+    /// Async version of `get` — offloads the synchronous file read to
+    /// tokio's blocking thread pool so it never stalls the async runtime.
+    pub async fn get_async<T: for<'de> Deserialize<'de> + Send + 'static>(
+        &self,
+        namespace: &str,
+        key: &str,
+    ) -> Option<T> {
+        if !self.enabled {
+            return None;
+        }
+        let path = self.base_dir.join(namespace).join(key);
+        tokio::task::spawn_blocking(move || {
+            let data = std::fs::read(&path).ok()?;
+            postcard::from_bytes(&data).ok()
+        })
+        .await
+        .ok()?
+    }
+
+    /// Async version of `put` — serialises on the current thread, then
+    /// offloads the directory-create + file-write to a blocking thread.
+    pub async fn put_async<T: Serialize>(&self, namespace: &str, key: &str, value: &T) {
+        if !self.enabled {
+            return;
+        }
+        let dir = self.base_dir.join(namespace);
+        let path = dir.join(key);
+        let data = match postcard::to_allocvec(value) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("Cache: failed to serialize: {}", e);
+                return;
+            }
+        };
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!("Cache: failed to create dir {}: {}", dir.display(), e);
+                return;
+            }
+            if let Err(e) = std::fs::write(&path, data) {
+                tracing::warn!("Cache: failed to write {}: {}", path.display(), e);
+            }
+        })
+        .await;
+    }
+
     /// Store raw text in the cache.
     pub fn put_text(&self, namespace: &str, key: &str, value: &str) {
         if !self.enabled {

@@ -3,22 +3,19 @@
 //! Instead of using fixed 400-char excerpts from other files, this module:
 //! 1. Chunks parsed document text into overlapping windows
 //! 2. Embeds each chunk via a local TF-IDF hashing vectorizer (no API needed)
-//! 3. Stores embeddings in SurrealDB (embedded mode with HNSW vector indexing)
+//! 3. Stores embeddings in a simple in-memory Vec (brute-force cosine search)
 //! 4. At generation time, retrieves the top-K most relevant chunks from OTHER
 //!    files to inject as cross-file context
 //!
 //! Performance optimisations:
-//! - **Skip indexed**: files already in SurrealDB (by name + chunk count) are skipped
+//! - **Skip indexed**: files already stored (by name + chunk count) are skipped
 //! - **Disk-cached embeddings**: individual vectors cached by content hash
 //! - **Sub-batching**: large files are embedded in batches of 8
-//!
-//! Storage: SurrealKV (persistent, pure-Rust) when an output dir is available;
-//! in-memory fallback otherwise. Persisted embeddings survive across app restarts.
+//! - **Brute-force search**: at typical scale (~3 000 chunks × 768-dim) this is
+//!   sub-millisecond and avoids the overhead/hangs of an embedded vector DB.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use surrealdb::Surreal;
-use surrealdb::engine::local::Db;
 use tracing::info;
 
 // ─────────────────────────────────────────────
@@ -64,28 +61,6 @@ pub struct TextChunk {
 pub struct SearchResult {
     pub chunk: TextChunk,
     pub score: f32,
-}
-
-/// Row shape returned from the vector similarity SurrealQL query.
-#[derive(Debug, Deserialize)]
-struct ChunkRow {
-    file_name: String,
-    file_type: String,
-    text: String,
-    offset: usize,
-    chunk_index: usize,
-    score: f32,
-}
-
-/// Row shape for INSERT (includes the embedding vector).
-#[derive(Debug, Serialize)]
-struct ChunkInsert {
-    file_name: String,
-    file_type: String,
-    text: String,
-    offset: usize,
-    chunk_index: usize,
-    embedding: Vec<f32>,
 }
 
 // ─────────────────────────────────────────────
@@ -161,318 +136,114 @@ fn snap_to_line_boundary(text: &str) -> String {
     }
 }
 
-/// Maximum texts per embedding sub-batch.
-const EMBED_SUB_BATCH: usize = 8;
+/// A stored chunk with its precomputed embedding vector.
+struct StoredChunk {
+    chunk: TextChunk,
+    embedding: Vec<f32>,
+}
 
-/// The RAG engine backed by SurrealDB embedded with HNSW vector indexing.
+/// The RAG engine backed by a simple in-memory vector store with brute-force
+/// cosine similarity search.  At the scale we operate (~3 000 chunks, 768-dim)
+/// this is sub-millisecond and avoids all SurrealDB overhead/hangs.
+///
+/// No disk cache is used — TF-IDF embedding is pure CPU and faster to
+/// recompute than to read/write a (potentially network-mounted) cache dir.
 pub struct RagEngine {
     /// Embedding vector dimension.
     embed_dim: usize,
-    /// SurrealDB embedded instance.
-    db: Surreal<Db>,
-    /// Running count of chunks stored in this session.
-    chunk_count: usize,
-    /// Disk cache for embedding vectors (avoids re-computing for identical text).
-    cache: crate::cache::DiskCache,
-    /// Set of file names already indexed in SurrealDB (for skip-if-present).
+    /// All stored chunks + embeddings.
+    store: Vec<StoredChunk>,
+    /// Set of file names already indexed (for skip-if-present).
     indexed_files: std::collections::HashMap<String, usize>,
 }
 
-/// SurrealQL schema migration run on startup.
-/// Uses OVERWRITE on the HNSW index so dimension changes are applied cleanly.
-fn schema_sql(dim: usize) -> String {
-    format!(r#"
-DEFINE TABLE IF NOT EXISTS chunks SCHEMAFULL;
-DEFINE FIELD IF NOT EXISTS file_name   ON chunks TYPE string;
-DEFINE FIELD IF NOT EXISTS file_type   ON chunks TYPE string;
-DEFINE FIELD IF NOT EXISTS text        ON chunks TYPE string;
-DEFINE FIELD IF NOT EXISTS offset      ON chunks TYPE int;
-DEFINE FIELD IF NOT EXISTS chunk_index ON chunks TYPE int;
-DEFINE FIELD IF NOT EXISTS embedding   ON chunks TYPE array<float>;
-DEFINE INDEX idx_chunks_embedding ON chunks
-    FIELDS embedding HNSW DIMENSION {dim} DIST COSINE;
-DEFINE INDEX IF NOT EXISTS idx_chunks_file ON chunks FIELDS file_name;
-"#)
-}
-
 impl RagEngine {
-    /// Create a new RAG engine with SurrealDB storage.
+    /// Create a new RAG engine with in-memory vector storage.
     ///
-    /// * `surreal_path` — if `Some`, SurrealKV persistent storage at that dir;
-    ///   if `None`, in-memory only.
     /// * `embed_dim` — embedding vector dimension
-    /// * `cache` — disk cache for embedding vectors
-    pub async fn new(
-        surreal_path: Option<&std::path::Path>,
-        embed_dim: usize,
-        cache: crate::cache::DiskCache,
-    ) -> Result<Self> {
-        let db = if let Some(path) = surreal_path {
-            let dir = path.join(".dockock_surreal");
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("Failed to create SurrealDB dir: {}", dir.display()))?;
-            let path_str = dir.to_string_lossy().to_string();
-            info!("SurrealDB: opening persistent store at {}", path_str);
-            Surreal::new::<surrealdb::engine::local::SurrealKv>(path_str.as_str())
-                .await
-                .context("Failed to open SurrealKV database")?
-        } else {
-            info!("SurrealDB: using in-memory store (no output dir)");
-            Surreal::new::<surrealdb::engine::local::Mem>(())
-                .await
-                .context("Failed to open in-memory SurrealDB")?
-        };
-
-        db.use_ns("dockock").use_db("rag").await
-            .context("Failed to select SurrealDB namespace/database")?;
-
-        // Ensure the HNSW index matches the current embedding dimension.
-        // We store the active dimension in a tiny `meta` table.  If it differs
-        // from `embed_dim`, all chunks must be wiped because their vectors are
-        // incompatible with the new dimension.
-        db.query("DEFINE TABLE IF NOT EXISTS meta SCHEMAFULL; \
-                   DEFINE FIELD IF NOT EXISTS key ON meta TYPE string; \
-                   DEFINE FIELD IF NOT EXISTS val ON meta TYPE int")
-            .await
-            .context("Failed to define meta table")?;
-
-        #[derive(Debug, Deserialize)]
-        struct MetaRow { val: usize }
-
-        let mut meta_res = db
-            .query("SELECT val FROM meta WHERE key = 'embed_dim' LIMIT 1")
-            .await
-            .context("Failed to query meta")?;
-        let stored_dim: Option<MetaRow> = meta_res.take::<Vec<MetaRow>>(0)
-            .unwrap_or_default()
-            .into_iter()
-            .next();
-
-        if stored_dim.as_ref().map(|m| m.val) != Some(embed_dim) {
-            info!(
-                "SurrealDB: embedding dimension changed ({} → {}) — wiping stale data",
-                stored_dim.map(|m| m.val).unwrap_or(0),
-                embed_dim,
-            );
-            db.query("DELETE chunks").await.context("Failed to wipe stale chunks")?;
-            db.query("REMOVE INDEX IF EXISTS idx_chunks_embedding ON chunks")
-                .await
-                .context("Failed to remove stale HNSW index")?;
-        }
-
-        db.query(&schema_sql(embed_dim))
-            .await
-            .context("Failed to run SurrealDB schema migration")?;
-
-        // Persist the current dimension
-        db.query("DELETE meta WHERE key = 'embed_dim'; \
-                   CREATE meta SET key = 'embed_dim', val = $dim")
-            .bind(("dim", embed_dim as i64))
-            .await
-            .context("Failed to persist embed_dim in meta")?;
-
-        // Count existing chunks (from a previous run if persistent)
-        let mut result = db.query("SELECT count() AS c FROM chunks GROUP ALL")
-            .await
-            .context("Failed to count existing chunks")?;
-        let existing: Option<CountRow> = result.take(0).ok().and_then(|v: Vec<CountRow>| v.into_iter().next());
-        let chunk_count = existing.map(|r| r.c).unwrap_or(0);
-        if chunk_count > 0 {
-            info!("SurrealDB: loaded {} existing chunks from previous session", chunk_count);
-        }
-
-        // Build index of which files are already in SurrealDB (for skip-if-present)
-        let mut idx_result = db
-            .query("SELECT file_name, count() AS c FROM chunks GROUP BY file_name")
-            .await
-            .context("Failed to query indexed files")?;
-        let idx_rows: Vec<FileCountRow> = idx_result.take(0).unwrap_or_default();
-        let indexed_files: std::collections::HashMap<String, usize> = idx_rows
-            .into_iter()
-            .map(|r| (r.file_name, r.c))
-            .collect();
-        if !indexed_files.is_empty() {
-            info!("SurrealDB: {} files already indexed", indexed_files.len());
-        }
-
-        Ok(Self {
+    pub fn new(embed_dim: usize) -> Self {
+        info!("RAG engine: using in-memory vector store (brute-force cosine, no disk cache)");
+        Self {
             embed_dim,
-            db,
-            chunk_count,
-            cache,
-            indexed_files,
-        })
+            store: Vec::new(),
+            indexed_files: std::collections::HashMap::new(),
+        }
     }
 
     /// Number of chunks in the vector store.
     pub fn chunk_count(&self) -> usize {
-        self.chunk_count
+        self.store.len()
     }
 
-    /// Embed and index all chunks from a single file.
+    /// Embed and index all chunks from a single file (synchronous).
     ///
-    /// Chunks are embedded in sub-batches with disk-cache lookups.
-    /// Files already present in SurrealDB (matching chunk count) are skipped entirely.
-    pub async fn index_file(
+    /// Pure CPU work — call from a blocking context, NOT from the async runtime.
+    pub fn index_file(
         &mut self,
         file_name: &str,
         file_type: &str,
         raw_text: &str,
-    ) -> Result<IndexResult> {
+    ) -> IndexResult {
         let chunks = chunk_text(raw_text, file_name, file_type);
         if chunks.is_empty() {
-            return Ok(IndexResult { total_chunks: 0, cached: 0, embedded: 0, skipped: true });
+            return IndexResult { total_chunks: 0, cached: 0, embedded: 0, skipped: true };
         }
 
-        // Skip if this file is already fully indexed in SurrealDB
+        // Skip if this file is already fully indexed in memory
         if let Some(&existing_count) = self.indexed_files.get(file_name) {
             if existing_count == chunks.len() {
-                return Ok(IndexResult {
+                return IndexResult {
                     total_chunks: chunks.len(),
                     cached: 0,
                     embedded: 0,
                     skipped: true,
-                });
+                };
             }
-            // Chunk count changed (doc was edited) — delete stale chunks and re-index
-            self.db
-                .query("DELETE chunks WHERE file_name = $fname")
-                .bind(("fname", file_name.to_string()))
-                .await
-                .context("Failed to delete stale chunks")?;
+            // Chunk count changed — remove stale chunks and re-index
+            self.store.retain(|sc| sc.chunk.file_name != file_name);
         }
 
-        // Embed with sub-batching + disk cache
-        let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
-        let mut cached_count = 0usize;
-        let mut embedded_count = 0usize;
+        let dim = self.embed_dim;
+        let embeddings: Vec<Vec<f32>> = chunks
+            .iter()
+            .map(|c| tfidf_hash_embed(&c.text, dim))
+            .collect();
 
-        for batch_start in (0..chunks.len()).step_by(EMBED_SUB_BATCH) {
-            let batch_end = (batch_start + EMBED_SUB_BATCH).min(chunks.len());
-            let batch = &chunks[batch_start..batch_end];
-
-            // Check disk cache for each text in the batch
-            let mut batch_results: Vec<Option<Vec<f32>>> = Vec::with_capacity(batch.len());
-            let mut uncached_indices: Vec<usize> = Vec::new();
-            let mut uncached_texts: Vec<&str> = Vec::new();
-
-            for (i, chunk) in batch.iter().enumerate() {
-                let cache_key = crate::cache::composite_key(&[
-                    chunk.text.as_bytes(),
-                    b"local-tfidf",
-                ]);
-                if let Some(cached_emb) = self.cache.get::<Vec<f32>>(crate::cache::NS_EMBEDDING, &cache_key) {
-                    batch_results.push(Some(cached_emb));
-                    cached_count += 1;
-                } else {
-                    batch_results.push(None);
-                    uncached_indices.push(i);
-                    uncached_texts.push(&chunk.text);
-                }
-            }
-
-            // Embed uncached texts locally
-            if !uncached_texts.is_empty() {
-                let new_embeddings = self.embed_batch(&uncached_texts);
-                if new_embeddings.len() != uncached_texts.len() {
-                    anyhow::bail!(
-                        "Embedding count mismatch: expected {}, got {}",
-                        uncached_texts.len(),
-                        new_embeddings.len()
-                    );
-                }
-                // Merge results and cache new embeddings
-                for (idx_in_uncached, &local_idx) in uncached_indices.iter().enumerate() {
-                    let emb = new_embeddings[idx_in_uncached].clone();
-                    // Cache on disk
-                    let cache_key = crate::cache::composite_key(&[
-                        batch[local_idx].text.as_bytes(),
-                        b"local-tfidf",
-                    ]);
-                    self.cache.put(crate::cache::NS_EMBEDDING, &cache_key, &emb);
-                    batch_results[local_idx] = Some(emb);
-                }
-                embedded_count += uncached_texts.len();
-            }
-
-            // Collect final embeddings for this sub-batch
-            for result in batch_results {
-                embeddings.push(result.expect("all embeddings should be resolved"));
-            }
-        }
-
-        // Batch-insert all chunks into SurrealDB via a single query
         let count = chunks.len();
-        for (chunk, emb) in chunks.into_iter().zip(embeddings.into_iter()) {
-            let cname = chunk.file_name.clone();
-            let cidx = chunk.chunk_index;
-            let row = ChunkInsert {
-                file_name: chunk.file_name,
-                file_type: chunk.file_type,
-                text: chunk.text,
-                offset: chunk.offset,
-                chunk_index: chunk.chunk_index,
-                embedding: emb,
-            };
-            self.db
-                .create::<Option<serde_json::Value>>("chunks")
-                .content(row)
-                .await
-                .with_context(|| format!(
-                    "Failed to insert chunk {} of '{}' into SurrealDB",
-                    cidx, cname,
-                ))?;
+        for (chunk, emb) in chunks.into_iter().zip(embeddings) {
+            self.store.push(StoredChunk { chunk, embedding: emb });
         }
 
-        self.chunk_count += count;
         self.indexed_files.insert(file_name.to_string(), count);
-        Ok(IndexResult { total_chunks: count, cached: cached_count, embedded: embedded_count, skipped: false })
+        IndexResult { total_chunks: count, cached: 0, embedded: count, skipped: false }
     }
 
     /// Retrieve the top-K most relevant chunks from files other than `exclude_file`.
     ///
-    /// Uses SurrealDB's built-in cosine similarity via HNSW index.
+    /// Brute-force cosine similarity — fast enough for thousands of 768-dim vectors.
     pub async fn retrieve(
         &self,
         query_text: &str,
         exclude_file: &str,
     ) -> Result<Vec<SearchResult>> {
-        let query_emb = self.embed_single(query_text).await?;
+        let query_emb = self.embed_single(query_text);
 
-        let sql = "
-            SELECT
-                file_name, file_type, text, offset, chunk_index,
-                vector::similarity::cosine(embedding, $query_emb) AS score
-            FROM chunks
-            WHERE file_name != $exclude
-            ORDER BY score DESC
-            LIMIT $top_k
-        ";
+        // Score every chunk (excluding the query's own file)
+        let mut scored: Vec<(usize, f32)> = self.store.iter().enumerate()
+            .filter(|(_, sc)| sc.chunk.file_name != exclude_file)
+            .map(|(i, sc)| (i, cosine_similarity(&query_emb, &sc.embedding)))
+            .collect();
 
-        let mut result = self.db
-            .query(sql)
-            .bind(("query_emb", query_emb))
-            .bind(("exclude", exclude_file.to_string()))
-            .bind(("top_k", TOP_K as i64))
-            .await
-            .context("SurrealDB vector search failed")?;
+        // Partial sort: top-K by descending score
+        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(TOP_K);
 
-        let rows: Vec<ChunkRow> = result.take(0)
-            .unwrap_or_default();
-
-        Ok(rows
-            .into_iter()
-            .map(|r| SearchResult {
-                chunk: TextChunk {
-                    file_name: r.file_name,
-                    file_type: r.file_type,
-                    text: r.text,
-                    offset: r.offset,
-                    chunk_index: r.chunk_index,
-                },
-                score: r.score,
-            })
-            .collect())
+        Ok(scored.into_iter().map(|(i, score)| {
+            SearchResult {
+                chunk: self.store[i].chunk.clone(),
+                score,
+            }
+        }).collect())
     }
 
     /// Build a formatted cross-file context string from RAG retrieval results.
@@ -500,7 +271,7 @@ impl RagEngine {
             );
             let snippet = &result.chunk.text;
 
-            let entry_cost = header.len() + snippet.len() + 2; // +2 for newlines
+            let entry_cost = header.len() + snippet.len() + 2;
             if chars_used + entry_cost > MAX_CONTEXT_CHARS {
                 let remaining = MAX_CONTEXT_CHARS.saturating_sub(chars_used + header.len() + 10);
                 if remaining > 100 {
@@ -521,34 +292,24 @@ impl RagEngine {
         Ok(context)
     }
 
-    /// Clear all chunks for a fresh run (useful when force-regenerating).
+    /// Clear all chunks for a fresh run.
     #[allow(dead_code)]
     pub async fn clear(&mut self) -> Result<()> {
-        self.db.query("DELETE chunks").await
-            .context("Failed to clear chunks table")?;
-        self.chunk_count = 0;
+        self.store.clear();
+        self.indexed_files.clear();
         Ok(())
     }
 
-    /// Embed a single text string.
-    async fn embed_single(&self, text: &str) -> Result<Vec<f32>> {
-        let cache_key = crate::cache::composite_key(&[
-            text.as_bytes(),
-            b"local-tfidf",
-        ]);
-        if let Some(cached) = self.cache.get::<Vec<f32>>(crate::cache::NS_EMBEDDING, &cache_key) {
-            return Ok(cached);
-        }
-
-        let emb = tfidf_hash_embed(text, self.embed_dim);
-        self.cache.put(crate::cache::NS_EMBEDDING, &cache_key, &emb);
-        Ok(emb)
+    /// Embed a single text string (pure CPU, no disk cache).
+    fn embed_single(&self, text: &str) -> Vec<f32> {
+        tfidf_hash_embed(text, self.embed_dim)
     }
 
-    /// Embed a batch of texts using local TF-IDF hashing.
-    fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>> {
-        texts.iter().map(|t| tfidf_hash_embed(t, self.embed_dim)).collect()
-    }
+}
+
+/// Cosine similarity between two vectors (assumes both are L2-normalised).
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
 /// Result of indexing a single file — provides detail for progress reporting.
@@ -562,19 +323,6 @@ pub struct IndexResult {
     pub embedded: usize,
     /// Whether the file was skipped (already fully indexed in SurrealDB).
     pub skipped: bool,
-}
-
-/// Helper for COUNT query deserialization.
-#[derive(Debug, Deserialize)]
-struct CountRow {
-    c: usize,
-}
-
-/// Helper for per-file COUNT query deserialization.
-#[derive(Debug, Deserialize)]
-struct FileCountRow {
-    file_name: String,
-    c: usize,
 }
 
 // ─────────────────────────────────────────────
