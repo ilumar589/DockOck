@@ -304,9 +304,19 @@ impl DockOckApp {
             refinement_input: String::new(),
             session_restore_pending: false,
             backend: crate::llm::ProviderBackend::Ollama,
-            custom_providers: crate::llm::load_custom_providers(
-                &std::env::current_dir().unwrap_or_default(),
-            ),
+            custom_providers: {
+                // Look next to the executable first, then fall back to cwd.
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let dirs: Vec<std::path::PathBuf> =
+                    exe_dir.into_iter().chain(std::iter::once(cwd)).collect();
+                dirs.iter()
+                    .map(|d| crate::llm::load_custom_providers(d))
+                    .find(|v| !v.is_empty())
+                    .unwrap_or_default()
+            },
             saved_ollama_models: (
                 crate::llm::DEFAULT_GENERATOR_MODEL.to_string(),
                 crate::llm::DEFAULT_EXTRACTOR_MODEL.to_string(),
