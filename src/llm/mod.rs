@@ -449,9 +449,21 @@ impl AgentOrchestrator {
                 // ── Custom: single OpenAI-compatible client for text roles ──
                 info!("Using custom provider: {name} at {base_url}");
 
+                // Build a reqwest::Client with explicit timeouts so cloud API
+                // requests don't hang indefinitely on DNS/connect stalls.
+                // Note: we do NOT set an overall `timeout()` because SSE
+                // streaming responses can legitimately run for many minutes.
+                // Per-chunk stall detection is handled in stream_chat_with_progress.
+                let http_client = reqwest::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(30))
+                    .read_timeout(std::time::Duration::from_secs(90))
+                    .build()
+                    .unwrap_or_default();
+
                 let openai_client = openai::CompletionsClient::builder()
                     .api_key(api_key)
                     .base_url(base_url)
+                    .http_client(http_client)
                     .build()
                     .with_context(|| format!("Failed to create OpenAI-compatible client for {}", name))?;
 
@@ -1785,6 +1797,9 @@ where
     M::StreamingResponse: rig::completion::GetTokenUsage,
     P: rig::agent::PromptHook<M> + 'static,
 {
+    // Overall deadline for the entire request (connection + streaming).
+    let deadline = tokio::time::Instant::now() + timeout;
+
     let mut stream = tokio::time::timeout(
         timeout,
         agent.stream_prompt(prompt).with_history(chat_history),
@@ -1795,27 +1810,50 @@ where
     let mut accumulated = String::new();
     let mut token_count: usize = 0;
 
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(
-                StreamedAssistantContent::Text(Text { text }),
-            )) => {
-                accumulated.push_str(&text);
-                token_count += 1;
-                if token_count % 20 == 0 {
-                    let _ = status_tx.send(format!(
-                        "🔄 [{stage_name}] {file_name}: {token_count} tokens…"
-                    ));
+    // Per-chunk timeout: if no data arrives for 60s the stream is considered stalled.
+    let chunk_timeout = std::time::Duration::from_secs(60);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "{stage_name} overall deadline exceeded for {file_name} after {token_count} tokens"
+            );
+        }
+        let wait = chunk_timeout.min(remaining);
+
+        match tokio::time::timeout(wait, stream.next()).await {
+            Ok(Some(item)) => match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Text(Text { text }),
+                )) => {
+                    accumulated.push_str(&text);
+                    token_count += 1;
+                    if token_count % 20 == 0 {
+                        let _ = status_tx.send(format!(
+                            "🔄 [{stage_name}] {file_name}: {token_count} tokens…"
+                        ));
+                    }
                 }
-            }
-            Ok(MultiTurnStreamItem::FinalResponse(_)) => {
+                Ok(MultiTurnStreamItem::FinalResponse(_)) => {
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("[{stage_name} STREAM ERROR] {file_name}: {e:?}");
+                    anyhow::bail!("{stage_name} stream error for {file_name}: {e}");
+                }
+                _ => {}
+            },
+            Ok(None) => {
+                // Stream ended
                 break;
             }
-            Err(e) => {
-                eprintln!("[{stage_name} STREAM ERROR] {file_name}: {e:?}");
-                anyhow::bail!("{stage_name} stream error for {file_name}: {e}");
+            Err(_) => {
+                anyhow::bail!(
+                    "{stage_name} stream stalled for {file_name} (no data for {}s after {token_count} tokens)",
+                    wait.as_secs()
+                );
             }
-            _ => {}
         }
     }
 

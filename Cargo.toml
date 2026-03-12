@@ -61,8 +61,3 @@ postcard = { version = "1", features = ["alloc"] }
 
 # Text processing
 regex = "1"
-
-# SurrealDB embedded vector store for RAG persistence
-# kv-surrealkv = pure-Rust persistent storage (no cmake/LLVM needed)
-# kv-mem = in-memory fallback
-surrealdb = { version = "2.5", features = ["kv-surrealkv", "kv-mem"] }
