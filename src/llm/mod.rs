@@ -622,6 +622,34 @@ impl AgentOrchestrator {
 
     // ── Internal helper: dispatch chat to the right backend ──
 
+    /// Check whether an error message indicates a retryable transient failure
+    /// (rate-limit, server overload, connection issue).
+    fn is_retryable_error(err_msg: &str) -> bool {
+        let lower = err_msg.to_lowercase();
+        lower.contains("429")
+            || lower.contains("too many requests")
+            || lower.contains("rate limit")
+            || lower.contains("ratelimit")
+            || lower.contains("tpm")
+            || lower.contains("rpm")
+            || lower.contains("502")
+            || lower.contains("503")
+            || lower.contains("529")
+            || lower.contains("bad gateway")
+            || lower.contains("service unavailable")
+            || lower.contains("overloaded")
+            || lower.contains("connection reset")
+            || lower.contains("connection refused")
+            || lower.contains("broken pipe")
+    }
+
+    /// Retry delays for transient errors (exponential backoff).
+    const RETRY_DELAYS: [std::time::Duration; 3] = [
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
+    ];
+
     /// Build an agent for one of the Ollama text roles and stream a chat.
     /// `ollama_client` is the Ollama client for this role (may fall back to generator).
     async fn run_ollama_chat(
@@ -636,12 +664,32 @@ impl AgentOrchestrator {
         timeout: std::time::Duration,
     ) -> Result<String> {
         let num_ctx = context_window_for_model(model);
-        let agent = ollama_client
-            .agent(model)
-            .preamble(preamble)
-            .additional_params(serde_json::json!({"num_ctx": num_ctx}))
-            .build();
-        stream_chat_with_progress(&agent, prompt, history, stage_name, file_name, status_tx, timeout).await
+        let mut last_err = None;
+        for attempt in 0..=Self::RETRY_DELAYS.len() {
+            let agent = ollama_client
+                .agent(model)
+                .preamble(preamble)
+                .additional_params(serde_json::json!({"num_ctx": num_ctx}))
+                .build();
+            match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if attempt < Self::RETRY_DELAYS.len() && Self::is_retryable_error(&msg) {
+                        let delay = Self::RETRY_DELAYS[attempt];
+                        let _ = status_tx.send(format!(
+                            "⏳ [{stage_name}] {file_name}: rate-limited, retrying in {}s (attempt {}/{})…",
+                            delay.as_secs(), attempt + 1, Self::RETRY_DELAYS.len()
+                        ));
+                        tokio::time::sleep(delay).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap())
     }
 
     /// Build an agent for the OpenAI-compatible backend and stream a chat.
@@ -656,11 +704,31 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
         timeout: std::time::Duration,
     ) -> Result<String> {
-        let agent = openai_client
-            .agent(model)
-            .preamble(preamble)
-            .build();
-        stream_chat_with_progress(&agent, prompt, history, stage_name, file_name, status_tx, timeout).await
+        let mut last_err = None;
+        for attempt in 0..=Self::RETRY_DELAYS.len() {
+            let agent = openai_client
+                .agent(model)
+                .preamble(preamble)
+                .build();
+            match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    let msg = format!("{e}");
+                    if attempt < Self::RETRY_DELAYS.len() && Self::is_retryable_error(&msg) {
+                        let delay = Self::RETRY_DELAYS[attempt];
+                        let _ = status_tx.send(format!(
+                            "⏳ [{stage_name}] {file_name}: rate-limited, retrying in {}s (attempt {}/{})…",
+                            delay.as_secs(), attempt + 1, Self::RETRY_DELAYS.len()
+                        ));
+                        tokio::time::sleep(delay).await;
+                        last_err = Some(e);
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(last_err.unwrap())
     }
 
     /// Resolve the Ollama client for the extractor role (falls back to generator).

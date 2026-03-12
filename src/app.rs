@@ -144,7 +144,7 @@ pub enum ProcessingEvent {
     /// All files have been processed (or an error terminated the run)
     Done(Result<(), String>),
     /// A single item (file or group) failed — still counts toward progress
-    ItemFailed(String),
+    ItemFailed { name: String, path: Option<PathBuf> },
     /// OpenSpec export started
     OpenSpecStarted,
     /// OpenSpec export completed for one document
@@ -264,6 +264,10 @@ pub struct DockOckApp {
     saved_ollama_models: (String, String, String, String),
     /// Cancellation flag for stopping in-progress generation
     cancel_flag: Arc<AtomicBool>,
+    /// File paths that failed processing (LLM or parse errors)
+    failed_items: std::collections::HashSet<PathBuf>,
+    /// Group names that failed processing
+    failed_groups: std::collections::HashSet<String>,
 }
 
 impl DockOckApp {
@@ -329,6 +333,8 @@ impl DockOckApp {
                 crate::llm::DEFAULT_VISION_MODEL.to_string(),
             ),
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            failed_items: std::collections::HashSet::new(),
+            failed_groups: std::collections::HashSet::new(),
         }
     }
 
@@ -877,8 +883,13 @@ impl DockOckApp {
                         }
                     }
                 }
-                ProcessingEvent::ItemFailed(name) => {
+                ProcessingEvent::ItemFailed { name, path } => {
                     self.progress.0 += 1;
+                    if let Some(p) = path {
+                        self.failed_items.insert(p);
+                    } else {
+                        self.failed_groups.insert(name.clone());
+                    }
                     self.log(LogLevel::Error, format!(
                         "❌ Failed: {} ({}/{})",
                         name, self.progress.0, self.progress.1,
@@ -1116,7 +1127,7 @@ impl DockOckApp {
                     }
                 });
             ui.label("∥");
-            ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0.1))
+            ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0).max_decimals(0).update_while_editing(false))
                 .on_hover_text("Max concurrent LLM tasks");
         });
     }
@@ -1215,6 +1226,7 @@ impl DockOckApp {
                 for (gi, group) in self.file_groups.iter().enumerate() {
                     let group_selected = self.selection == Some(Selection::Group(group.name.clone()));
                     let has_group_result = self.group_results.contains_key(&group.name);
+                    let has_group_failed = self.failed_groups.contains(&group.name);
 
                     let header_label = if has_group_result {
                         if let Some(dur) = self.group_elapsed_times.get(&group.name) {
@@ -1228,6 +1240,8 @@ impl DockOckApp {
                         } else {
                             format!("✓ 📎 {} ({} files)", group.name, group.members.len())
                         }
+                    } else if has_group_failed {
+                        format!("✖ 📎 {} ({} files) — failed", group.name, group.members.len())
                     } else {
                         format!("📎 {} ({} files)", group.name, group.members.len())
                     };
@@ -1258,6 +1272,16 @@ impl DockOckApp {
                                 if let Some(ref et) = elapsed_text {
                                     ui.label(egui::RichText::new(et).color(egui::Color32::from_rgb(130, 130, 130)).small());
                                 }
+                                r
+                            }).inner
+                        } else if has_group_failed {
+                            let cross = egui::RichText::new("✖ ").color(egui::Color32::from_rgb(220, 80, 80)).strong();
+                            let title = egui::RichText::new(format!("📎 {} ({} files)", group.name, group.members.len()))
+                                .color(egui::Color32::from_rgb(220, 160, 160));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                let r = ui.selectable_label(group_selected, cross);
+                                ui.label(title);
                                 r
                             }).inner
                         } else {
@@ -1335,6 +1359,7 @@ impl DockOckApp {
                         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
                     let has_result = self.results.contains_key(path);
+                    let has_failed = self.failed_items.contains(path);
                     let selected = self.selection == Some(Selection::File(i));
 
                     let resp = if has_result {
@@ -1356,6 +1381,16 @@ impl DockOckApp {
                             if let Some(ref et) = elapsed_text {
                                 ui.label(egui::RichText::new(et).color(egui::Color32::from_rgb(130, 130, 130)).small());
                             }
+                            r
+                        }).inner
+                    } else if has_failed {
+                        let cross = egui::RichText::new("✖ ").color(egui::Color32::from_rgb(220, 80, 80)).strong();
+                        let file_name = egui::RichText::new(&name)
+                            .color(egui::Color32::from_rgb(220, 160, 160));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let r = ui.selectable_label(selected, cross);
+                            ui.label(file_name);
                             r
                         }).inner
                     } else {
@@ -1996,6 +2031,23 @@ async fn process_files(
         total
     )));
 
+    // ── Send ItemFailed for files that failed parsing ──
+    {
+        let grouped_for_fail: std::collections::HashSet<PathBuf> = groups
+            .iter()
+            .flat_map(|g| g.members.iter().cloned())
+            .collect();
+        for path in &files {
+            if !parsed_map.contains_key(path) && !grouped_for_fail.contains(path) {
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = tx.send(ProcessingEvent::ItemFailed { name: name.clone(), path: Some(path.clone()) });
+                let _ = tx.send(ProcessingEvent::Status(format!("⚠ Skipped {} (parse failure)", name)));
+            }
+        }
+    }
+
     // ── Phase 1.25: Extract entity glossary from all parsed content ──
     {
         if let Ok(mut ctx) = context.lock() {
@@ -2080,6 +2132,8 @@ async fn process_files(
         }
 
         if members_data.is_empty() {
+            let _ = tx.send(ProcessingEvent::ItemFailed { name: group.name.clone(), path: None });
+            let _ = tx.send(ProcessingEvent::Status(format!("⚠ Skipped group {} (all members failed to parse)", group.name)));
             continue;
         }
 
@@ -2143,7 +2197,7 @@ async fn process_files(
                             "⚠ Pipeline error for {}: {}",
                             file_name, e
                         )));
-                        let _ = tx.send(ProcessingEvent::ItemFailed(file_name.clone()));
+                        let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(member_path.clone()) });
                     }
                 }
             });
@@ -2213,7 +2267,7 @@ async fn process_files(
                         "⚠ Pipeline error for group {}: {}",
                         group_name, e
                     )));
-                    let _ = tx.send(ProcessingEvent::ItemFailed(group_name.clone()));
+                    let _ = tx.send(ProcessingEvent::ItemFailed { name: group_name.clone(), path: None });
                 }
             }
         });
@@ -2304,7 +2358,7 @@ async fn process_files(
                         "⚠ Pipeline error for {}: {}",
                         file_name, e
                     )));
-                    let _ = tx.send(ProcessingEvent::ItemFailed(file_name.clone()));
+                    let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(path.clone()) });
                 }
             }
         });
