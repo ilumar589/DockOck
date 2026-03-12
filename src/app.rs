@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -142,6 +143,8 @@ pub enum ProcessingEvent {
     },
     /// All files have been processed (or an error terminated the run)
     Done(Result<(), String>),
+    /// A single item (file or group) failed — still counts toward progress
+    ItemFailed(String),
     /// OpenSpec export started
     OpenSpecStarted,
     /// OpenSpec export completed for one document
@@ -259,6 +262,8 @@ pub struct DockOckApp {
     custom_providers: Vec<crate::llm::CustomProviderConfig>,
     /// Saved Ollama model selections (restored when switching back from custom)
     saved_ollama_models: (String, String, String, String),
+    /// Cancellation flag for stopping in-progress generation
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl DockOckApp {
@@ -323,6 +328,7 @@ impl DockOckApp {
                 crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
                 crate::llm::DEFAULT_VISION_MODEL.to_string(),
             ),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -416,6 +422,7 @@ impl DockOckApp {
         self.state = AppState::Idle;
         self.progress = (0, 0);
         self.files_started = 0;
+        self.cancel_flag.store(false, Ordering::Relaxed);
         self.file_groups.clear();
         self.openspec_results.clear();
         if let Ok(mut ctx) = self.context.lock() {
@@ -607,6 +614,7 @@ impl DockOckApp {
 
         self.progress = (0, total_items);
         self.files_started = 0;
+        self.cancel_flag.store(false, Ordering::Relaxed);
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -633,6 +641,7 @@ impl DockOckApp {
         let cache = crate::cache::DiskCache::new(Some(&local_cache_root));
         let force_regenerate = self.force_regenerate;
         let backend = self.backend.clone();
+        let cancel_flag = Arc::clone(&self.cancel_flag);
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
@@ -641,7 +650,7 @@ impl DockOckApp {
                 gen_model, ext_model, rev_model, vis_model,
                 mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
-                cache, force_regenerate, tx,
+                cache, force_regenerate, tx, cancel_flag,
             ));
         });
     }
@@ -847,18 +856,33 @@ impl DockOckApp {
                 ProcessingEvent::Done(result) => {
                     match result {
                         Ok(()) => {
-                            self.log(LogLevel::Success, format!(
-                                "✅ All {} files processed successfully.",
-                                self.progress.1
-                            ));
+                            let failed = self.progress.1.saturating_sub(self.progress.0);
+                            if failed > 0 {
+                                self.log(LogLevel::Warning, format!(
+                                    "⚠ {}/{} items completed ({} failed).",
+                                    self.progress.0, self.progress.1, failed,
+                                ));
+                            } else {
+                                self.log(LogLevel::Success, format!(
+                                    "✅ All {} files processed successfully.",
+                                    self.progress.1
+                                ));
+                            }
                             self.auto_save_session();
                         }
                         Err(e) => {
-                            self.log(LogLevel::Error, format!("❌ Processing failed: {}", e));
+                            self.log(LogLevel::Error, format!("❌ Processing stopped: {}", e));
                             self.event_rx = None;
                             self.state = AppState::Done;
                         }
                     }
+                }
+                ProcessingEvent::ItemFailed(name) => {
+                    self.progress.0 += 1;
+                    self.log(LogLevel::Error, format!(
+                        "❌ Failed: {} ({}/{})",
+                        name, self.progress.0, self.progress.1,
+                    ));
                 }
                 ProcessingEvent::OpenSpecStarted => {
                     self.log(LogLevel::Info, "📦 Starting OpenSpec export phase…");
@@ -1163,9 +1187,8 @@ impl DockOckApp {
         if self.state == AppState::Processing && self.progress.1 > 0 {
             ui.add_space(4.0);
             let completed = self.progress.0 as f32;
-            let started = self.files_started.saturating_sub(self.progress.0) as f32;
             let total = self.progress.1 as f32;
-            let fraction = ((completed + started * 0.5) / total).clamp(0.0, 1.0);
+            let fraction = (completed / total).clamp(0.0, 1.0);
             let bar = egui::ProgressBar::new(fraction)
                 .text(format!("{}/{} items", self.progress.0, self.progress.1))
                 .animate(true);
@@ -1671,12 +1694,13 @@ impl DockOckApp {
             }
 
             if is_processing {
+                if ui.button("⏹ Stop").clicked() {
+                    self.cancel_flag.store(true, Ordering::Relaxed);
+                    self.log(LogLevel::Warning, "⏹ Cancellation requested…".to_string());
+                }
                 ui.spinner();
                 let pct = if self.progress.1 > 0 {
-                    let completed = self.progress.0 as f32;
-                    let started = self.files_started.saturating_sub(self.progress.0) as f32;
-                    let total = self.progress.1 as f32;
-                    ((completed + started * 0.5) / total * 100.0).clamp(0.0, 100.0) as u32
+                    (self.progress.0 as f32 / self.progress.1 as f32 * 100.0).clamp(0.0, 100.0) as u32
                 } else {
                     0
                 };
@@ -1839,6 +1863,7 @@ async fn process_files(
     cache: crate::cache::DiskCache,
     force_regenerate: bool,
     tx: Sender<ProcessingEvent>,
+    cancel_flag: Arc<AtomicBool>,
 ) {
     let total = files.len();
 
@@ -2035,6 +2060,12 @@ async fn process_files(
 
     // ── Dispatch group work items ──
     for group in &groups {
+        if cancel_flag.load(Ordering::Relaxed) {
+            let _ = tx.send(ProcessingEvent::Status("⏹ Cancelled by user.".to_string()));
+            let _ = tx.send(ProcessingEvent::Done(Err("Cancelled by user".to_string())));
+            let _ = tx.send(ProcessingEvent::OpenSpecDone(Err("Cancelled".to_string())));
+            return;
+        }
         // Collect parsed data for each member
         let mut members_data: Vec<(String, String, String, Vec<crate::parser::ExtractedImage>)> =
             Vec::new();
@@ -2062,9 +2093,11 @@ async fn process_files(
             let ctx = ctx_snapshot.clone();
             let gdocs = Arc::clone(&gherkin_docs);
             let force_regen = force_regenerate;
+            let cflag = Arc::clone(&cancel_flag);
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await;
+                if cflag.load(Ordering::Relaxed) { return; }
                 let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
                 let file_start = std::time::Instant::now();
 
@@ -2110,6 +2143,7 @@ async fn process_files(
                             "⚠ Pipeline error for {}: {}",
                             file_name, e
                         )));
+                        let _ = tx.send(ProcessingEvent::ItemFailed(file_name.clone()));
                     }
                 }
             });
@@ -2125,9 +2159,11 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
+        let cflag = Arc::clone(&cancel_flag);
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
+            if cflag.load(Ordering::Relaxed) { return; }
 
             // Use the first member path for FileStarted signal
             if let Some(first) = member_paths.first() {
@@ -2177,6 +2213,7 @@ async fn process_files(
                         "⚠ Pipeline error for group {}: {}",
                         group_name, e
                     )));
+                    let _ = tx.send(ProcessingEvent::ItemFailed(group_name.clone()));
                 }
             }
         });
@@ -2193,6 +2230,12 @@ async fn process_files(
         if grouped_paths.contains(path) {
             continue;
         }
+        if cancel_flag.load(Ordering::Relaxed) {
+            let _ = tx.send(ProcessingEvent::Status("⏹ Cancelled by user.".to_string()));
+            let _ = tx.send(ProcessingEvent::Done(Err("Cancelled by user".to_string())));
+            let _ = tx.send(ProcessingEvent::OpenSpecDone(Err("Cancelled".to_string())));
+            return;
+        }
 
         let path = path.clone();
         let file_type = file_type.clone();
@@ -2204,6 +2247,7 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
+        let cflag = Arc::clone(&cancel_flag);
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2211,6 +2255,7 @@ async fn process_files(
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
+            if cflag.load(Ordering::Relaxed) { return; }
             let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
             let _ = tx.send(ProcessingEvent::Status(format!(
                 "🚀 Starting pipeline for {}…", file_name
@@ -2259,6 +2304,7 @@ async fn process_files(
                         "⚠ Pipeline error for {}: {}",
                         file_name, e
                     )));
+                    let _ = tx.send(ProcessingEvent::ItemFailed(file_name.clone()));
                 }
             }
         });
