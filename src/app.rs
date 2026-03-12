@@ -1092,7 +1092,7 @@ impl DockOckApp {
                     }
                 });
             ui.label("∥");
-            ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=8).speed(0.1))
+            ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0.1))
                 .on_hover_text("Max concurrent LLM tasks");
         });
     }
