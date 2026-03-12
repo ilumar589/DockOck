@@ -8,8 +8,8 @@ use serde::Deserialize;
 // Provider backend enum
 // ─────────────────────────────────────────────
 
-/// Which LLM backend to use for text generation roles (generator, extractor, reviewer).
-/// Vision always stays local (Ollama).
+/// Which LLM backend to use for LLM roles (generator, extractor, reviewer, vision).
+/// When using a Custom backend, vision can also run through the cloud API.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ProviderBackend {
     /// Local Ollama Docker instances (default).
@@ -73,6 +73,7 @@ pub struct RoleDefaults {
     pub generator: Option<String>,
     pub extractor: Option<String>,
     pub reviewer: Option<String>,
+    pub vision: Option<String>,
 }
 
 /// Model info including display name and limits.
@@ -105,6 +106,7 @@ struct JsonDefaults {
     generator: Option<String>,
     extractor: Option<String>,
     reviewer: Option<String>,
+    vision: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -174,6 +176,7 @@ pub fn load_custom_providers(dir: &Path) -> Vec<CustomProviderConfig> {
                     generator: defaults.generator,
                     extractor: defaults.extractor,
                     reviewer: defaults.reviewer,
+                    vision: defaults.vision,
                 },
             }
         })
@@ -215,6 +218,11 @@ pub fn custom_model_limits<'a>(configs: &'a [CustomProviderConfig], model_id: &s
         }
     }
     None
+}
+
+/// Return the default vision model ID for the first custom provider, if configured.
+pub fn custom_vision_default(configs: &[CustomProviderConfig]) -> Option<String> {
+    configs.first().and_then(|c| c.defaults.vision.clone())
 }
 
 /// Return a sorted list of model IDs for the first custom provider.

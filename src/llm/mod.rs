@@ -270,6 +270,22 @@ struct OllamaGenerateResponse {
     response: String,
 }
 
+/// Response from OpenAI-compatible `/chat/completions` endpoint.
+#[derive(serde::Deserialize)]
+struct OpenAIChatResponse {
+    choices: Vec<OpenAIChatChoice>,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAIChatChoice {
+    message: OpenAIChatMessage,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAIChatMessage {
+    content: String,
+}
+
 // ─────────────────────────────────────────────
 // Client creation
 // ─────────────────────────────────────────────
@@ -295,6 +311,9 @@ pub struct AgentOrchestrator {
     /// OpenAI-compatible client (present when backend is Custom)
     openai_client: Option<openai::CompletionsClient>,
     vision_endpoint_url: String,
+    /// Cloud vision base URL + API key (present when backend is Custom)
+    cloud_vision_base_url: Option<String>,
+    cloud_vision_api_key: Option<String>,
     generator_model: String,
     extractor_model: String,
     reviewer_model: String,
@@ -410,6 +429,8 @@ impl AgentOrchestrator {
                         reviewer_client,
                         openai_client: None,
                         vision_endpoint_url,
+                        cloud_vision_base_url: None,
+                        cloud_vision_api_key: None,
                         generator_model: generator_model.to_string(),
                         extractor_model: extractor_model.to_string(),
                         reviewer_model: reviewer_model.to_string(),
@@ -434,24 +455,31 @@ impl AgentOrchestrator {
                     .build()
                     .with_context(|| format!("Failed to create OpenAI-compatible client for {}", name))?;
 
-                // Only probe the local vision endpoint
+                // Cloud vision is available via the same API
+                let cloud_vision_base_url = Some(base_url.clone());
+                let cloud_vision_api_key = Some(api_key.clone());
+
+                // Probe local vision endpoint as optional fallback
                 let vis_ok = check_endpoint(&ENDPOINT_VISION).await;
                 statuses.push(EndpointStatus {
                     name: "Cloud API",
                     url: Box::leak(base_url.clone().into_boxed_str()),
                     reachable: true, // assume cloud is reachable; errors surface at call time
                 });
-                statuses.push(EndpointStatus {
-                    name: ENDPOINT_VISION.name,
-                    url: ENDPOINT_VISION.url,
-                    reachable: vis_ok,
-                });
+                if vis_ok {
+                    statuses.push(EndpointStatus {
+                        name: ENDPOINT_VISION.name,
+                        url: ENDPOINT_VISION.url,
+                        reachable: true,
+                    });
+                }
 
+                // Local Ollama vision URL — still used if model is a local Ollama model
                 let vision_endpoint_url = if vis_ok {
-                    info!("Vision agent available at {}", ENDPOINT_VISION.url);
+                    info!("Local vision agent available at {}", ENDPOINT_VISION.url);
                     ENDPOINT_VISION.url.to_string()
                 } else {
-                    warn!("Vision instance not available — image enrichment will be skipped");
+                    info!("Local vision not available — using cloud vision via {name}");
                     String::new()
                 };
 
@@ -463,6 +491,8 @@ impl AgentOrchestrator {
                         reviewer_client: None,
                         openai_client: Some(openai_client),
                         vision_endpoint_url,
+                        cloud_vision_base_url,
+                        cloud_vision_api_key,
                         generator_model: generator_model.to_string(),
                         extractor_model: extractor_model.to_string(),
                         reviewer_model: reviewer_model.to_string(),
@@ -1408,7 +1438,8 @@ impl AgentOrchestrator {
         }
     }
 
-    /// Describe a single image using the vision model via Ollama's raw HTTP API.
+    /// Describe a single image using the vision model.
+    /// Routes to cloud (OpenAI-compatible) or local (Ollama) based on backend.
     /// Results are cached by image content hash + model name.
     async fn describe_image(
         &self,
@@ -1423,8 +1454,75 @@ impl AgentOrchestrator {
             return Ok(cached);
         }
 
-        let endpoint_url = &self.vision_endpoint_url;
+        let description = if let (Some(base_url), Some(api_key)) =
+            (&self.cloud_vision_base_url, &self.cloud_vision_api_key)
+        {
+            self.describe_image_cloud(image, base_url, api_key).await?
+        } else {
+            self.describe_image_ollama(image).await?
+        };
 
+        // Store in cache
+        self.cache.put_text(crate::cache::NS_VISION, &cache_key, &description);
+
+        Ok(description)
+    }
+
+    /// Describe an image via an OpenAI-compatible chat completions endpoint.
+    /// Sends the image as a base64 data URI in a multimodal user message.
+    async fn describe_image_cloud(
+        &self,
+        image: &crate::parser::ExtractedImage,
+        base_url: &str,
+        api_key: &str,
+    ) -> Result<String> {
+        let b64 = BASE64_STANDARD.encode(&image.data);
+        let content_type = if image.content_type.is_empty() {
+            "image/png"
+        } else {
+            &image.content_type
+        };
+        let data_uri = format!("data:{};base64,{}", content_type, b64);
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{}/chat/completions", base_url))
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": self.vision_model,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        { "type": "text", "text": VISION_DESCRIBE_PROMPT },
+                        { "type": "image_url", "image_url": { "url": data_uri } }
+                    ]
+                }],
+                "max_tokens": 1024
+            }))
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .with_context(|| format!("Cloud vision API request failed for {}", image.label))?;
+
+        let body: OpenAIChatResponse = resp
+            .json()
+            .await
+            .with_context(|| "Failed to parse cloud vision response")?;
+
+        body.choices
+            .into_iter()
+            .next()
+            .map(|c| c.message.content)
+            .ok_or_else(|| anyhow::anyhow!("Cloud vision returned no choices for {}", image.label))
+    }
+
+    /// Describe an image via the local Ollama `/api/generate` endpoint.
+    async fn describe_image_ollama(
+        &self,
+        image: &crate::parser::ExtractedImage,
+    ) -> Result<String> {
+        let endpoint_url = &self.vision_endpoint_url;
         let b64 = BASE64_STANDARD.encode(&image.data);
 
         let client = reqwest::Client::new();
@@ -1445,9 +1543,6 @@ impl AgentOrchestrator {
             .json()
             .await
             .with_context(|| "Failed to parse vision model response")?;
-
-        // Store in cache
-        self.cache.put_text(crate::cache::NS_VISION, &cache_key, &body.response);
 
         Ok(body.response)
     }

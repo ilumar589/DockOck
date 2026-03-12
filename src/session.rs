@@ -32,7 +32,6 @@ pub struct SessionData {
     pub extractor_model: String,
     pub reviewer_model: String,
     pub vision_model: String,
-    pub embedding_model: String,
     pub pipeline_mode: crate::llm::PipelineMode,
     pub max_concurrent: usize,
     pub output_dir: Option<PathBuf>,
