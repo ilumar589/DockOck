@@ -18,6 +18,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
@@ -142,6 +143,8 @@ pub enum ProcessingEvent {
     },
     /// All files have been processed (or an error terminated the run)
     Done(Result<(), String>),
+    /// A single item (file or group) failed — still counts toward progress
+    ItemFailed { name: String, path: Option<PathBuf> },
     /// OpenSpec export started
     OpenSpecStarted,
     /// OpenSpec export completed for one document
@@ -259,6 +262,12 @@ pub struct DockOckApp {
     custom_providers: Vec<crate::llm::CustomProviderConfig>,
     /// Saved Ollama model selections (restored when switching back from custom)
     saved_ollama_models: (String, String, String, String),
+    /// Cancellation flag for stopping in-progress generation
+    cancel_flag: Arc<AtomicBool>,
+    /// File paths that failed processing (LLM or parse errors)
+    failed_items: std::collections::HashSet<PathBuf>,
+    /// Group names that failed processing
+    failed_groups: std::collections::HashSet<String>,
 }
 
 impl DockOckApp {
@@ -323,6 +332,9 @@ impl DockOckApp {
                 crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
                 crate::llm::DEFAULT_VISION_MODEL.to_string(),
             ),
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            failed_items: std::collections::HashSet::new(),
+            failed_groups: std::collections::HashSet::new(),
         }
     }
 
@@ -416,6 +428,7 @@ impl DockOckApp {
         self.state = AppState::Idle;
         self.progress = (0, 0);
         self.files_started = 0;
+        self.cancel_flag.store(false, Ordering::Relaxed);
         self.file_groups.clear();
         self.openspec_results.clear();
         if let Ok(mut ctx) = self.context.lock() {
@@ -607,6 +620,7 @@ impl DockOckApp {
 
         self.progress = (0, total_items);
         self.files_started = 0;
+        self.cancel_flag.store(false, Ordering::Relaxed);
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -633,6 +647,7 @@ impl DockOckApp {
         let cache = crate::cache::DiskCache::new(Some(&local_cache_root));
         let force_regenerate = self.force_regenerate;
         let backend = self.backend.clone();
+        let cancel_flag = Arc::clone(&self.cancel_flag);
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
@@ -641,7 +656,7 @@ impl DockOckApp {
                 gen_model, ext_model, rev_model, vis_model,
                 mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
-                cache, force_regenerate, tx,
+                cache, force_regenerate, tx, cancel_flag,
             ));
         });
     }
@@ -847,18 +862,38 @@ impl DockOckApp {
                 ProcessingEvent::Done(result) => {
                     match result {
                         Ok(()) => {
-                            self.log(LogLevel::Success, format!(
-                                "✅ All {} files processed successfully.",
-                                self.progress.1
-                            ));
+                            let failed = self.progress.1.saturating_sub(self.progress.0);
+                            if failed > 0 {
+                                self.log(LogLevel::Warning, format!(
+                                    "⚠ {}/{} items completed ({} failed).",
+                                    self.progress.0, self.progress.1, failed,
+                                ));
+                            } else {
+                                self.log(LogLevel::Success, format!(
+                                    "✅ All {} files processed successfully.",
+                                    self.progress.1
+                                ));
+                            }
                             self.auto_save_session();
                         }
                         Err(e) => {
-                            self.log(LogLevel::Error, format!("❌ Processing failed: {}", e));
+                            self.log(LogLevel::Error, format!("❌ Processing stopped: {}", e));
                             self.event_rx = None;
                             self.state = AppState::Done;
                         }
                     }
+                }
+                ProcessingEvent::ItemFailed { name, path } => {
+                    self.progress.0 += 1;
+                    if let Some(p) = path {
+                        self.failed_items.insert(p);
+                    } else {
+                        self.failed_groups.insert(name.clone());
+                    }
+                    self.log(LogLevel::Error, format!(
+                        "❌ Failed: {} ({}/{})",
+                        name, self.progress.0, self.progress.1,
+                    ));
                 }
                 ProcessingEvent::OpenSpecStarted => {
                     self.log(LogLevel::Info, "📦 Starting OpenSpec export phase…");
@@ -1092,7 +1127,7 @@ impl DockOckApp {
                     }
                 });
             ui.label("∥");
-            ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0.1))
+            ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0).max_decimals(0).update_while_editing(false))
                 .on_hover_text("Max concurrent LLM tasks");
         });
     }
@@ -1163,9 +1198,8 @@ impl DockOckApp {
         if self.state == AppState::Processing && self.progress.1 > 0 {
             ui.add_space(4.0);
             let completed = self.progress.0 as f32;
-            let started = self.files_started.saturating_sub(self.progress.0) as f32;
             let total = self.progress.1 as f32;
-            let fraction = ((completed + started * 0.5) / total).clamp(0.0, 1.0);
+            let fraction = (completed / total).clamp(0.0, 1.0);
             let bar = egui::ProgressBar::new(fraction)
                 .text(format!("{}/{} items", self.progress.0, self.progress.1))
                 .animate(true);
@@ -1192,6 +1226,7 @@ impl DockOckApp {
                 for (gi, group) in self.file_groups.iter().enumerate() {
                     let group_selected = self.selection == Some(Selection::Group(group.name.clone()));
                     let has_group_result = self.group_results.contains_key(&group.name);
+                    let has_group_failed = self.failed_groups.contains(&group.name);
 
                     let header_label = if has_group_result {
                         if let Some(dur) = self.group_elapsed_times.get(&group.name) {
@@ -1205,6 +1240,8 @@ impl DockOckApp {
                         } else {
                             format!("✓ 📎 {} ({} files)", group.name, group.members.len())
                         }
+                    } else if has_group_failed {
+                        format!("✖ 📎 {} ({} files) — failed", group.name, group.members.len())
                     } else {
                         format!("📎 {} ({} files)", group.name, group.members.len())
                     };
@@ -1235,6 +1272,16 @@ impl DockOckApp {
                                 if let Some(ref et) = elapsed_text {
                                     ui.label(egui::RichText::new(et).color(egui::Color32::from_rgb(130, 130, 130)).small());
                                 }
+                                r
+                            }).inner
+                        } else if has_group_failed {
+                            let cross = egui::RichText::new("✖ ").color(egui::Color32::from_rgb(220, 80, 80)).strong();
+                            let title = egui::RichText::new(format!("📎 {} ({} files)", group.name, group.members.len()))
+                                .color(egui::Color32::from_rgb(220, 160, 160));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                let r = ui.selectable_label(group_selected, cross);
+                                ui.label(title);
                                 r
                             }).inner
                         } else {
@@ -1312,6 +1359,7 @@ impl DockOckApp {
                         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
                     let has_result = self.results.contains_key(path);
+                    let has_failed = self.failed_items.contains(path);
                     let selected = self.selection == Some(Selection::File(i));
 
                     let resp = if has_result {
@@ -1333,6 +1381,16 @@ impl DockOckApp {
                             if let Some(ref et) = elapsed_text {
                                 ui.label(egui::RichText::new(et).color(egui::Color32::from_rgb(130, 130, 130)).small());
                             }
+                            r
+                        }).inner
+                    } else if has_failed {
+                        let cross = egui::RichText::new("✖ ").color(egui::Color32::from_rgb(220, 80, 80)).strong();
+                        let file_name = egui::RichText::new(&name)
+                            .color(egui::Color32::from_rgb(220, 160, 160));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let r = ui.selectable_label(selected, cross);
+                            ui.label(file_name);
                             r
                         }).inner
                     } else {
@@ -1671,12 +1729,13 @@ impl DockOckApp {
             }
 
             if is_processing {
+                if ui.button("⏹ Stop").clicked() {
+                    self.cancel_flag.store(true, Ordering::Relaxed);
+                    self.log(LogLevel::Warning, "⏹ Cancellation requested…".to_string());
+                }
                 ui.spinner();
                 let pct = if self.progress.1 > 0 {
-                    let completed = self.progress.0 as f32;
-                    let started = self.files_started.saturating_sub(self.progress.0) as f32;
-                    let total = self.progress.1 as f32;
-                    ((completed + started * 0.5) / total * 100.0).clamp(0.0, 100.0) as u32
+                    (self.progress.0 as f32 / self.progress.1 as f32 * 100.0).clamp(0.0, 100.0) as u32
                 } else {
                     0
                 };
@@ -1839,6 +1898,7 @@ async fn process_files(
     cache: crate::cache::DiskCache,
     force_regenerate: bool,
     tx: Sender<ProcessingEvent>,
+    cancel_flag: Arc<AtomicBool>,
 ) {
     let total = files.len();
 
@@ -1971,6 +2031,23 @@ async fn process_files(
         total
     )));
 
+    // ── Send ItemFailed for files that failed parsing ──
+    {
+        let grouped_for_fail: std::collections::HashSet<PathBuf> = groups
+            .iter()
+            .flat_map(|g| g.members.iter().cloned())
+            .collect();
+        for path in &files {
+            if !parsed_map.contains_key(path) && !grouped_for_fail.contains(path) {
+                let name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let _ = tx.send(ProcessingEvent::ItemFailed { name: name.clone(), path: Some(path.clone()) });
+                let _ = tx.send(ProcessingEvent::Status(format!("⚠ Skipped {} (parse failure)", name)));
+            }
+        }
+    }
+
     // ── Phase 1.25: Extract entity glossary from all parsed content ──
     {
         if let Ok(mut ctx) = context.lock() {
@@ -2035,6 +2112,12 @@ async fn process_files(
 
     // ── Dispatch group work items ──
     for group in &groups {
+        if cancel_flag.load(Ordering::Relaxed) {
+            let _ = tx.send(ProcessingEvent::Status("⏹ Cancelled by user.".to_string()));
+            let _ = tx.send(ProcessingEvent::Done(Err("Cancelled by user".to_string())));
+            let _ = tx.send(ProcessingEvent::OpenSpecDone(Err("Cancelled".to_string())));
+            return;
+        }
         // Collect parsed data for each member
         let mut members_data: Vec<(String, String, String, Vec<crate::parser::ExtractedImage>)> =
             Vec::new();
@@ -2049,6 +2132,8 @@ async fn process_files(
         }
 
         if members_data.is_empty() {
+            let _ = tx.send(ProcessingEvent::ItemFailed { name: group.name.clone(), path: None });
+            let _ = tx.send(ProcessingEvent::Status(format!("⚠ Skipped group {} (all members failed to parse)", group.name)));
             continue;
         }
 
@@ -2062,9 +2147,11 @@ async fn process_files(
             let ctx = ctx_snapshot.clone();
             let gdocs = Arc::clone(&gherkin_docs);
             let force_regen = force_regenerate;
+            let cflag = Arc::clone(&cancel_flag);
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await;
+                if cflag.load(Ordering::Relaxed) { return; }
                 let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
                 let file_start = std::time::Instant::now();
 
@@ -2110,6 +2197,7 @@ async fn process_files(
                             "⚠ Pipeline error for {}: {}",
                             file_name, e
                         )));
+                        let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(member_path.clone()) });
                     }
                 }
             });
@@ -2125,9 +2213,11 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
+        let cflag = Arc::clone(&cancel_flag);
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
+            if cflag.load(Ordering::Relaxed) { return; }
 
             // Use the first member path for FileStarted signal
             if let Some(first) = member_paths.first() {
@@ -2177,6 +2267,7 @@ async fn process_files(
                         "⚠ Pipeline error for group {}: {}",
                         group_name, e
                     )));
+                    let _ = tx.send(ProcessingEvent::ItemFailed { name: group_name.clone(), path: None });
                 }
             }
         });
@@ -2193,6 +2284,12 @@ async fn process_files(
         if grouped_paths.contains(path) {
             continue;
         }
+        if cancel_flag.load(Ordering::Relaxed) {
+            let _ = tx.send(ProcessingEvent::Status("⏹ Cancelled by user.".to_string()));
+            let _ = tx.send(ProcessingEvent::Done(Err("Cancelled by user".to_string())));
+            let _ = tx.send(ProcessingEvent::OpenSpecDone(Err("Cancelled".to_string())));
+            return;
+        }
 
         let path = path.clone();
         let file_type = file_type.clone();
@@ -2204,6 +2301,7 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
+        let cflag = Arc::clone(&cancel_flag);
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2211,6 +2309,7 @@ async fn process_files(
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await;
+            if cflag.load(Ordering::Relaxed) { return; }
             let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
             let _ = tx.send(ProcessingEvent::Status(format!(
                 "🚀 Starting pipeline for {}…", file_name
@@ -2259,6 +2358,7 @@ async fn process_files(
                         "⚠ Pipeline error for {}: {}",
                         file_name, e
                     )));
+                    let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(path.clone()) });
                 }
             }
         });
