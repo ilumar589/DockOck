@@ -179,9 +179,7 @@ pub struct RagEngine {
 }
 
 /// SurrealQL schema migration run on startup.
-/// The HNSW dimension is set based on the embedding backend:
-/// - Ollama `nomic-embed-text`: 768 dimensions
-/// - Cloud embedding models: typically 1024 or 2048 dimensions
+/// Uses OVERWRITE on the HNSW index so dimension changes are applied cleanly.
 fn schema_sql(dim: usize) -> String {
     format!(r#"
 DEFINE TABLE IF NOT EXISTS chunks SCHEMAFULL;
@@ -191,7 +189,7 @@ DEFINE FIELD IF NOT EXISTS text        ON chunks TYPE string;
 DEFINE FIELD IF NOT EXISTS offset      ON chunks TYPE int;
 DEFINE FIELD IF NOT EXISTS chunk_index ON chunks TYPE int;
 DEFINE FIELD IF NOT EXISTS embedding   ON chunks TYPE array<float>;
-DEFINE INDEX IF NOT EXISTS idx_chunks_embedding ON chunks
+DEFINE INDEX idx_chunks_embedding ON chunks
     FIELDS embedding HNSW DIMENSION {dim} DIST COSINE;
 DEFINE INDEX IF NOT EXISTS idx_chunks_file ON chunks FIELDS file_name;
 "#)
@@ -228,9 +226,50 @@ impl RagEngine {
         db.use_ns("dockock").use_db("rag").await
             .context("Failed to select SurrealDB namespace/database")?;
 
-        // Run schema migration with the correct embedding dimension
-        db.query(&schema_sql(embed_dim)).await
+        // Ensure the HNSW index matches the current embedding dimension.
+        // We store the active dimension in a tiny `meta` table.  If it differs
+        // from `embed_dim`, all chunks must be wiped because their vectors are
+        // incompatible with the new dimension.
+        db.query("DEFINE TABLE IF NOT EXISTS meta SCHEMAFULL; \
+                   DEFINE FIELD IF NOT EXISTS key ON meta TYPE string; \
+                   DEFINE FIELD IF NOT EXISTS val ON meta TYPE int")
+            .await
+            .context("Failed to define meta table")?;
+
+        #[derive(Debug, Deserialize)]
+        struct MetaRow { val: usize }
+
+        let mut meta_res = db
+            .query("SELECT val FROM meta WHERE key = 'embed_dim' LIMIT 1")
+            .await
+            .context("Failed to query meta")?;
+        let stored_dim: Option<MetaRow> = meta_res.take::<Vec<MetaRow>>(0)
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+
+        if stored_dim.as_ref().map(|m| m.val) != Some(embed_dim) {
+            info!(
+                "SurrealDB: embedding dimension changed ({} → {}) — wiping stale data",
+                stored_dim.map(|m| m.val).unwrap_or(0),
+                embed_dim,
+            );
+            db.query("DELETE chunks").await.context("Failed to wipe stale chunks")?;
+            db.query("REMOVE INDEX IF EXISTS idx_chunks_embedding ON chunks")
+                .await
+                .context("Failed to remove stale HNSW index")?;
+        }
+
+        db.query(&schema_sql(embed_dim))
+            .await
             .context("Failed to run SurrealDB schema migration")?;
+
+        // Persist the current dimension
+        db.query("DELETE meta WHERE key = 'embed_dim'; \
+                   CREATE meta SET key = 'embed_dim', val = $dim")
+            .bind(("dim", embed_dim as i64))
+            .await
+            .context("Failed to persist embed_dim in meta")?;
 
         // Count existing chunks (from a previous run if persistent)
         let mut result = db.query("SELECT count() AS c FROM chunks GROUP ALL")
@@ -365,6 +404,8 @@ impl RagEngine {
         // Batch-insert all chunks into SurrealDB via a single query
         let count = chunks.len();
         for (chunk, emb) in chunks.into_iter().zip(embeddings.into_iter()) {
+            let cname = chunk.file_name.clone();
+            let cidx = chunk.chunk_index;
             let row = ChunkInsert {
                 file_name: chunk.file_name,
                 file_type: chunk.file_type,
@@ -377,7 +418,10 @@ impl RagEngine {
                 .create::<Option<serde_json::Value>>("chunks")
                 .content(row)
                 .await
-                .context("Failed to insert chunk into SurrealDB")?;
+                .with_context(|| format!(
+                    "Failed to insert chunk {} of '{}' into SurrealDB",
+                    cidx, cname,
+                ))?;
         }
 
         self.chunk_count += count;
