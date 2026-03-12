@@ -1206,7 +1206,30 @@ impl DockOckApp {
                         true,
                     )
                     .show_header(ui, |ui| {
-                        let resp = ui.selectable_label(group_selected, &header_label);
+                        let resp = if has_group_result {
+                            let elapsed_text = self.group_elapsed_times.get(&group.name).map(|dur| {
+                                let secs = dur.as_secs_f64();
+                                if secs >= 60.0 {
+                                    format!("  {:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                                } else {
+                                    format!("  {:.1}s", secs)
+                                }
+                            });
+                            let job = egui::RichText::new("✔ ").color(egui::Color32::from_rgb(80, 200, 120)).strong();
+                            let title = egui::RichText::new(format!("📎 {} ({} files)", group.name, group.members.len()))
+                                .color(egui::Color32::from_rgb(180, 220, 180));
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                let r = ui.selectable_label(group_selected, job);
+                                ui.label(title);
+                                if let Some(ref et) = elapsed_text {
+                                    ui.label(egui::RichText::new(et).color(egui::Color32::from_rgb(130, 130, 130)).small());
+                                }
+                                r
+                            }).inner
+                        } else {
+                            ui.selectable_label(group_selected, &header_label)
+                        };
                         if resp.clicked() {
                             self.selection = Some(Selection::Group(group.name.clone()));
                         }
@@ -1279,26 +1302,33 @@ impl DockOckApp {
                         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
                     let has_result = self.results.contains_key(path);
-                    let label = if has_result {
-                        if let Some(dur) = self.elapsed_times.get(path) {
-                            let secs = dur.as_secs_f64();
-                            let elapsed_str = if secs >= 60.0 {
-                                format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
-                            } else {
-                                format!("{:.1}s", secs)
-                            };
-                            format!("✓ {} ({})", name, elapsed_str)
-                        } else {
-                            format!("✓ {}", name)
-                        }
-                    } else {
-                        name.clone()
-                    };
-
                     let selected = self.selection == Some(Selection::File(i));
-                    let resp = ui
-                        .selectable_label(selected, &label)
-                        .on_hover_text(path.to_string_lossy().as_ref());
+
+                    let resp = if has_result {
+                        let elapsed_text = self.elapsed_times.get(path).map(|dur| {
+                            let secs = dur.as_secs_f64();
+                            if secs >= 60.0 {
+                                format!("  {:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                            } else {
+                                format!("  {:.1}s", secs)
+                            }
+                        });
+                        let check = egui::RichText::new("✔ ").color(egui::Color32::from_rgb(80, 200, 120)).strong();
+                        let file_name = egui::RichText::new(&name)
+                            .color(egui::Color32::from_rgb(180, 220, 180));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            let r = ui.selectable_label(selected, check);
+                            ui.label(file_name);
+                            if let Some(ref et) = elapsed_text {
+                                ui.label(egui::RichText::new(et).color(egui::Color32::from_rgb(130, 130, 130)).small());
+                            }
+                            r
+                        }).inner
+                    } else {
+                        ui.selectable_label(selected, &name)
+                    }
+                    .on_hover_text(path.to_string_lossy().as_ref());
 
                     if resp.clicked() {
                         self.selection = Some(Selection::File(i));
