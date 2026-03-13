@@ -187,9 +187,16 @@ Rules:
 1. Identify the key actors, systems, data entities, and processes described.
 2. List preconditions and postconditions for each process.
 3. Capture business rules and validation logic.
-4. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES.
-5. Be concise — no more than 300 words.
-6. Do not add conversational prose."#;
+4. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES, IMAGE_CONTENT.
+5. Be concise — no more than 500 words.
+6. Do not add conversational prose.
+7. If the input contains an "=== Embedded Image Descriptions ===" section, you MUST include a
+   dedicated IMAGE_CONTENT section in your summary that preserves:
+   - XML/data structure hierarchies (element names, nesting, attributes) exactly as described
+   - All diagram flows, decision points, and entity relationships
+   - All reviewer/sidebar comments with author names and their full text
+   - All cross-references to other documents
+   Image-derived information is business-critical and must NOT be summarized away or omitted."#;
 
 pub const GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 Your task is to read a structured document summary and produce well-structured Gherkin
@@ -201,7 +208,12 @@ Rules:
 3. Use concrete, business-readable language in steps.
 4. Where cross-file context is provided, reference other components or actors correctly.
 5. Do not add explanatory prose outside the Gherkin block.
-6. Always end with a blank line after the last Scenario."#;
+6. Always end with a blank line after the last Scenario.
+7. If the input contains an "=== Embedded Image Descriptions ===" section, treat every
+   image description as a first-class source of business requirements. Generate dedicated
+   Scenarios for data structures (e.g. XML schemas), process flows, entity relationships,
+   reviewer comments, and any business rules visible in those images. Do NOT ignore or
+   skip image-derived content — it is equally important as the document text."#;
 
 const REVIEWER_PREAMBLE: &str = r#"You are a Gherkin quality reviewer.
 Your task is to review and improve a Gherkin Feature document.
@@ -224,9 +236,12 @@ Rules:
 2. List preconditions and postconditions for each process.
 3. Capture business rules and validation logic from every document.
 4. Merge overlapping information — do not repeat the same fact from different documents.
-5. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES.
-6. Be concise — no more than 500 words.
-7. Do not add conversational prose."#;
+5. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES, IMAGE_CONTENT.
+6. Be concise — no more than 800 words.
+7. Do not add conversational prose.
+8. If the input contains "=== Embedded Image Descriptions ===" sections, you MUST include a
+   dedicated IMAGE_CONTENT section that preserves XML/data structure hierarchies, diagram flows,
+   reviewer comments (with author names), and cross-references. Image content is business-critical."#;
 
 const GROUP_GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 You will receive a structured summary synthesised from MULTIPLE related documents that
@@ -240,16 +255,35 @@ Rules:
 4. Use concrete, business-readable language in steps.
 5. Where cross-file context is provided, reference other components or actors correctly.
 6. Do not add explanatory prose outside the Gherkin block.
-7. Always end with a blank line after the last Scenario."#;
+7. Always end with a blank line after the last Scenario.
+8. If the input contains an "=== Embedded Image Descriptions ===" section, treat every
+   image description as a first-class source of business requirements. Generate dedicated
+   Scenarios for data structures (e.g. XML schemas), process flows, entity relationships,
+   reviewer comments, and any business rules visible in those images. Do NOT ignore or
+   skip image-derived content — it is equally important as the document text."#;
 
 const VISION_DESCRIBE_PROMPT: &str = "\
-Describe this image in detail for a business analyst. Focus on:
-- Any text, labels, or annotations visible
-- Diagram type (flowchart, architecture, sequence, ER diagram, etc.)
-- Process flows and connections between elements
-- Tables, forms, or structured data
-- UI wireframes or screenshots
-Be concise but capture all business-relevant information. Output plain text only.";
+IMPORTANT: Every image in this document carries business-critical information that MUST be \
+reflected in downstream Gherkin test scenarios. Your description must be detailed enough for \
+another AI to generate complete, accurate Gherkin Feature files from it.
+\
+Describe this image in full detail for a business analyst. Focus on:
+- Any text, labels, or annotations visible — transcribe them exactly
+- Diagram type (flowchart, architecture, sequence, ER diagram, XML schema, etc.)
+- Process flows and connections between elements — describe every path and decision point
+- Tables, forms, or structured data — reproduce column headers and key data
+- UI wireframes or screenshots — describe every field, button, and interaction
+- XML or data structures: reproduce the element hierarchy verbatim (tag names, nesting, attributes)
+- Sidebar comments, review notes, or annotations: transcribe each one with the author name and full text
+- Info boxes, callouts, or warnings: reproduce their exact text content
+- Section headings and numbering: preserve the document structure (e.g. 2.2.1, 2.2.2)
+- Cross-references to other documents (e.g. 'Cf. D018 - LNA - CommonTypes')
+- Business rules, constraints, or validation logic implied by the image
+- Entity relationships and data dependencies
+\
+Capture ALL information thoroughly — nothing in the image is decorative. \
+Every element represents a business rule, data structure, or process that must \
+be testable. Do not summarize or omit structural details. Output plain text only.";
 
 const MERGE_REVIEWER_PREAMBLE: &str = r#"You are a Gherkin merge specialist.
 You will receive Gherkin output generated from multiple overlapping sections of the same document.
@@ -1578,7 +1612,7 @@ impl AgentOrchestrator {
                         { "type": "image_url", "image_url": { "url": data_uri } }
                     ]
                 }],
-                "max_tokens": 1024
+                "max_tokens": 4096
             }))
             .timeout(std::time::Duration::from_secs(120))
             .send()
@@ -1762,6 +1796,16 @@ fn score_line(line: &str) -> u32 {
     // Bullet / list items
     if line.starts_with('-') || line.starts_with('*') || line.starts_with("•") {
         score += 3;
+    }
+
+    // Image description markers and content — always retain
+    if lower.contains("=== embedded image descriptions ===")
+        || lower.starts_with("[image ")
+        || lower.contains("<inspection") || lower.contains("</inspection")
+        || lower.contains("xml schema") || lower.contains("xml structure")
+        || lower.contains("xmlns")
+    {
+        score += 15;
     }
 
     // Very short lines are usually noise / blank separators — penalise
