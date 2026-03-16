@@ -16,6 +16,7 @@ use std::path::Path;
 use super::{ExtractedImage, ParseResult, is_vision_compatible, mime_from_extension};
 
 /// Extract all readable text, connections, and embedded images from a `.vsdx` file.
+#[tracing::instrument(name = "parser.visio", skip(path), fields(file_name = %path.display()))]
 pub fn parse(path: &Path) -> Result<ParseResult> {
     let data = std::fs::read(path)
         .with_context(|| format!("Failed to read file: {}", path.display()))?;

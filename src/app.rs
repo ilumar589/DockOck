@@ -2160,9 +2160,114 @@ async fn process_files(
         .flat_map(|g| g.members.iter().cloned())
         .collect();
 
-    // ── Phase 1.3: RAG disabled ──
-    // RAG cross-file context has been removed to avoid runtime hangs.
-    // The pipeline uses excerpt-based context instead.
+    // ── Phase 1.3: RAG index build ──
+    // Connect to MongoDB and build the semantic RAG index from all parsed file chunks.
+    // Falls back to excerpt-based context if MongoDB is unreachable or embedding fails.
+    let rag_state: Option<(crate::rag::EmbeddingProvider, mongodb::Client)> = 'rag: {
+        let _ = tx.send(ProcessingEvent::Status(
+            "🔗 Connecting to MongoDB for RAG index…".to_string(),
+        ));
+        let mongo_client = match crate::rag::connect_mongo("mongodb://localhost:27017").await {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "⚠ MongoDB unavailable — using excerpt-based context. ({})", e
+                )));
+                break 'rag None;
+            }
+        };
+
+        // Determine embedding provider: try Ollama first, then FastEmbed
+        let embedding_provider = {
+            // Check if the extractor Ollama instance has nomic-embed-text available
+            let ollama_url = match &backend {
+                crate::llm::ProviderBackend::Ollama => "http://localhost:11435".to_string(),
+                crate::llm::ProviderBackend::Custom { .. } => "http://localhost:11435".to_string(),
+            };
+            let ollama_client = rig::providers::ollama::Client::builder()
+                .api_key(rig::client::Nothing)
+                .base_url(&ollama_url)
+                .build()
+                .unwrap();
+            // Try a small test embed to verify Ollama embeddings work
+            let test_result = {
+                use rig::client::EmbeddingsClient;
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    rig::embeddings::EmbeddingsBuilder::new(
+                        ollama_client.embedding_model("nomic-embed-text"),
+                    )
+                    .document("hello world".to_string())
+                    .unwrap()
+                    .build(),
+                )
+                .await
+            };
+
+            match test_result {
+                Ok(Ok(_)) => {
+                    let _ = tx.send(ProcessingEvent::Status(
+                        "🧠 Using Ollama (nomic-embed-text) for RAG embeddings".to_string(),
+                    ));
+                    crate::rag::EmbeddingProvider::Ollama {
+                        client: ollama_client,
+                        model: "nomic-embed-text".to_string(),
+                    }
+                }
+                _ => {
+                    let _ = tx.send(ProcessingEvent::Status(
+                        "🧠 Ollama embeddings unavailable — falling back to FastEmbed (local CPU)".to_string(),
+                    ));
+                    crate::rag::EmbeddingProvider::FastEmbed
+                }
+            }
+        };
+
+        // Chunk all files and build the index
+        let chunks = {
+            let ctx = context.lock().map(|c| c.clone()).unwrap_or_default();
+            ctx.chunk_all_files()
+        };
+
+        let collection = crate::rag::chunks_collection(&mongo_client);
+
+        let _ = tx.send(ProcessingEvent::Status(format!(
+            "🔨 Building RAG index ({} chunks)…", chunks.len()
+        )));
+
+        match crate::rag::build_index(
+            &embedding_provider, &chunks, &collection, &cancel_token,
+        ).await {
+            Ok(true) => {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "✅ RAG index built ({} chunks indexed)", chunks.len()
+                )));
+                // Clean up orphaned chunks from previous runs
+                let active_files: Vec<String> = chunks.iter()
+                    .map(|c| c.file_name.clone())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let _ = crate::rag::cleanup_orphaned_chunks(&collection, &active_files).await;
+            }
+            Ok(false) => {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "⚠ RAG index build returned no embeddings — using excerpt fallback".to_string(),
+                ));
+                break 'rag None;
+            }
+            Err(e) => {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "⚠ RAG index build failed — using excerpt fallback. ({})", e
+                )));
+                break 'rag None;
+            }
+        }
+
+        Some((embedding_provider, mongo_client))
+    };
+
+    let rag_state = rag_state.map(Arc::new);
 
     // Take a snapshot of context now (after all files are parsed)
     let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
@@ -2215,6 +2320,7 @@ async fn process_files(
             let gdocs = Arc::clone(&gherkin_docs);
             let force_regen = force_regenerate;
             let child_token = cancel_token.child_token();
+            let rag_st = rag_state.clone();
 
             tracker.spawn(async move {
                 // Cancel-aware semaphore wait
@@ -2229,7 +2335,16 @@ async fn process_files(
                 let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
                 let file_start = std::time::Instant::now();
 
-                let rag_ctx: Option<String> = None;
+                // RAG retrieval: query the vector index for cross-file context
+                let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
+                    let (ref provider, ref mongo) = **rs;
+                    let coll = crate::rag::chunks_collection(mongo);
+                    let query = crate::rag::build_query_text(&raw_text, &file_name);
+                    let ctx_str = crate::rag::retrieve_context(provider, &coll, &query, &file_name, &child_token).await;
+                    if ctx_str.is_empty() { None } else { Some(ctx_str) }
+                } else {
+                    None
+                };
 
                 let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
                 let tx_fwd = tx.clone();
@@ -2287,6 +2402,7 @@ async fn process_files(
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
         let child_token = cancel_token.child_token();
+        let rag_st = rag_state.clone();
 
         tracker.spawn(async move {
             // Cancel-aware semaphore wait
@@ -2305,7 +2421,18 @@ async fn process_files(
             }
             let group_start = std::time::Instant::now();
 
-            let rag_ctx: Option<String> = None;
+            // RAG retrieval for group: query using merged member content
+            let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
+                let (ref provider, ref mongo) = **rs;
+                let coll = crate::rag::chunks_collection(mongo);
+                let merged_query: String = members_data.iter()
+                    .map(|(name, _, text, _)| crate::rag::build_query_text(text, name))
+                    .collect::<Vec<_>>().join("\n");
+                let ctx_str = crate::rag::retrieve_context(provider, &coll, &merged_query, &group_name, &child_token).await;
+                if ctx_str.is_empty() { None } else { Some(ctx_str) }
+            } else {
+                None
+            };
 
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();
@@ -2385,6 +2512,7 @@ async fn process_files(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let rag_st = rag_state.clone();
 
         tracker.spawn(async move {
             // Cancel-aware semaphore wait
@@ -2402,7 +2530,16 @@ async fn process_files(
             )));
             let file_start = std::time::Instant::now();
 
-            let rag_ctx: Option<String> = None;
+            // RAG retrieval: query the vector index for cross-file context
+            let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
+                let (ref provider, ref mongo) = **rs;
+                let coll = crate::rag::chunks_collection(mongo);
+                let query = crate::rag::build_query_text(&raw_text, &file_name);
+                let ctx_str = crate::rag::retrieve_context(provider, &coll, &query, &file_name, &child_token).await;
+                if ctx_str.is_empty() { None } else { Some(ctx_str) }
+            } else {
+                None
+            };
 
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();

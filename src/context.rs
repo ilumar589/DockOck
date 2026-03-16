@@ -180,6 +180,19 @@ impl ProjectContext {
         self.entities = entities;
     }
 
+    /// Chunk all file contents into overlapping text chunks for RAG indexing.
+    pub fn chunk_all_files(&self) -> Vec<crate::rag::TextChunk> {
+        self.file_contents
+            .values()
+            .flat_map(|fc| {
+                let name = fc.path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| fc.path.to_string_lossy().to_string());
+                crate::rag::chunk_text(&fc.raw_text, &name, &fc.file_type)
+            })
+            .collect()
+    }
+
     /// Build a glossary string for injection into LLM prompts.
     ///
     /// Returns an empty string if no entities have been extracted.

@@ -690,6 +690,11 @@ impl AgentOrchestrator {
 
     /// Build an agent for one of the Ollama text roles and stream a chat.
     /// `ollama_client` is the Ollama client for this role (may fall back to generator).
+    #[tracing::instrument(
+        name = "llm.run_ollama_chat",
+        skip(ollama_client, preamble, prompt, history, status_tx, cancel_token),
+        fields(model, stage_name, file_name)
+    )]
     async fn run_ollama_chat(
         ollama_client: &ollama::Client,
         model: &str,
@@ -740,6 +745,11 @@ impl AgentOrchestrator {
     }
 
     /// Build an agent for the OpenAI-compatible backend and stream a chat.
+    #[tracing::instrument(
+        name = "llm.run_openai_chat",
+        skip(openai_client, preamble, prompt, history, status_tx, cancel_token),
+        fields(model, stage_name, file_name)
+    )]
     async fn run_openai_chat(
         openai_client: &openai::CompletionsClient,
         model: &str,
@@ -828,6 +838,11 @@ impl AgentOrchestrator {
     /// Run the pipeline for one file. Stages depend on `self.mode`.
     /// Results are cached by content hash when `force_regenerate` is false.
     /// If `rag_context` is provided, it replaces the default cross-file excerpt context.
+    #[tracing::instrument(
+        name = "llm.process_file",
+        skip(self, raw_text, images, context, rag_context, status_tx, cancel_token),
+        fields(file_name, file_type, pipeline_mode = ?self.mode)
+    )]
     pub async fn process_file(
         &self,
         file_name: &str,
@@ -954,6 +969,11 @@ impl AgentOrchestrator {
     /// Chunked pipeline for documents that exceed the model's context window.
     /// Splits text into overlapping windows, processes each chunk through
     /// extract/preprocess → generate, then merges all Gherkin via a merge-review pass.
+    #[tracing::instrument(
+        name = "llm.process_file_chunked",
+        skip(self, enriched_text, context, rag_context, status_tx, cancel_token),
+        fields(file_name, file_type)
+    )]
     async fn process_file_chunked(
         &self,
         file_name: &str,
@@ -1109,6 +1129,11 @@ impl AgentOrchestrator {
         }
     }
 
+    #[tracing::instrument(
+        name = "llm.extract",
+        skip(self, raw_text, status_tx, cancel_token),
+        fields(file_name, file_type)
+    )]
     async fn extract(
         &self,
         file_name: &str,
@@ -1146,6 +1171,11 @@ impl AgentOrchestrator {
         }
     }
 
+    #[tracing::instrument(
+        name = "llm.generate",
+        skip(self, summary, context_summary, glossary, status_tx, cancel_token),
+        fields(file_name, context_len = context_summary.len())
+    )]
     async fn generate(
         &self,
         file_name: &str,
@@ -1217,6 +1247,11 @@ impl AgentOrchestrator {
         }
     }
 
+    #[tracing::instrument(
+        name = "llm.review",
+        skip(self, gherkin, status_tx, cancel_token),
+        fields(file_name)
+    )]
     async fn review(
         &self,
         file_name: &str,
@@ -1252,6 +1287,11 @@ impl AgentOrchestrator {
     ///
     /// Each image is sent to the vision model; the resulting descriptions are
     /// appended to the raw text so the generator LLM has full context.
+    #[tracing::instrument(
+        name = "llm.enrich_text_with_images",
+        skip(self, raw_text, images, status_tx, cancel_token),
+        fields(file_name, image_count = images.len())
+    )]
     async fn enrich_text_with_images(
         &self,
         raw_text: &str,
@@ -1317,6 +1357,11 @@ impl AgentOrchestrator {
 
     /// Run the pipeline for a group of related files, producing a single merged Gherkin output.
     /// If `rag_context` is provided, it replaces the default cross-file excerpt context.
+    #[tracing::instrument(
+        name = "llm.process_group",
+        skip(self, members, context, rag_context, status_tx, cancel_token),
+        fields(group_name, member_count = members.len())
+    )]
     pub async fn process_group(
         &self,
         group_name: &str,
@@ -1487,6 +1532,11 @@ impl AgentOrchestrator {
         Ok(result)
     }
 
+    #[tracing::instrument(
+        name = "llm.extract_group",
+        skip(self, merged_text, status_tx, cancel_token),
+        fields(group_name)
+    )]
     async fn extract_group(
         &self,
         group_name: &str,
@@ -1523,6 +1573,11 @@ impl AgentOrchestrator {
         }
     }
 
+    #[tracing::instrument(
+        name = "llm.generate_group",
+        skip(self, summary, context_summary, glossary, status_tx, cancel_token),
+        fields(group_name, context_len = context_summary.len())
+    )]
     async fn generate_group(
         &self,
         group_name: &str,
@@ -1605,6 +1660,11 @@ impl AgentOrchestrator {
     /// Describe a single image using the vision model.
     /// Routes to cloud (OpenAI-compatible) or local (Ollama) based on backend.
     /// Results are cached by image content hash + model name.
+    #[tracing::instrument(
+        name = "llm.describe_image",
+        skip(self, image, cancel_token, status_tx),
+        fields(image_label = %image.label, image_size_bytes = image.data.len())
+    )]
     async fn describe_image(
         &self,
         image: &crate::parser::ExtractedImage,
@@ -2094,6 +2154,11 @@ fn snap_to_line_boundary_llm(text: &str) -> String {
 /// full response text and sending periodic progress updates via `status_tx`.
 /// The model sees each history message as a distinct turn, giving it clearer
 /// separation between glossary / context / document content.
+#[tracing::instrument(
+    name = "llm.stream_chat",
+    skip(agent, prompt, chat_history, status_tx, cancel_token),
+    fields(stage_name, file_name)
+)]
 async fn stream_chat_with_progress<M, P>(
     agent: &rig::agent::Agent<M, P>,
     prompt: &str,
