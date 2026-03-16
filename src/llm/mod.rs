@@ -53,7 +53,7 @@ pub const DEFAULT_REVIEWER_MODEL: &str = "qwen2.5-coder:7b";
 pub const DEFAULT_VISION_MODEL: &str = "moondream";
 
 /// Default maximum number of files processed through the LLM pipeline simultaneously.
-pub const DEFAULT_MAX_CONCURRENT: usize = 3;
+pub const DEFAULT_MAX_CONCURRENT: usize = 20;
 
 /// Maximum number of characters to send to the LLM in a single prompt.
 /// Text beyond this limit is truncated with a note.
