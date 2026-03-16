@@ -1,38 +1,44 @@
-//! RAG (Retrieval-Augmented Generation) pipeline for semantic cross-file context.
+//! RAG pipeline using rig-core embedding APIs + MongoDB vector store (via Docker).
 //!
-//! Instead of using fixed 400-char excerpts from other files, this module:
+//! Replaces the old TF-IDF hashing approach with semantic embeddings:
 //! 1. Chunks parsed document text into overlapping windows
-//! 2. Embeds each chunk via a local TF-IDF hashing vectorizer (no API needed)
-//! 3. Stores embeddings in a simple in-memory Vec (brute-force cosine search)
-//! 4. At generation time, retrieves the top-K most relevant chunks from OTHER
+//! 2. Embeds each chunk via Ollama / OpenAI / FastEmbed (local CPU fallback)
+//! 3. Stores embeddings in MongoDB (persistent across runs)
+//! 4. At generation time, retrieves the top-N most relevant chunks from OTHER
 //!    files to inject as cross-file context
-//!
-//! Performance optimisations:
-//! - **Skip indexed**: files already stored (by name + chunk count) are skipped
-//! - **Disk-cached embeddings**: individual vectors cached by content hash
-//! - **Sub-batching**: large files are embedded in batches of 8
-//! - **Brute-force search**: at typical scale (~3 000 chunks × 768-dim) this is
-//!   sub-millisecond and avoids the overhead/hangs of an embedded vector DB.
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::Result;
+use mongodb::bson::{self, doc};
+use mongodb::options::ClientOptions;
+use mongodb::{Client as MongoClient, Collection};
+use rig::client::EmbeddingsClient;
+use rig::embeddings::EmbeddingsBuilder;
+use rig::vector_store::{
+    TopNResults, VectorSearchRequest, VectorStoreError, VectorStoreIndex, VectorStoreIndexDyn,
+    request::Filter,
+};
+use rig_fastembed::FastembedModel;
+use rig_mongodb::{MongoDbVectorIndex, SearchParams};
 use serde::{Deserialize, Serialize};
-use tracing::info;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, instrument, warn};
 
 // ─────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────
 
-/// Dimension for local TF-IDF hashing vectors.
-pub const LOCAL_EMBEDDING_DIM: usize = 768;
+/// Number of characters per chunk (~256 tokens).
+const CHUNK_SIZE_CHARS: usize = 1024;
 
-/// Number of characters per chunk (~128 tokens × 4 chars/token = 512 chars).
-const CHUNK_SIZE_CHARS: usize = 2048;
-
-/// Overlap between consecutive chunks (in characters).
-const CHUNK_OVERLAP_CHARS: usize = 512;
+/// Overlap between consecutive chunks (in characters), ~25%.
+const CHUNK_OVERLAP_CHARS: usize = 256;
 
 /// How many top chunks to retrieve per query.
-const TOP_K: usize = 8;
+const TOP_K: usize = 4;
 
 /// Maximum total characters of cross-file context to inject into the prompt.
 const MAX_CONTEXT_CHARS: usize = 8_000;
@@ -56,23 +62,19 @@ pub struct TextChunk {
     pub chunk_index: usize,
 }
 
-/// A search result: a chunk with its relevance score.
-#[derive(Debug, Clone)]
-pub struct SearchResult {
-    pub chunk: TextChunk,
-    pub score: f32,
+impl TextChunk {
+    /// Unique document ID for MongoDB storage: `"filename:chunk_idx"`.
+    pub fn document_id(&self) -> String {
+        format!("{}:{}", self.file_name, self.chunk_index)
+    }
 }
 
 // ─────────────────────────────────────────────
 // Chunking
 // ─────────────────────────────────────────────
 
-/// Split document text into overlapping chunks.
-pub fn chunk_text(
-    text: &str,
-    file_name: &str,
-    file_type: &str,
-) -> Vec<TextChunk> {
+/// Split document text into overlapping chunks, snapping to line boundaries.
+pub fn chunk_text(text: &str, file_name: &str, file_type: &str) -> Vec<TextChunk> {
     let chars: Vec<char> = text.chars().collect();
     let total = chars.len();
 
@@ -80,7 +82,6 @@ pub fn chunk_text(
         return Vec::new();
     }
 
-    // If the text fits in a single chunk, return it as-is.
     if total <= CHUNK_SIZE_CHARS {
         return vec![TextChunk {
             file_name: file_name.to_string(),
@@ -100,7 +101,6 @@ pub fn chunk_text(
         let end = (offset + CHUNK_SIZE_CHARS).min(total);
         let chunk_text: String = chars[offset..end].iter().collect();
 
-        // Try to break at a line boundary if possible (within last 20% of chunk)
         let actual_text = if end < total {
             snap_to_line_boundary(&chunk_text)
         } else {
@@ -124,282 +124,547 @@ pub fn chunk_text(
     chunks
 }
 
-/// Try to snap the chunk boundary to the last newline in the final 20% of the text,
-/// so we don't split mid-sentence.
+/// Snap the chunk boundary to the last newline in the final 20% of the text.
 fn snap_to_line_boundary(text: &str) -> String {
     let len = text.len();
-    let search_start = len.saturating_sub(len / 5); // last 20%
+    let mut search_start = len.saturating_sub(len / 5);
+    // Ensure search_start falls on a UTF-8 char boundary
+    while search_start < len && !text.is_char_boundary(search_start) {
+        search_start += 1;
+    }
     if let Some(pos) = text[search_start..].rfind('\n') {
-        text[..search_start + pos + 1].to_string()
+        let end = search_start + pos + 1;
+        text[..end].to_string()
     } else {
         text.to_string()
     }
 }
 
-/// A stored chunk with its precomputed embedding vector.
-struct StoredChunk {
-    chunk: TextChunk,
-    embedding: Vec<f32>,
+// ─────────────────────────────────────────────
+// MongoDB connection
+// ─────────────────────────────────────────────
+
+/// Connect to the MongoDB instance running in Docker.
+/// Returns the `chunks` collection in the `dockock` database.
+pub async fn connect_mongo(connection_string: &str) -> Result<MongoClient> {
+    let options = ClientOptions::parse(connection_string).await?;
+    let client = MongoClient::with_options(options)?;
+    // Ping to verify connectivity
+    client
+        .database("dockock")
+        .run_command(doc! { "ping": 1 })
+        .await?;
+    info!("Connected to MongoDB at {}", connection_string);
+    Ok(client)
 }
 
-/// The RAG engine backed by a simple in-memory vector store with brute-force
-/// cosine similarity search.  At the scale we operate (~3 000 chunks, 768-dim)
-/// this is sub-millisecond and avoids all SurrealDB overhead/hangs.
-///
-/// No disk cache is used — TF-IDF embedding is pure CPU and faster to
-/// recompute than to read/write a (potentially network-mounted) cache dir.
-pub struct RagEngine {
-    /// Embedding vector dimension.
-    embed_dim: usize,
-    /// All stored chunks + embeddings.
-    store: Vec<StoredChunk>,
-    /// Set of file names already indexed (for skip-if-present).
-    indexed_files: std::collections::HashMap<String, usize>,
+/// Get the chunks collection.
+pub fn chunks_collection(client: &MongoClient) -> Collection<bson::Document> {
+    client.database("dockock").collection("chunks")
 }
 
-impl RagEngine {
-    /// Create a new RAG engine with in-memory vector storage.
-    ///
-    /// * `embed_dim` — embedding vector dimension
-    pub fn new(embed_dim: usize) -> Self {
-        info!("RAG engine: using in-memory vector store (brute-force cosine, no disk cache)");
-        Self {
-            embed_dim,
-            store: Vec::new(),
-            indexed_files: std::collections::HashMap::new(),
-        }
-    }
+/// Ensure that the required Atlas Search vector indexes exist on both the
+/// `chunks` and `memories` collections.  On `mongodb-atlas-local` the indexes
+/// are created via `createSearchIndexes`; if they already exist the command
+/// returns an error that we silently ignore.
+#[instrument(skip_all)]
+pub async fn ensure_search_indexes(client: &MongoClient) {
+    let db = client.database("dockock");
 
-    /// Number of chunks in the vector store.
-    pub fn chunk_count(&self) -> usize {
-        self.store.len()
-    }
-
-    /// Embed and index all chunks from a single file (synchronous).
-    ///
-    /// Pure CPU work — call from a blocking context, NOT from the async runtime.
-    pub fn index_file(
-        &mut self,
-        file_name: &str,
-        file_type: &str,
-        raw_text: &str,
-    ) -> IndexResult {
-        let chunks = chunk_text(raw_text, file_name, file_type);
-        if chunks.is_empty() {
-            return IndexResult { total_chunks: 0, cached: 0, embedded: 0, skipped: true };
-        }
-
-        // Skip if this file is already fully indexed in memory
-        if let Some(&existing_count) = self.indexed_files.get(file_name) {
-            if existing_count == chunks.len() {
-                return IndexResult {
-                    total_chunks: chunks.len(),
-                    cached: 0,
-                    embedded: 0,
-                    skipped: true,
-                };
+    // Index for `chunks` collection
+    let chunks_cmd = doc! {
+        "createSearchIndexes": "chunks",
+        "indexes": [{
+            "name": "vector_index",
+            "type": "vectorSearch",
+            "definition": {
+                "fields": [{
+                    "type": "vector",
+                    "path": "embedding",
+                    "numDimensions": 768,
+                    "similarity": "cosine"
+                }]
             }
-            // Chunk count changed — remove stale chunks and re-index
-            self.store.retain(|sc| sc.chunk.file_name != file_name);
-        }
-
-        let dim = self.embed_dim;
-        let embeddings: Vec<Vec<f32>> = chunks
-            .iter()
-            .map(|c| tfidf_hash_embed(&c.text, dim))
-            .collect();
-
-        let count = chunks.len();
-        for (chunk, emb) in chunks.into_iter().zip(embeddings) {
-            self.store.push(StoredChunk { chunk, embedding: emb });
-        }
-
-        self.indexed_files.insert(file_name.to_string(), count);
-        IndexResult { total_chunks: count, cached: 0, embedded: count, skipped: false }
-    }
-
-    /// Retrieve the top-K most relevant chunks from files other than `exclude_file`.
-    ///
-    /// Brute-force cosine similarity — fast enough for thousands of 768-dim vectors.
-    pub async fn retrieve(
-        &self,
-        query_text: &str,
-        exclude_file: &str,
-    ) -> Result<Vec<SearchResult>> {
-        let query_emb = self.embed_single(query_text);
-
-        // Score every chunk (excluding the query's own file)
-        let mut scored: Vec<(usize, f32)> = self.store.iter().enumerate()
-            .filter(|(_, sc)| sc.chunk.file_name != exclude_file)
-            .map(|(i, sc)| (i, cosine_similarity(&query_emb, &sc.embedding)))
-            .collect();
-
-        // Partial sort: top-K by descending score
-        scored.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(TOP_K);
-
-        Ok(scored.into_iter().map(|(i, score)| {
-            SearchResult {
-                chunk: self.store[i].chunk.clone(),
-                score,
+        }]
+    };
+    match db.run_command(chunks_cmd).await {
+        Ok(_) => info!("Created vector_index on chunks collection"),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already exists") || msg.contains("Duplicate") {
+                info!("vector_index already exists on chunks collection");
+            } else {
+                warn!("Failed to create vector_index on chunks: {e}");
             }
-        }).collect())
+        }
     }
 
-    /// Build a formatted cross-file context string from RAG retrieval results.
-    pub async fn build_cross_file_context(
-        &self,
-        query_text: &str,
-        exclude_file: &str,
-    ) -> Result<String> {
-        let results = self.retrieve(query_text, exclude_file).await?;
-
-        if results.is_empty() {
-            return Ok("No relevant cross-file context found.".to_string());
-        }
-
-        let mut context = String::from("=== Related Context from Other Documents ===\n\n");
-        let mut chars_used = context.len();
-
-        for result in results.iter() {
-            let header = format!(
-                "[From {} ({}), chunk {}] (relevance: {:.2})\n",
-                result.chunk.file_name,
-                result.chunk.file_type,
-                result.chunk.chunk_index + 1,
-                result.score,
-            );
-            let snippet = &result.chunk.text;
-
-            let entry_cost = header.len() + snippet.len() + 2;
-            if chars_used + entry_cost > MAX_CONTEXT_CHARS {
-                let remaining = MAX_CONTEXT_CHARS.saturating_sub(chars_used + header.len() + 10);
-                if remaining > 100 {
-                    context.push_str(&header);
-                    let truncated: String = snippet.chars().take(remaining).collect();
-                    context.push_str(&truncated);
-                    context.push_str("…\n\n");
-                }
-                break;
+    // Index for `memories` collection
+    let memories_cmd = doc! {
+        "createSearchIndexes": "memories",
+        "indexes": [{
+            "name": "memory_vector_index",
+            "type": "vectorSearch",
+            "definition": {
+                "fields": [{
+                    "type": "vector",
+                    "path": "embedding",
+                    "numDimensions": 768,
+                    "similarity": "cosine"
+                }]
             }
-
-            context.push_str(&header);
-            context.push_str(snippet);
-            context.push_str("\n\n");
-            chars_used += entry_cost;
+        }]
+    };
+    match db.run_command(memories_cmd).await {
+        Ok(_) => info!("Created memory_vector_index on memories collection"),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already exists") || msg.contains("Duplicate") {
+                info!("memory_vector_index already exists on memories collection");
+            } else {
+                warn!("Failed to create memory_vector_index on memories: {e}");
+            }
         }
-
-        Ok(context)
     }
-
-    /// Clear all chunks for a fresh run.
-    #[allow(dead_code)]
-    pub async fn clear(&mut self) -> Result<()> {
-        self.store.clear();
-        self.indexed_files.clear();
-        Ok(())
-    }
-
-    /// Embed a single text string (pure CPU, no disk cache).
-    fn embed_single(&self, text: &str) -> Vec<f32> {
-        tfidf_hash_embed(text, self.embed_dim)
-    }
-
 }
 
-/// Cosine similarity between two vectors (assumes both are L2-normalised).
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+// ─────────────────────────────────────────────
+// Embedding provider selection
+// ─────────────────────────────────────────────
+
+/// User-facing embedding model selection in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingChoice {
+    /// Try Ollama first, fall back to FastEmbed.
+    Auto,
+    /// Ollama `nomic-embed-text` (768-dim, GPU-accelerated).
+    OllamaNomicEmbedText,
+    /// Ollama `mxbai-embed-large` (1024-dim, higher quality).
+    OllamaMxbaiEmbedLarge,
+    /// FastEmbed local CPU (`AllMiniLML6V2Q`, 384-dim, no external service).
+    FastEmbedMiniLM,
+    /// Disable RAG entirely; use excerpt-based context fallback.
+    None,
 }
 
-/// Result of indexing a single file — provides detail for progress reporting.
+impl EmbeddingChoice {
+    pub const ALL: &[EmbeddingChoice] = &[
+        Self::Auto,
+        Self::OllamaNomicEmbedText,
+        Self::OllamaMxbaiEmbedLarge,
+        Self::FastEmbedMiniLM,
+        Self::None,
+    ];
+}
+
+impl std::fmt::Display for EmbeddingChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "Auto (Ollama → FastEmbed)"),
+            Self::OllamaNomicEmbedText => write!(f, "nomic-embed-text (Ollama)"),
+            Self::OllamaMxbaiEmbedLarge => write!(f, "mxbai-embed-large (Ollama)"),
+            Self::FastEmbedMiniLM => write!(f, "AllMiniLM (FastEmbed, CPU)"),
+            Self::None => write!(f, "None (disable RAG)"),
+        }
+    }
+}
+
+impl Default for EmbeddingChoice {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Which embedding backend to use.
 #[derive(Debug, Clone)]
-pub struct IndexResult {
-    /// Total chunk count for the file.
-    pub total_chunks: usize,
-    /// How many chunks had cached embeddings (disk cache hit).
-    pub cached: usize,
-    /// How many chunks were freshly embedded via API.
-    pub embedded: usize,
-    /// Whether the file was skipped (already fully indexed in SurrealDB).
-    pub skipped: bool,
+pub enum EmbeddingProvider {
+    /// Use the Ollama instance for embeddings (e.g. nomic-embed-text).
+    Ollama {
+        client: rig::providers::ollama::Client,
+        model: String,
+    },
+    /// Use FastEmbed for local CPU-only embeddings (no external service needed).
+    FastEmbed,
 }
 
 // ─────────────────────────────────────────────
-// Local TF-IDF hashing vectorizer
+// Index building (Phase 1.3)
 // ─────────────────────────────────────────────
 
-/// Tokenize text into lowercase word tokens (≥ 2 chars, alphanumeric only).
-fn tokenize(text: &str) -> Vec<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| s.len() >= 2)
-        .map(|s| s.to_lowercase())
-        .collect()
-}
-
-/// FNV-1a–style hash → bucket index.
-fn hash_token(token: &str, dim: usize) -> usize {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in token.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    (h as usize) % dim
-}
-
-/// Sign hash for the signed feature-hashing trick (reduces collision bias).
-fn sign_hash(token: &str) -> f32 {
-    let mut h: u64 = 0x517cc1b727220a95;
-    for b in token.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    if h & 1 == 0 { 1.0 } else { -1.0 }
-}
-
-/// Produce a TF-IDF–like embedding using the feature-hashing trick.
+/// Build the RAG index by embedding all project file chunks and upserting
+/// them into MongoDB. Returns `true` if index was built successfully.
 ///
-/// Uses sublinear TF (`1 + ln(count)`) and signed hashing.  The resulting
-/// vector is L2-normalised so cosine similarity works directly.
-fn tfidf_hash_embed(text: &str, dim: usize) -> Vec<f32> {
-    let tokens = tokenize(text);
-    if tokens.is_empty() {
-        return vec![0.0; dim];
+/// Chunks whose `document_id` already exists in MongoDB are skipped (incremental).
+/// Embedding is done in batches of `EMBED_BATCH_SIZE` for progress visibility
+/// and to avoid OOM on large projects.
+///
+/// Falls back gracefully: if embedding fails, returns `false` so
+/// the caller can use excerpt-based context instead.
+const EMBED_BATCH_SIZE: usize = 64;
+
+#[instrument(skip_all, fields(chunk_count))]
+pub async fn build_index(
+    provider: &EmbeddingProvider,
+    chunks: &[TextChunk],
+    collection: &Collection<bson::Document>,
+    cancel_token: &CancellationToken,
+    on_progress: impl Fn(&str),  // status message
+) -> Result<bool> {
+    if chunks.is_empty() {
+        info!("RAG: no chunks to index");
+        return Ok(false);
+    }
+    tracing::Span::current().record("chunk_count", chunks.len());
+
+    // ── Skip chunks already in MongoDB (incremental indexing) ──
+    on_progress("🔍 Checking for already-indexed chunks…");
+    eprintln!("[DEBUG RAG build_index] checking existing_ids for {} chunks…", chunks.len());
+    let all_ids: Vec<String> = chunks.iter().map(|c| c.document_id()).collect();
+    let existing = existing_ids(collection, &all_ids).await;
+    eprintln!("[DEBUG RAG build_index] existing_ids done: {} found", existing.len());
+    let new_chunks: Vec<&TextChunk> = chunks
+        .iter()
+        .filter(|c| !existing.contains(&c.document_id()))
+        .collect();
+
+    if new_chunks.is_empty() {
+        on_progress(&format!("✅ All {} chunks already indexed — skipping embed", chunks.len()));
+        info!("RAG: all {} chunks already indexed — skipping", chunks.len());
+        return Ok(true);
+    }
+    on_progress(&format!(
+        "🔨 {} new chunks to embed ({} cached)", new_chunks.len(), existing.len()
+    ));
+
+    let total_batches = (new_chunks.len() + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE;
+    let mut indexed = 0usize;
+
+    for (batch_idx, batch) in new_chunks.chunks(EMBED_BATCH_SIZE).enumerate() {
+        if cancel_token.is_cancelled() {
+            anyhow::bail!("Cancelled during RAG indexing");
+        }
+        let ids: Vec<String> = batch.iter().map(|c| c.document_id()).collect();
+        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+
+        on_progress(&format!(
+            "🧠 Embedding batch {}/{} ({} texts)…",
+            batch_idx + 1, total_batches, texts.len()
+        ));
+
+        let embeddings = match provider {
+            EmbeddingProvider::Ollama { client, model } => {
+                embed_ollama(client, model, texts, cancel_token).await?
+            }
+            EmbeddingProvider::FastEmbed => {
+                embed_fastembed(texts, cancel_token).await?
+            }
+        };
+
+        let Some(embeddings) = embeddings else {
+            return Ok(false);
+        };
+
+        on_progress(&format!(
+            "💾 Storing batch {}/{} in MongoDB…", batch_idx + 1, total_batches
+        ));
+
+        upsert_embeddings(&ids, &embeddings, collection).await?;
+        indexed += batch.len();
+        info!(
+            "RAG: batch {}/{} done ({}/{} chunks indexed)",
+            batch_idx + 1,
+            total_batches,
+            indexed,
+            new_chunks.len()
+        );
     }
 
-    // Count term frequencies
-    let mut tf: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for t in &tokens {
-        *tf.entry(t.as_str()).or_insert(0) += 1;
-    }
+    info!(
+        "RAG index built via {} ({} new chunks, {} already existed)",
+        match provider {
+            EmbeddingProvider::Ollama { .. } => "Ollama",
+            EmbeddingProvider::FastEmbed => "FastEmbed",
+        },
+        indexed,
+        existing.len()
+    );
+    Ok(true)
+}
 
-    // Feature hashing with sublinear TF
-    let mut vec = vec![0.0f32; dim];
-    for (term, &count) in &tf {
-        let idx = hash_token(term, dim);
-        let sign = sign_hash(term);
-        let weight = 1.0 + (count as f32).ln();
-        vec[idx] += sign * weight;
+/// Return the set of IDs that already exist in the collection.
+async fn existing_ids(
+    collection: &Collection<bson::Document>,
+    ids: &[String],
+) -> std::collections::HashSet<String> {
+    use futures::TryStreamExt;
+    let mut found = std::collections::HashSet::new();
+    // Query in batches of 500 to avoid oversized $in arrays.
+    // Timeout after 10s total — if MongoDB is slow we just re-embed.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for batch in ids.chunks(500) {
+            let filter = doc! { "_id": { "$in": batch } };
+            if let Ok(mut cursor) = collection
+                .find(filter)
+                .projection(doc! { "_id": 1 })
+                .await
+            {
+                while let Ok(Some(d)) = cursor.try_next().await {
+                    if let Ok(id) = d.get_str("_id") {
+                        found.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    if result.is_err() {
+        warn!("RAG: existing_ids check timed out — will re-embed all chunks");
+        return std::collections::HashSet::new();
     }
+    found
+}
 
-    // L2 normalise
-    let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm > 0.0 {
-        for x in &mut vec {
-            *x /= norm;
+type EmbedResult = Vec<(String, rig::one_or_many::OneOrMany<rig::embeddings::Embedding>)>;
+
+/// Embed a batch of texts via Ollama. Returns `None` if embedding fails.
+/// Times out after 120 seconds per batch to avoid silent hangs.
+async fn embed_ollama(
+    client: &rig::providers::ollama::Client,
+    model_name: &str,
+    texts: Vec<String>,
+    cancel_token: &CancellationToken,
+) -> Result<Option<EmbedResult>> {
+    let model = client.embedding_model(model_name);
+    let builder = EmbeddingsBuilder::new(model).documents(texts)?;
+    let embeddings = tokio::select! {
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            builder.build(),
+        ) => {
+            match result {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => {
+                    warn!("RAG: Ollama embedding failed: {e}");
+                    return Ok(None);
+                }
+                Err(_) => {
+                    warn!("RAG: Ollama embedding timed out (120s)");
+                    return Ok(None);
+                }
+            }
+        }
+        _ = cancel_token.cancelled() => {
+            anyhow::bail!("Cancelled during RAG indexing");
+        }
+    };
+    Ok(Some(embeddings))
+}
+
+/// Embed a batch of texts via FastEmbed. Returns `None` if embedding fails.
+/// Times out after 300 seconds per batch (CPU can be slow).
+async fn embed_fastembed(
+    texts: Vec<String>,
+    cancel_token: &CancellationToken,
+) -> Result<Option<EmbedResult>> {
+    let fastembed_client = rig_fastembed::Client::new();
+    let model = fastembed_client.embedding_model(&FastembedModel::AllMiniLML6V2Q);
+    let builder = EmbeddingsBuilder::new(model).documents(texts)?;
+    let embeddings = tokio::select! {
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            builder.build(),
+        ) => {
+            match result {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => {
+                    warn!("RAG: FastEmbed embedding failed: {e}");
+                    return Ok(None);
+                }
+                Err(_) => {
+                    warn!("RAG: FastEmbed embedding timed out (300s)");
+                    return Ok(None);
+                }
+            }
+        }
+        _ = cancel_token.cancelled() => {
+            anyhow::bail!("Cancelled during RAG indexing");
+        }
+    };
+    Ok(Some(embeddings))
+}
+
+/// Upsert embedded documents into MongoDB using concurrent writes.
+async fn upsert_embeddings(
+    ids: &[String],
+    embeddings: &[(String, rig::one_or_many::OneOrMany<rig::embeddings::Embedding>)],
+    collection: &Collection<bson::Document>,
+) -> Result<()> {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let futures: FuturesUnordered<_> = ids
+        .iter()
+        .zip(embeddings.iter())
+        .map(|(id, (text, emb_set))| {
+            let id = id.clone();
+            let text = text.clone();
+            let embedding = emb_set.first_ref().vec.clone();
+            let coll = collection.clone();
+            async move {
+                let d = doc! {
+                    "_id": &id,
+                    "text": &text,
+                    "embedding": &embedding,
+                };
+                coll.replace_one(doc! { "_id": &id }, d)
+                    .upsert(true)
+                    .await
+            }
+        })
+        .collect();
+    let results: Vec<_> = futures.collect().await;
+    for r in results {
+        r?;
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────
+// Retrieval (Phase 2 per-file)
+// ─────────────────────────────────────────────
+
+/// Retrieve cross-file context for a given file by querying MongoDB vector index.
+///
+/// Returns a formatted context string, or empty string if retrieval fails.
+#[instrument(skip_all, fields(exclude_file, result_count))]
+#[allow(dead_code)]
+pub async fn retrieve_context(
+    provider: &EmbeddingProvider,
+    collection: &Collection<bson::Document>,
+    query_text: &str,
+    exclude_file: &str,
+    cancel_token: &CancellationToken,
+) -> String {
+    let result = match provider {
+        EmbeddingProvider::Ollama { client, model } => {
+            retrieve_ollama(client, model, collection, query_text, exclude_file, cancel_token).await
+        }
+        EmbeddingProvider::FastEmbed => {
+            retrieve_fastembed(collection, query_text, exclude_file, cancel_token).await
+        }
+    };
+
+    match result {
+        Ok(ctx) => {
+            tracing::Span::current().record("result_count", ctx.len());
+            ctx
+        }
+        Err(e) => {
+            warn!("RAG retrieval failed: {e}");
+            String::new()
         }
     }
-
-    vec
 }
+
+#[allow(dead_code)]
+async fn retrieve_ollama(
+    client: &rig::providers::ollama::Client,
+    model_name: &str,
+    collection: &Collection<bson::Document>,
+    query_text: &str,
+    exclude_file: &str,
+    cancel_token: &CancellationToken,
+) -> Result<String> {
+    let model = client.embedding_model(model_name);
+    let index = MongoDbVectorIndex::new(
+        collection.clone(),
+        model,
+        "vector_index",
+        SearchParams::new(),
+    )
+    .await?;
+
+    do_retrieve(&index, query_text, exclude_file, cancel_token).await
+}
+
+#[allow(dead_code)]
+async fn retrieve_fastembed(
+    collection: &Collection<bson::Document>,
+    query_text: &str,
+    exclude_file: &str,
+    cancel_token: &CancellationToken,
+) -> Result<String> {
+    let fastembed_client = rig_fastembed::Client::new();
+    let model = fastembed_client.embedding_model(&FastembedModel::AllMiniLML6V2Q);
+    let index = MongoDbVectorIndex::new(
+        collection.clone(),
+        model,
+        "vector_index",
+        SearchParams::new(),
+    )
+    .await?;
+
+    do_retrieve(&index, query_text, exclude_file, cancel_token).await
+}
+
+#[allow(dead_code)]
+async fn do_retrieve<I: VectorStoreIndex>(
+    index: &I,
+    query_text: &str,
+    exclude_file: &str,
+    cancel_token: &CancellationToken,
+) -> Result<String> {
+    let request: VectorSearchRequest<I::Filter> = VectorSearchRequest::builder()
+        .query(query_text)
+        .samples((TOP_K + 2) as u64)
+        .build()?;
+
+    let results: Vec<(f64, String, String)> = tokio::select! {
+        r = index.top_n(request) => r?,
+        _ = cancel_token.cancelled() => {
+            anyhow::bail!("Cancelled during RAG retrieval");
+        }
+    };
+
+    let mut context = String::from("=== Related Context from Other Documents ===\n\n");
+    let mut chars_used = context.len();
+    let mut count = 0usize;
+
+    for (score, id, text) in results {
+        // Skip chunks from the same file
+        if id.starts_with(exclude_file) {
+            continue;
+        }
+        if count >= TOP_K {
+            break;
+        }
+
+        let entry = format!("--- [{id}] (relevance: {score:.2}) ---\n{text}\n\n");
+        if chars_used + entry.len() > MAX_CONTEXT_CHARS {
+            break;
+        }
+
+        context.push_str(&entry);
+        chars_used += entry.len();
+        count += 1;
+    }
+
+    if count == 0 {
+        return Ok(String::new());
+    }
+
+    Ok(context)
+}
+
+// ─────────────────────────────────────────────
+// Query building
+// ─────────────────────────────────────────────
 
 /// Build a short representative query from a file's raw text for RAG retrieval.
 ///
-/// Takes the first ~1000 chars plus any headings/key terms found in the document.
+/// Takes headings + key lines from the first ~200 lines plus a text excerpt.
+#[allow(dead_code)]
 pub fn build_query_text(raw_text: &str, file_name: &str) -> String {
     let mut query = format!("Document: {}\n", file_name);
 
-    // Collect headings and key lines (first pass)
     let mut key_lines = Vec::new();
     let mut other_text = String::new();
     for line in raw_text.lines().take(200) {
@@ -429,10 +694,169 @@ pub fn build_query_text(raw_text: &str, file_name: &str) -> String {
     }
     query.push_str(&other_text);
 
-    // Cap query at ~1500 chars
     if query.len() > 1500 {
         query.truncate(1500);
     }
 
     query
+}
+
+// ─────────────────────────────────────────────
+// Orphan cleanup
+// ─────────────────────────────────────────────
+
+/// Remove chunks from MongoDB whose source file is no longer in the project.
+#[instrument(skip_all)]
+pub async fn cleanup_orphaned_chunks(
+    collection: &Collection<bson::Document>,
+    active_file_names: &[String],
+) -> Result<()> {
+    if active_file_names.is_empty() {
+        return Ok(());
+    }
+
+    // Build a regex that matches any of the active file prefixes
+    let pattern = active_file_names
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+
+    let filter = doc! {
+        "_id": { "$not": { "$regex": &pattern } }
+    };
+
+    let result = collection.delete_many(filter).await?;
+    if result.deleted_count > 0 {
+        info!("RAG: cleaned up {} orphaned chunks", result.deleted_count);
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────
+// Combined retrieval (chunks + memories)
+// ─────────────────────────────────────────────
+
+/// Retrieve cross-file context from both the `chunks` collection (raw file
+/// embeddings) and the `memories` collection (historical factoids), merging
+/// both into a single context string.
+#[instrument(skip_all)]
+#[allow(dead_code)]
+pub async fn retrieve_full_context(
+    provider: &EmbeddingProvider,
+    mongo_client: &MongoClient,
+    query_text: &str,
+    exclude_file: &str,
+    cancel_token: &CancellationToken,
+) -> String {
+    let chunks_coll = chunks_collection(mongo_client);
+    let chunk_ctx = retrieve_context(provider, &chunks_coll, query_text, exclude_file, cancel_token).await;
+
+    let mem_coll = crate::memory::memories_collection(mongo_client);
+    let mem_ctx = crate::memory::retrieve_memories(provider, &mem_coll, query_text, cancel_token).await;
+
+    if chunk_ctx.is_empty() && mem_ctx.is_empty() {
+        return String::new();
+    }
+
+    let mut combined = chunk_ctx;
+    if !mem_ctx.is_empty() {
+        combined.push_str(&mem_ctx);
+    }
+    combined
+}
+
+// ─────────────────────────────────────────────
+// Shared vector store index (for dynamic_context)
+// ─────────────────────────────────────────────
+
+/// A cloneable, type-erased vector store index for use with rig-core's
+/// `dynamic_context()` agent builder method.
+///
+/// Wraps an `Arc` so the same index can be shared across multiple
+/// agent builds without re-creating the MongoDB index handle each time.
+#[derive(Clone)]
+pub struct SharedVectorIndex(Arc<dyn VectorStoreIndexDyn + Send + Sync>);
+
+impl std::fmt::Debug for SharedVectorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedVectorIndex").finish_non_exhaustive()
+    }
+}
+
+impl SharedVectorIndex {
+    pub fn new(index: impl VectorStoreIndexDyn + Send + Sync + 'static) -> Self {
+        Self(Arc::new(index))
+    }
+}
+
+impl VectorStoreIndexDyn for SharedVectorIndex {
+    fn top_n<'a>(
+        &'a self,
+        req: VectorSearchRequest<Filter<serde_json::Value>>,
+    ) -> Pin<Box<dyn Future<Output = TopNResults> + Send + 'a>> {
+        self.0.top_n(req)
+    }
+
+    fn top_n_ids<'a>(
+        &'a self,
+        req: VectorSearchRequest<Filter<serde_json::Value>>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<(f64, String)>, VectorStoreError>> + Send + 'a>>
+    {
+        self.0.top_n_ids(req)
+    }
+}
+
+/// Create shared, cloneable vector store indexes for both the `chunks` and
+/// `memories` collections.  The returned indexes are suitable for rig-core's
+/// `.dynamic_context()` on agent builders.
+///
+/// Index creation may fail if the search index isn't queryable yet — failed
+/// indexes are silently omitted (the caller treats an empty vec as "no RAG").
+#[instrument(skip_all)]
+pub async fn create_dynamic_indexes(
+    provider: &EmbeddingProvider,
+    mongo_client: &MongoClient,
+) -> Vec<SharedVectorIndex> {
+    let mut indexes = Vec::new();
+
+    // Chunks index (top-4 cross-file chunks)
+    let chunks_coll = chunks_collection(mongo_client);
+    match create_index_for_provider(provider, chunks_coll, "vector_index").await {
+        Ok(idx) => indexes.push(idx),
+        Err(e) => warn!("Failed to create chunks dynamic index: {e}"),
+    }
+
+    // Memories index (top-3 historical factoids)
+    let mem_coll = crate::memory::memories_collection(mongo_client);
+    match create_index_for_provider(provider, mem_coll, "memory_vector_index").await {
+        Ok(idx) => indexes.push(idx),
+        Err(e) => warn!("Failed to create memories dynamic index: {e}"),
+    }
+
+    indexes
+}
+
+async fn create_index_for_provider(
+    provider: &EmbeddingProvider,
+    collection: Collection<bson::Document>,
+    index_name: &str,
+) -> Result<SharedVectorIndex> {
+    match provider {
+        EmbeddingProvider::Ollama { client, model } => {
+            let model = client.embedding_model(model);
+            let index =
+                MongoDbVectorIndex::new(collection, model, index_name, SearchParams::new())
+                    .await?;
+            Ok(SharedVectorIndex::new(index))
+        }
+        EmbeddingProvider::FastEmbed => {
+            let fe_client = rig_fastembed::Client::new();
+            let model = fe_client.embedding_model(&FastembedModel::AllMiniLML6V2Q);
+            let index =
+                MongoDbVectorIndex::new(collection, model, index_name, SearchParams::new())
+                    .await?;
+            Ok(SharedVectorIndex::new(index))
+        }
+    }
 }

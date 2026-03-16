@@ -1,0 +1,58 @@
+# OpenTelemetry Collector configuration for DockOck
+#
+# Usage:
+#   1. Add the collector service to docker-compose.yml (see below)
+#   2. Build DockOck with the otel feature: cargo run --release --features otel
+#   3. Set OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 (default)
+#
+# Docker Compose snippet:
+#   otel-collector:
+#     image: otel/opentelemetry-collector-contrib:latest
+#     volumes:
+#       - ./otel/config.yaml:/etc/otelcol-contrib/config.yaml
+#     ports:
+#       - "4317:4317"   # gRPC
+#       - "4318:4318"   # HTTP
+#       - "13133:13133" # health check
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # Console exporter for debugging
+  debug:
+    verbosity: basic
+
+  # Jaeger — uncomment if running Jaeger locally
+  # otlp/jaeger:
+  #   endpoint: jaeger:4317
+  #   tls:
+  #     insecure: true
+
+  # Langfuse — uncomment and set credentials
+  # otlp/langfuse:
+  #   endpoint: https://cloud.langfuse.com/api/public/otel
+  #   headers:
+  #     Authorization: "Basic <base64(public_key:secret_key)>"
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

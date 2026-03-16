@@ -18,22 +18,58 @@ mod cache;
 mod context;
 mod gherkin;
 mod llm;
+mod memory;
 mod openspec;
 mod parser;
 mod rag;
 mod session;
 
+/// Initialise structured tracing with `EnvFilter` and optional OTEL export.
+///
+/// Verbosity is controlled by the `RUST_LOG` environment variable.
+/// Default: `info,dockock=debug,rig=info`.
+fn init_tracing() {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info,dockock=debug,rig=info".into());
+
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .with_thread_ids(true);
+
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
+
+    #[cfg(feature = "otel")]
+    let registry = {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .build()
+            .expect("OTLP exporter");
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                opentelemetry_sdk::Resource::builder()
+                    .with_service_name("dockock")
+                    .build(),
+            )
+            .build();
+        let tracer = provider.tracer("dockock");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        registry.with(otel_layer)
+    };
+
+    registry.init();
+}
+
 fn main() -> eframe::Result<()> {
     // Load .env file (API keys, custom provider settings)
     dotenv::dotenv().ok();
 
-    // Initialise tracing for debug logs
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
+    // Initialise structured tracing with configurable verbosity
+    init_tracing();
 
     // Create a Tokio runtime that lives for the duration of the process.
     // The UI runs on the main thread; async work is spawned via the runtime handle.

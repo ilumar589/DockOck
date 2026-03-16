@@ -21,7 +21,7 @@ eframe = "0.33.3"
 egui = "0.33.3"
 
 # LLM integration (Ollama via rig-core)
-rig-core = "0.32.0"
+rig-core = { version = "0.32.0", features = ["derive"] }
 
 # Environment file loading
 dotenv = "0.15"
@@ -51,9 +51,15 @@ rfd = "0.17.2"
 base64 = "0.22"
 reqwest = { version = "0.13.2", features = ["json"] }
 
-# Logging
+# Logging / observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Optional: OpenTelemetry export (behind feature flag)
+tracing-opentelemetry = { version = "0.32.1", optional = true }
+opentelemetry = { version = "0.31", features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["tonic", "trace"], optional = true }
 
 # Caching
 sha2 = "0.10"
@@ -64,3 +70,18 @@ regex = "1"
 
 # Async utilities (CancellationToken, TaskTracker)
 tokio-util = { version = "0.7", features = ["rt"] }
+
+# RAG: MongoDB vector store + embeddings
+mongodb = "3"
+rig-mongodb = "0.4.1"
+
+# RAG: Local CPU-only embeddings fallback
+rig-fastembed = "0.3.1"
+
+# Memory: unique IDs and timestamps for factoid storage
+nanoid = "0.4"
+chrono = "0.4"
+
+[features]
+default = []
+otel = ["tracing-opentelemetry", "opentelemetry", "opentelemetry_sdk", "opentelemetry-otlp"]

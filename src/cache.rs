@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use tracing::warn;
+use tracing::{instrument, warn};
 
 /// Compute a hex-encoded SHA-256 hash of the given data.
 pub fn content_hash(data: &[u8]) -> String {
@@ -54,6 +54,7 @@ impl DiskCache {
     }
 
     /// Retrieve a cached value by namespace and key hash.
+    #[instrument(skip(self, key), fields(ns = namespace))]
     pub fn get<T: for<'de> Deserialize<'de>>(&self, namespace: &str, key: &str) -> Option<T> {
         if !self.enabled {
             return None;
@@ -73,6 +74,7 @@ impl DiskCache {
     }
 
     /// Store a value in the cache under a namespace and key hash.
+    #[instrument(skip(self, key, value), fields(ns = namespace))]
     pub fn put<T: Serialize>(&self, namespace: &str, key: &str, value: &T) {
         if !self.enabled {
             return;

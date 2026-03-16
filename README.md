@@ -74,15 +74,22 @@ DockOck/
 │   ├── app.rs           – egui application (state, UI, event loop)
 │   ├── context.rs       – Shared cross-file context accumulator
 │   ├── gherkin.rs       – Gherkin data structures + LLM output parser
+│   ├── rag.rs           – RAG pipeline (chunking, embedding, MongoDB vector store)
+│   ├── memory.rs        – Cross-session factoid persistence
+│   ├── cache.rs         – Content-addressed disk cache (SHA-256)
+│   ├── session.rs       – Session save/load (JSON)
+│   ├── openspec.rs      – OpenSpec HTTP client
 │   ├── parser/
 │   │   ├── mod.rs       – File-type dispatcher
 │   │   ├── word.rs      – .docx parser (ZIP + XML)
 │   │   ├── excel.rs     – .xlsx parser (calamine)
 │   │   └── visio.rs     – .vsdx parser (ZIP + XML)
 │   └── llm/
-│       └── mod.rs       – Ollama integration via rig-core
+│       ├── mod.rs       – LLM orchestration (4-agent pipeline via rig-core)
+│       ├── prefix_cache.rs – KV-cache prefix priming
+│       └── provider.rs  – Custom provider abstraction
 ├── Dockerfile.ollama    – Stand-alone Ollama Docker image
-├── docker-compose.yml   – Recommended way to run Ollama locally
+├── docker-compose.yml   – Services: 4× Ollama, MongoDB 7, OpenSpec
 └── docs/
     ├── SETUP.md         – Detailed setup guide
     └── ARCHITECTURE.md  – Architecture and design decisions
@@ -90,7 +97,28 @@ DockOck/
 
 ---
 
-## 📚 Further Reading
+## � OpenTelemetry (Optional)
+
+DockOck supports exporting traces via OpenTelemetry when compiled with the `otel` feature:
+
+```bash
+cargo run --release --features otel
+```
+
+By default traces are sent to `http://localhost:4318` (HTTP/protobuf). Override with:
+
+```bash
+set OTEL_EXPORTER_OTLP_ENDPOINT=http://your-collector:4318
+cargo run --release --features otel
+```
+
+A ready-made collector config is provided in [`otel/config.yaml`](otel/config.yaml). To run the collector alongside Ollama, add it to your Docker Compose setup (see comments in the config file).
+
+Traces include spans for every LLM call, file parse, embedding build, and RAG retrieval — ideal for debugging latency and monitoring token usage in Jaeger or Langfuse.
+
+---
+
+## �📚 Further Reading
 
 - [docs/SETUP.md](docs/SETUP.md) – Detailed environment setup and troubleshooting
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) – Architecture overview and design decisions

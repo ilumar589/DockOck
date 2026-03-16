@@ -19,6 +19,7 @@ use std::path::Path;
 ///
 /// A structural outline is prepended showing sheet names and row counts,
 /// followed by the full content of each sheet.
+#[tracing::instrument(name = "parser.excel", skip(path), fields(file_name = %path.display()))]
 pub fn parse(path: &Path) -> Result<String> {
     let mut workbook = open_workbook_auto(path)
         .with_context(|| format!("Failed to open spreadsheet: {}", path.display()))?;

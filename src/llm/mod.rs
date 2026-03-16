@@ -53,7 +53,7 @@ pub const DEFAULT_REVIEWER_MODEL: &str = "qwen2.5-coder:7b";
 pub const DEFAULT_VISION_MODEL: &str = "moondream";
 
 /// Default maximum number of files processed through the LLM pipeline simultaneously.
-pub const DEFAULT_MAX_CONCURRENT: usize = 3;
+pub const DEFAULT_MAX_CONCURRENT: usize = 20;
 
 /// Maximum number of characters to send to the LLM in a single prompt.
 /// Text beyond this limit is truncated with a note.
@@ -361,6 +361,9 @@ pub struct AgentOrchestrator {
     cache: crate::cache::DiskCache,
     /// KV-cache for generator shared prefix (Ollama only).
     generator_prefix_cache: Option<tokio::sync::Mutex<PrefixCache>>,
+    /// Shared RAG indexes for `dynamic_context()` (chunks + memories).
+    /// When non-empty, agents automatically inject relevant context per call.
+    rag_indexes: Vec<crate::rag::SharedVectorIndex>,
 }
 
 /// Result of checking which Ollama endpoints are reachable.
@@ -479,6 +482,7 @@ impl AgentOrchestrator {
                         generator_prefix_cache: Some(tokio::sync::Mutex::new(
                             PrefixCache::new(ENDPOINT_GENERATOR.url, generator_model)
                         )),
+                        rag_indexes: Vec::new(),
                     },
                     statuses,
                 ))
@@ -551,11 +555,19 @@ impl AgentOrchestrator {
                         mode,
                         cache,
                         generator_prefix_cache: None, // not applicable for cloud APIs
+                        rag_indexes: Vec::new(),
                     },
                     statuses,
                 ))
             }
         }
+    }
+
+    /// Set the RAG vector store indexes for `dynamic_context()` integration.
+    /// When set, agents will automatically retrieve relevant cross-file context
+    /// from MongoDB vector indexes on each LLM call.
+    pub fn set_rag_indexes(&mut self, indexes: Vec<crate::rag::SharedVectorIndex>) {
+        self.rag_indexes = indexes;
     }
 
     /// Prime the generator's KV-cache prefix (Ollama only).
@@ -690,6 +702,11 @@ impl AgentOrchestrator {
 
     /// Build an agent for one of the Ollama text roles and stream a chat.
     /// `ollama_client` is the Ollama client for this role (may fall back to generator).
+    #[tracing::instrument(
+        name = "llm.run_ollama_chat",
+        skip(ollama_client, preamble, prompt, history, rag_indexes, status_tx, cancel_token),
+        fields(model, stage_name, file_name)
+    )]
     async fn run_ollama_chat(
         ollama_client: &ollama::Client,
         model: &str,
@@ -698,6 +715,7 @@ impl AgentOrchestrator {
         history: Vec<Message>,
         stage_name: &str,
         file_name: &str,
+        rag_indexes: &[crate::rag::SharedVectorIndex],
         status_tx: &std::sync::mpsc::Sender<String>,
         timeout: std::time::Duration,
         cancel_token: &CancellationToken,
@@ -708,11 +726,14 @@ impl AgentOrchestrator {
             if cancel_token.is_cancelled() {
                 anyhow::bail!("{stage_name} cancelled for {file_name}");
             }
-            let agent = ollama_client
+            let mut builder = ollama_client
                 .agent(model)
                 .preamble(preamble)
-                .additional_params(serde_json::json!({"num_ctx": num_ctx}))
-                .build();
+                .additional_params(serde_json::json!({"num_ctx": num_ctx}));
+            for idx in rag_indexes {
+                builder = builder.dynamic_context(4, idx.clone());
+            }
+            let agent = builder.build();
             match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout, cancel_token).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
@@ -740,6 +761,11 @@ impl AgentOrchestrator {
     }
 
     /// Build an agent for the OpenAI-compatible backend and stream a chat.
+    #[tracing::instrument(
+        name = "llm.run_openai_chat",
+        skip(openai_client, preamble, prompt, history, rag_indexes, status_tx, cancel_token),
+        fields(model, stage_name, file_name)
+    )]
     async fn run_openai_chat(
         openai_client: &openai::CompletionsClient,
         model: &str,
@@ -748,6 +774,7 @@ impl AgentOrchestrator {
         history: Vec<Message>,
         stage_name: &str,
         file_name: &str,
+        rag_indexes: &[crate::rag::SharedVectorIndex],
         status_tx: &std::sync::mpsc::Sender<String>,
         timeout: std::time::Duration,
         cancel_token: &CancellationToken,
@@ -757,10 +784,13 @@ impl AgentOrchestrator {
             if cancel_token.is_cancelled() {
                 anyhow::bail!("{stage_name} cancelled for {file_name}");
             }
-            let agent = openai_client
+            let mut builder = openai_client
                 .agent(model)
-                .preamble(preamble)
-                .build();
+                .preamble(preamble);
+            for idx in rag_indexes {
+                builder = builder.dynamic_context(4, idx.clone());
+            }
+            let agent = builder.build();
             match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout, cancel_token).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
@@ -827,7 +857,14 @@ impl AgentOrchestrator {
 
     /// Run the pipeline for one file. Stages depend on `self.mode`.
     /// Results are cached by content hash when `force_regenerate` is false.
-    /// If `rag_context` is provided, it replaces the default cross-file excerpt context.
+    /// When RAG dynamic_context indexes are configured, cross-file context is
+    /// injected automatically by rig-core; otherwise the local ProjectContext
+    /// excerpt is used.
+    #[tracing::instrument(
+        name = "llm.process_file",
+        skip(self, raw_text, images, context, status_tx, cancel_token),
+        fields(file_name, file_type, pipeline_mode = ?self.mode)
+    )]
     pub async fn process_file(
         &self,
         file_name: &str,
@@ -835,15 +872,18 @@ impl AgentOrchestrator {
         raw_text: &str,
         images: &[crate::parser::ExtractedImage],
         context: &ProjectContext,
-        rag_context: Option<&str>,
         status_tx: &std::sync::mpsc::Sender<String>,
         force_regenerate: bool,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
-        // Build LLM cache key from all inputs that affect the output
-        let context_summary = match rag_context {
-            Some(rc) => rc.to_string(),
-            None => context.build_summary(),
+        // Build LLM cache key from all inputs that affect the output.
+        // When RAG indexes are active, dynamic context is retrieved per-call
+        // and we leave context_summary empty (cache key changes only when
+        // the document itself changes).
+        let context_summary = if self.rag_indexes.is_empty() {
+            context.build_summary()
+        } else {
+            String::new()
         };
         let images_hash = {
             let mut h = sha2::Sha256::new();
@@ -893,7 +933,7 @@ impl AgentOrchestrator {
         // ── Chunk-and-merge path for oversized documents ──
         if needs_chunking(&enriched_text, budget_model) {
             let result = self.process_file_chunked(
-                file_name, file_type, &enriched_text, context, rag_context, status_tx, cancel_token,
+                file_name, file_type, &enriched_text, context, status_tx, cancel_token,
             ).await?;
             self.cache.put_text(crate::cache::NS_LLM, &llm_cache_key, &result);
             return Ok(result);
@@ -954,13 +994,17 @@ impl AgentOrchestrator {
     /// Chunked pipeline for documents that exceed the model's context window.
     /// Splits text into overlapping windows, processes each chunk through
     /// extract/preprocess → generate, then merges all Gherkin via a merge-review pass.
+    #[tracing::instrument(
+        name = "llm.process_file_chunked",
+        skip(self, enriched_text, context, status_tx, cancel_token),
+        fields(file_name, file_type)
+    )]
     async fn process_file_chunked(
         &self,
         file_name: &str,
         file_type: &str,
         enriched_text: &str,
         context: &ProjectContext,
-        rag_context: Option<&str>,
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
@@ -1008,9 +1052,10 @@ impl AgentOrchestrator {
 
         // Phase 2: Generate Gherkin for each chunk, with prior summaries as context hints
         let glossary = context.build_glossary();
-        let context_summary = match rag_context {
-            Some(rc) => rc.to_string(),
-            None => context.build_summary(),
+        let context_summary = if self.rag_indexes.is_empty() {
+            context.build_summary()
+        } else {
+            String::new()
         };
         let mut chunk_gherkins: Vec<String> = Vec::with_capacity(n);
 
@@ -1094,7 +1139,8 @@ impl AgentOrchestrator {
         if let Some(openai) = &self.openai_client {
             Self::run_openai_chat(
                 openai, &self.generator_model, MERGE_REVIEWER_PREAMBLE,
-                &prompt, history, "Merge", file_name, status_tx,
+                &prompt, history, "Merge", file_name, &[],
+                status_tx,
                 std::time::Duration::from_secs(180),
                 cancel_token,
             ).await
@@ -1102,13 +1148,19 @@ impl AgentOrchestrator {
             Self::run_ollama_chat(
                 self.generator_client.as_ref().expect("Ollama generator required"),
                 &self.generator_model, MERGE_REVIEWER_PREAMBLE,
-                &prompt, history, "Merge", file_name, status_tx,
+                &prompt, history, "Merge", file_name, &[],
+                status_tx,
                 std::time::Duration::from_secs(180),
                 cancel_token,
             ).await
         }
     }
 
+    #[tracing::instrument(
+        name = "llm.extract",
+        skip(self, raw_text, status_tx, cancel_token),
+        fields(file_name, file_type)
+    )]
     async fn extract(
         &self,
         file_name: &str,
@@ -1131,7 +1183,8 @@ impl AgentOrchestrator {
             Self::run_openai_chat(
                 openai, model, EXTRACTOR_PREAMBLE,
                 "Produce the structured summary now.",
-                history, "Extractor", file_name, status_tx,
+                history, "Extractor", file_name, &[],
+                status_tx,
                 std::time::Duration::from_secs(120),
                 cancel_token,
             ).await
@@ -1139,13 +1192,19 @@ impl AgentOrchestrator {
             Self::run_ollama_chat(
                 self.ollama_extractor_client(), model, EXTRACTOR_PREAMBLE,
                 "Produce the structured summary now.",
-                history, "Extractor", file_name, status_tx,
+                history, "Extractor", file_name, &[],
+                status_tx,
                 std::time::Duration::from_secs(120),
                 cancel_token,
             ).await
         }
     }
 
+    #[tracing::instrument(
+        name = "llm.generate",
+        skip(self, summary, context_summary, glossary, status_tx, cancel_token),
+        fields(file_name, context_len = context_summary.len())
+    )]
     async fn generate(
         &self,
         file_name: &str,
@@ -1155,30 +1214,34 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
-        // Try prefix-cached path first (Ollama only — skips recomputing shared prefix attention)
-        if let Some(ref cache_mutex) = self.generator_prefix_cache {
-            let num_ctx = context_window_for_model(&self.generator_model);
-            let cache = cache_mutex.lock().await;
-            if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
-                // Build per-file suffix only (glossary is in the cached prefix)
-                let mut suffix = String::new();
-                if !context_summary.contains("No prior files") && !context_summary.is_empty() {
-                    suffix.push_str(context_summary);
-                    suffix.push('\n');
-                }
-                suffix.push_str(&format!(
-                    "=== Structured Summary ===\n{summary}\n\n\
-                     Generate the Gherkin Feature for document: {file_name}"
-                ));
+        // Try prefix-cached path first (Ollama only — skips recomputing shared prefix attention).
+        // When RAG dynamic_context is active, skip prefix cache because it
+        // bypasses agent construction and cannot inject retrieved chunks.
+        if self.rag_indexes.is_empty() {
+            if let Some(ref cache_mutex) = self.generator_prefix_cache {
+                let num_ctx = context_window_for_model(&self.generator_model);
+                let cache = cache_mutex.lock().await;
+                if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
+                    // Build per-file suffix only (glossary is in the cached prefix)
+                    let mut suffix = String::new();
+                    if !context_summary.contains("No prior files") && !context_summary.is_empty() {
+                        suffix.push_str(context_summary);
+                        suffix.push('\n');
+                    }
+                    suffix.push_str(&format!(
+                        "=== Structured Summary ===\n{summary}\n\n\
+                         Generate the Gherkin Feature for document: {file_name}"
+                    ));
 
-                return cache.stream_generate(
-                    &suffix,
-                    num_ctx,
-                    "Generator",
-                    file_name,
-                    status_tx,
-                    std::time::Duration::from_secs(180),
-                ).await;
+                    return cache.stream_generate(
+                        &suffix,
+                        num_ctx,
+                        "Generator",
+                        file_name,
+                        status_tx,
+                        std::time::Duration::from_secs(180),
+                    ).await;
+                }
             }
         }
 
@@ -1193,16 +1256,27 @@ impl AgentOrchestrator {
             history.push(Message::user(context_summary.to_owned()));
         }
 
-        history.push(Message::user(format!(
-            "=== Structured Summary ===\n{summary}"
-        )));
-
-        let prompt = format!("Generate the Gherkin Feature for document: {file_name}");
+        // When RAG indexes are active, fold the structured summary INTO the
+        // prompt text so that rig-core's `rag_text()` (which reads the prompt
+        // message) captures meaningful content for vector retrieval.  Without
+        // RAG the summary stays in a preceding chat-history message.
+        let prompt = if !self.rag_indexes.is_empty() {
+            format!(
+                "=== Structured Summary ===\n{summary}\n\n\
+                 Generate the Gherkin Feature for document: {file_name}"
+            )
+        } else {
+            history.push(Message::user(format!(
+                "=== Structured Summary ===\n{summary}"
+            )));
+            format!("Generate the Gherkin Feature for document: {file_name}")
+        };
 
         if let Some(openai) = &self.openai_client {
             Self::run_openai_chat(
                 openai, &self.generator_model, GENERATOR_PREAMBLE,
-                &prompt, history, "Generator", file_name, status_tx,
+                &prompt, history, "Generator", file_name, &self.rag_indexes,
+                status_tx,
                 std::time::Duration::from_secs(180),
                 cancel_token,
             ).await
@@ -1210,13 +1284,19 @@ impl AgentOrchestrator {
             Self::run_ollama_chat(
                 self.generator_client.as_ref().expect("Ollama generator required"),
                 &self.generator_model, GENERATOR_PREAMBLE,
-                &prompt, history, "Generator", file_name, status_tx,
+                &prompt, history, "Generator", file_name, &self.rag_indexes,
+                status_tx,
                 std::time::Duration::from_secs(180),
                 cancel_token,
             ).await
         }
     }
 
+    #[tracing::instrument(
+        name = "llm.review",
+        skip(self, gherkin, status_tx, cancel_token),
+        fields(file_name)
+    )]
     async fn review(
         &self,
         file_name: &str,
@@ -1233,7 +1313,8 @@ impl AgentOrchestrator {
             Self::run_openai_chat(
                 openai, model, REVIEWER_PREAMBLE,
                 "Review and correct the Gherkin Feature above. Output only the corrected Gherkin:",
-                history, "Reviewer", file_name, status_tx,
+                history, "Reviewer", file_name, &[],
+                status_tx,
                 std::time::Duration::from_secs(120),
                 cancel_token,
             ).await
@@ -1241,7 +1322,8 @@ impl AgentOrchestrator {
             Self::run_ollama_chat(
                 self.ollama_reviewer_client(), model, REVIEWER_PREAMBLE,
                 "Review and correct the Gherkin Feature above. Output only the corrected Gherkin:",
-                history, "Reviewer", file_name, status_tx,
+                history, "Reviewer", file_name, &[],
+                status_tx,
                 std::time::Duration::from_secs(120),
                 cancel_token,
             ).await
@@ -1252,6 +1334,11 @@ impl AgentOrchestrator {
     ///
     /// Each image is sent to the vision model; the resulting descriptions are
     /// appended to the raw text so the generator LLM has full context.
+    #[tracing::instrument(
+        name = "llm.enrich_text_with_images",
+        skip(self, raw_text, images, status_tx, cancel_token),
+        fields(file_name, image_count = images.len())
+    )]
     async fn enrich_text_with_images(
         &self,
         raw_text: &str,
@@ -1316,13 +1403,19 @@ impl AgentOrchestrator {
     }
 
     /// Run the pipeline for a group of related files, producing a single merged Gherkin output.
-    /// If `rag_context` is provided, it replaces the default cross-file excerpt context.
+    /// When RAG dynamic_context indexes are configured, cross-file context is
+    /// injected automatically by rig-core; otherwise the local ProjectContext
+    /// excerpt is used.
+    #[tracing::instrument(
+        name = "llm.process_group",
+        skip(self, members, context, status_tx, cancel_token),
+        fields(group_name, member_count = members.len())
+    )]
     pub async fn process_group(
         &self,
         group_name: &str,
         members: &[(String, String, String, Vec<crate::parser::ExtractedImage>)],
         context: &ProjectContext,
-        rag_context: Option<&str>,
         status_tx: &std::sync::mpsc::Sender<String>,
         force_regenerate: bool,
         cancel_token: &CancellationToken,
@@ -1400,7 +1493,7 @@ impl AgentOrchestrator {
         };
         if needs_chunking(&merged_text, budget_model) {
             let result = self.process_file_chunked(
-                group_name, "Multi-document group", &merged_text, context, rag_context, status_tx, cancel_token,
+                group_name, "Multi-document group", &merged_text, context, status_tx, cancel_token,
             ).await?;
             self.cache.put_text(crate::cache::NS_LLM, &group_cache_key, &result);
             return Ok(result);
@@ -1451,9 +1544,10 @@ impl AgentOrchestrator {
             .cloned()
             .collect();
 
-        let context_summary = match rag_context {
-            Some(rc) => rc.to_string(),
-            None => context.build_summary_excluding(&exclude),
+        let context_summary = if self.rag_indexes.is_empty() {
+            context.build_summary_excluding(&exclude)
+        } else {
+            String::new()
         };
         let gherkin = self
             .generate_group(group_name, &summary, &context_summary, &context.build_glossary(), status_tx, cancel_token)
@@ -1487,6 +1581,11 @@ impl AgentOrchestrator {
         Ok(result)
     }
 
+    #[tracing::instrument(
+        name = "llm.extract_group",
+        skip(self, merged_text, status_tx, cancel_token),
+        fields(group_name)
+    )]
     async fn extract_group(
         &self,
         group_name: &str,
@@ -1508,7 +1607,8 @@ impl AgentOrchestrator {
             Self::run_openai_chat(
                 openai, model, GROUP_EXTRACTOR_PREAMBLE,
                 "Produce a single unified structured summary for this document group.",
-                history, "Extractor", group_name, status_tx,
+                history, "Extractor", group_name, &[],
+                status_tx,
                 std::time::Duration::from_secs(180),
                 cancel_token,
             ).await
@@ -1516,13 +1616,19 @@ impl AgentOrchestrator {
             Self::run_ollama_chat(
                 self.ollama_extractor_client(), model, GROUP_EXTRACTOR_PREAMBLE,
                 "Produce a single unified structured summary for this document group.",
-                history, "Extractor", group_name, status_tx,
+                history, "Extractor", group_name, &[],
+                status_tx,
                 std::time::Duration::from_secs(180),
                 cancel_token,
             ).await
         }
     }
 
+    #[tracing::instrument(
+        name = "llm.generate_group",
+        skip(self, summary, context_summary, glossary, status_tx, cancel_token),
+        fields(group_name, context_len = context_summary.len())
+    )]
     async fn generate_group(
         &self,
         group_name: &str,
@@ -1532,38 +1638,41 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
-        // Try prefix-cached path first (Ollama only)
-        if let Some(ref cache_mutex) = self.generator_prefix_cache {
-            let num_ctx = context_window_for_model(&self.generator_model);
-            let cache = cache_mutex.lock().await;
-            // Groups use GROUP_GENERATOR_PREAMBLE, not the standard one.
-            // The prefix cache is primed with GENERATOR_PREAMBLE. If the
-            // glossary matches, the cached prefix still saves glossary
-            // recomputation even though the system prompt differs slightly.
-            // For simplicity we only use the cache when primed with the
-            // matching preamble — which means groups fall through to the
-            // rig-core path.  A future optimisation could prime a separate
-            // cache for the group preamble.
-            if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
-                // Build suffix with group-specific framing
-                let mut suffix = String::new();
-                if !context_summary.contains("No prior files") && !context_summary.is_empty() {
-                    suffix.push_str(context_summary);
-                    suffix.push('\n');
-                }
-                suffix.push_str(&format!(
-                    "=== Unified Structured Summary ===\n{summary}\n\n\
-                     Generate a single cohesive Gherkin Feature for document group: {group_name}"
-                ));
+        // Try prefix-cached path first (Ollama only).
+        // Skip when RAG dynamic_context is active — same reasoning as generate().
+        if self.rag_indexes.is_empty() {
+            if let Some(ref cache_mutex) = self.generator_prefix_cache {
+                let num_ctx = context_window_for_model(&self.generator_model);
+                let cache = cache_mutex.lock().await;
+                // Groups use GROUP_GENERATOR_PREAMBLE, not the standard one.
+                // The prefix cache is primed with GENERATOR_PREAMBLE. If the
+                // glossary matches, the cached prefix still saves glossary
+                // recomputation even though the system prompt differs slightly.
+                // For simplicity we only use the cache when primed with the
+                // matching preamble — which means groups fall through to the
+                // rig-core path.  A future optimisation could prime a separate
+                // cache for the group preamble.
+                if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
+                    // Build suffix with group-specific framing
+                    let mut suffix = String::new();
+                    if !context_summary.contains("No prior files") && !context_summary.is_empty() {
+                        suffix.push_str(context_summary);
+                        suffix.push('\n');
+                    }
+                    suffix.push_str(&format!(
+                        "=== Unified Structured Summary ===\n{summary}\n\n\
+                         Generate a single cohesive Gherkin Feature for document group: {group_name}"
+                    ));
 
-                return cache.stream_generate(
-                    &suffix,
-                    num_ctx,
-                    "Generator",
-                    group_name,
-                    status_tx,
-                    std::time::Duration::from_secs(240),
-                ).await;
+                    return cache.stream_generate(
+                        &suffix,
+                        num_ctx,
+                        "Generator",
+                        group_name,
+                        status_tx,
+                        std::time::Duration::from_secs(240),
+                    ).await;
+                }
             }
         }
 
@@ -1578,16 +1687,24 @@ impl AgentOrchestrator {
             history.push(Message::user(context_summary.to_owned()));
         }
 
-        history.push(Message::user(format!(
-            "=== Unified Structured Summary ===\n{summary}"
-        )));
-
-        let prompt = format!("Generate a single cohesive Gherkin Feature for document group: {group_name}");
+        // Fold summary into prompt when RAG active (same pattern as generate()).
+        let prompt = if !self.rag_indexes.is_empty() {
+            format!(
+                "=== Unified Structured Summary ===\n{summary}\n\n\
+                 Generate a single cohesive Gherkin Feature for document group: {group_name}"
+            )
+        } else {
+            history.push(Message::user(format!(
+                "=== Unified Structured Summary ===\n{summary}"
+            )));
+            format!("Generate a single cohesive Gherkin Feature for document group: {group_name}")
+        };
 
         if let Some(openai) = &self.openai_client {
             Self::run_openai_chat(
                 openai, &self.generator_model, GROUP_GENERATOR_PREAMBLE,
-                &prompt, history, "Generator", group_name, status_tx,
+                &prompt, history, "Generator", group_name, &self.rag_indexes,
+                status_tx,
                 std::time::Duration::from_secs(240),
                 cancel_token,
             ).await
@@ -1595,7 +1712,8 @@ impl AgentOrchestrator {
             Self::run_ollama_chat(
                 self.generator_client.as_ref().expect("Ollama generator required"),
                 &self.generator_model, GROUP_GENERATOR_PREAMBLE,
-                &prompt, history, "Generator", group_name, status_tx,
+                &prompt, history, "Generator", group_name, &self.rag_indexes,
+                status_tx,
                 std::time::Duration::from_secs(240),
                 cancel_token,
             ).await
@@ -1605,6 +1723,11 @@ impl AgentOrchestrator {
     /// Describe a single image using the vision model.
     /// Routes to cloud (OpenAI-compatible) or local (Ollama) based on backend.
     /// Results are cached by image content hash + model name.
+    #[tracing::instrument(
+        name = "llm.describe_image",
+        skip(self, image, cancel_token, status_tx),
+        fields(image_label = %image.label, image_size_bytes = image.data.len())
+    )]
     async fn describe_image(
         &self,
         image: &crate::parser::ExtractedImage,
@@ -2094,6 +2217,11 @@ fn snap_to_line_boundary_llm(text: &str) -> String {
 /// full response text and sending periodic progress updates via `status_tx`.
 /// The model sees each history message as a distinct turn, giving it clearer
 /// separation between glossary / context / document content.
+#[tracing::instrument(
+    name = "llm.stream_chat",
+    skip(agent, prompt, chat_history, status_tx, cancel_token),
+    fields(stage_name, file_name)
+)]
 async fn stream_chat_with_progress<M, P>(
     agent: &rig::agent::Agent<M, P>,
     prompt: &str,

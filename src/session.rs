@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 use crate::context::FileGroup;
 use crate::gherkin::GherkinDocument;
@@ -46,6 +47,7 @@ fn session_path(output_dir: &Path) -> PathBuf {
 }
 
 /// Save session data to disk. Returns `Ok(path)` on success.
+#[instrument(skip(data))]
 pub fn save(output_dir: &Path, data: &SessionData) -> Result<PathBuf, String> {
     let path = session_path(output_dir);
     let json = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
@@ -54,6 +56,7 @@ pub fn save(output_dir: &Path, data: &SessionData) -> Result<PathBuf, String> {
 }
 
 /// Load session data from disk. Returns `None` if the file doesn't exist.
+#[instrument]
 pub fn load(output_dir: &Path) -> Option<SessionData> {
     let path = session_path(output_dir);
     let json = std::fs::read_to_string(&path).ok()?;
