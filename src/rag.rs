@@ -127,9 +127,14 @@ pub fn chunk_text(text: &str, file_name: &str, file_type: &str) -> Vec<TextChunk
 /// Snap the chunk boundary to the last newline in the final 20% of the text.
 fn snap_to_line_boundary(text: &str) -> String {
     let len = text.len();
-    let search_start = len.saturating_sub(len / 5);
+    let mut search_start = len.saturating_sub(len / 5);
+    // Ensure search_start falls on a UTF-8 char boundary
+    while search_start < len && !text.is_char_boundary(search_start) {
+        search_start += 1;
+    }
     if let Some(pos) = text[search_start..].rfind('\n') {
-        text[..search_start + pos + 1].to_string()
+        let end = search_start + pos + 1;
+        text[..end].to_string()
     } else {
         text.to_string()
     }
@@ -289,14 +294,21 @@ pub enum EmbeddingProvider {
 /// Build the RAG index by embedding all project file chunks and upserting
 /// them into MongoDB. Returns `true` if index was built successfully.
 ///
+/// Chunks whose `document_id` already exists in MongoDB are skipped (incremental).
+/// Embedding is done in batches of `EMBED_BATCH_SIZE` for progress visibility
+/// and to avoid OOM on large projects.
+///
 /// Falls back gracefully: if embedding fails, returns `false` so
 /// the caller can use excerpt-based context instead.
+const EMBED_BATCH_SIZE: usize = 64;
+
 #[instrument(skip_all, fields(chunk_count))]
 pub async fn build_index(
     provider: &EmbeddingProvider,
     chunks: &[TextChunk],
     collection: &Collection<bson::Document>,
     cancel_token: &CancellationToken,
+    on_progress: impl Fn(&str),  // status message
 ) -> Result<bool> {
     if chunks.is_empty() {
         info!("RAG: no chunks to index");
@@ -304,37 +316,140 @@ pub async fn build_index(
     }
     tracing::Span::current().record("chunk_count", chunks.len());
 
-    match provider {
-        EmbeddingProvider::Ollama { client, model } => {
-            build_index_ollama(client, model, chunks, collection, cancel_token).await
-        }
-        EmbeddingProvider::FastEmbed => {
-            build_index_fastembed(chunks, collection, cancel_token).await
-        }
+    // ── Skip chunks already in MongoDB (incremental indexing) ──
+    on_progress("🔍 Checking for already-indexed chunks…");
+    eprintln!("[DEBUG RAG build_index] checking existing_ids for {} chunks…", chunks.len());
+    let all_ids: Vec<String> = chunks.iter().map(|c| c.document_id()).collect();
+    let existing = existing_ids(collection, &all_ids).await;
+    eprintln!("[DEBUG RAG build_index] existing_ids done: {} found", existing.len());
+    let new_chunks: Vec<&TextChunk> = chunks
+        .iter()
+        .filter(|c| !existing.contains(&c.document_id()))
+        .collect();
+
+    if new_chunks.is_empty() {
+        on_progress(&format!("✅ All {} chunks already indexed — skipping embed", chunks.len()));
+        info!("RAG: all {} chunks already indexed — skipping", chunks.len());
+        return Ok(true);
     }
+    on_progress(&format!(
+        "🔨 {} new chunks to embed ({} cached)", new_chunks.len(), existing.len()
+    ));
+
+    let total_batches = (new_chunks.len() + EMBED_BATCH_SIZE - 1) / EMBED_BATCH_SIZE;
+    let mut indexed = 0usize;
+
+    for (batch_idx, batch) in new_chunks.chunks(EMBED_BATCH_SIZE).enumerate() {
+        if cancel_token.is_cancelled() {
+            anyhow::bail!("Cancelled during RAG indexing");
+        }
+        let ids: Vec<String> = batch.iter().map(|c| c.document_id()).collect();
+        let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
+
+        on_progress(&format!(
+            "🧠 Embedding batch {}/{} ({} texts)…",
+            batch_idx + 1, total_batches, texts.len()
+        ));
+
+        let embeddings = match provider {
+            EmbeddingProvider::Ollama { client, model } => {
+                embed_ollama(client, model, texts, cancel_token).await?
+            }
+            EmbeddingProvider::FastEmbed => {
+                embed_fastembed(texts, cancel_token).await?
+            }
+        };
+
+        let Some(embeddings) = embeddings else {
+            return Ok(false);
+        };
+
+        on_progress(&format!(
+            "💾 Storing batch {}/{} in MongoDB…", batch_idx + 1, total_batches
+        ));
+
+        upsert_embeddings(&ids, &embeddings, collection).await?;
+        indexed += batch.len();
+        info!(
+            "RAG: batch {}/{} done ({}/{} chunks indexed)",
+            batch_idx + 1,
+            total_batches,
+            indexed,
+            new_chunks.len()
+        );
+    }
+
+    info!(
+        "RAG index built via {} ({} new chunks, {} already existed)",
+        match provider {
+            EmbeddingProvider::Ollama { .. } => "Ollama",
+            EmbeddingProvider::FastEmbed => "FastEmbed",
+        },
+        indexed,
+        existing.len()
+    );
+    Ok(true)
 }
 
-/// Build index using Ollama embeddings.
-async fn build_index_ollama(
+/// Return the set of IDs that already exist in the collection.
+async fn existing_ids(
+    collection: &Collection<bson::Document>,
+    ids: &[String],
+) -> std::collections::HashSet<String> {
+    use futures::TryStreamExt;
+    let mut found = std::collections::HashSet::new();
+    // Query in batches of 500 to avoid oversized $in arrays.
+    // Timeout after 10s total — if MongoDB is slow we just re-embed.
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        for batch in ids.chunks(500) {
+            let filter = doc! { "_id": { "$in": batch } };
+            if let Ok(mut cursor) = collection
+                .find(filter)
+                .projection(doc! { "_id": 1 })
+                .await
+            {
+                while let Ok(Some(d)) = cursor.try_next().await {
+                    if let Ok(id) = d.get_str("_id") {
+                        found.insert(id.to_string());
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    if result.is_err() {
+        warn!("RAG: existing_ids check timed out — will re-embed all chunks");
+        return std::collections::HashSet::new();
+    }
+    found
+}
+
+type EmbedResult = Vec<(String, rig::one_or_many::OneOrMany<rig::embeddings::Embedding>)>;
+
+/// Embed a batch of texts via Ollama. Returns `None` if embedding fails.
+/// Times out after 120 seconds per batch to avoid silent hangs.
+async fn embed_ollama(
     client: &rig::providers::ollama::Client,
     model_name: &str,
-    chunks: &[TextChunk],
-    collection: &Collection<bson::Document>,
+    texts: Vec<String>,
     cancel_token: &CancellationToken,
-) -> Result<bool> {
+) -> Result<Option<EmbedResult>> {
     let model = client.embedding_model(model_name);
-    let ids: Vec<String> = chunks.iter().map(|c| c.document_id()).collect();
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-
+    let builder = EmbeddingsBuilder::new(model).documents(texts)?;
     let embeddings = tokio::select! {
-        result = EmbeddingsBuilder::new(model)
-            .documents(texts)?
-            .build() => {
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            builder.build(),
+        ) => {
             match result {
-                Ok(e) => e,
-                Err(e) => {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => {
                     warn!("RAG: Ollama embedding failed: {e}");
-                    return Ok(false);
+                    return Ok(None);
+                }
+                Err(_) => {
+                    warn!("RAG: Ollama embedding timed out (120s)");
+                    return Ok(None);
                 }
             }
         }
@@ -342,32 +457,32 @@ async fn build_index_ollama(
             anyhow::bail!("Cancelled during RAG indexing");
         }
     };
-
-    upsert_embeddings(&ids, &embeddings, collection).await?;
-    info!("RAG index built via Ollama ({} chunks)", embeddings.len());
-    Ok(true)
+    Ok(Some(embeddings))
 }
 
-/// Build index using FastEmbed (local CPU fallback).
-async fn build_index_fastembed(
-    chunks: &[TextChunk],
-    collection: &Collection<bson::Document>,
+/// Embed a batch of texts via FastEmbed. Returns `None` if embedding fails.
+/// Times out after 300 seconds per batch (CPU can be slow).
+async fn embed_fastembed(
+    texts: Vec<String>,
     cancel_token: &CancellationToken,
-) -> Result<bool> {
+) -> Result<Option<EmbedResult>> {
     let fastembed_client = rig_fastembed::Client::new();
     let model = fastembed_client.embedding_model(&FastembedModel::AllMiniLML6V2Q);
-    let ids: Vec<String> = chunks.iter().map(|c| c.document_id()).collect();
-    let texts: Vec<String> = chunks.iter().map(|c| c.text.clone()).collect();
-
+    let builder = EmbeddingsBuilder::new(model).documents(texts)?;
     let embeddings = tokio::select! {
-        result = EmbeddingsBuilder::new(model)
-            .documents(texts)?
-            .build() => {
+        result = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            builder.build(),
+        ) => {
             match result {
-                Ok(e) => e,
-                Err(e) => {
+                Ok(Ok(e)) => e,
+                Ok(Err(e)) => {
                     warn!("RAG: FastEmbed embedding failed: {e}");
-                    return Ok(false);
+                    return Ok(None);
+                }
+                Err(_) => {
+                    warn!("RAG: FastEmbed embedding timed out (300s)");
+                    return Ok(None);
                 }
             }
         }
@@ -375,29 +490,39 @@ async fn build_index_fastembed(
             anyhow::bail!("Cancelled during RAG indexing");
         }
     };
-
-    upsert_embeddings(&ids, &embeddings, collection).await?;
-    info!("RAG index built via FastEmbed ({} chunks)", embeddings.len());
-    Ok(true)
+    Ok(Some(embeddings))
 }
 
-/// Upsert embedded documents into MongoDB.
+/// Upsert embedded documents into MongoDB using concurrent writes.
 async fn upsert_embeddings(
     ids: &[String],
     embeddings: &[(String, rig::one_or_many::OneOrMany<rig::embeddings::Embedding>)],
     collection: &Collection<bson::Document>,
 ) -> Result<()> {
-    for (id, (text, emb_set)) in ids.iter().zip(embeddings.iter()) {
-        let embedding = emb_set.first_ref();
-        let d = doc! {
-            "_id": id.clone(),
-            "text": text.clone(),
-            "embedding": &embedding.vec,
-        };
-        collection
-            .replace_one(doc! { "_id": id.clone() }, d)
-            .upsert(true)
-            .await?;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let futures: FuturesUnordered<_> = ids
+        .iter()
+        .zip(embeddings.iter())
+        .map(|(id, (text, emb_set))| {
+            let id = id.clone();
+            let text = text.clone();
+            let embedding = emb_set.first_ref().vec.clone();
+            let coll = collection.clone();
+            async move {
+                let d = doc! {
+                    "_id": &id,
+                    "text": &text,
+                    "embedding": &embedding,
+                };
+                coll.replace_one(doc! { "_id": &id }, d)
+                    .upsert(true)
+                    .await
+            }
+        })
+        .collect();
+    let results: Vec<_> = futures.collect().await;
+    for r in results {
+        r?;
     }
     Ok(())
 }

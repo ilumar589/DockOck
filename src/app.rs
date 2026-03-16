@@ -2220,10 +2220,10 @@ async fn process_files(
             };
 
             // Helper: test that an Ollama embedding model actually works
-            async fn test_ollama_embed(client: &rig::providers::ollama::Client, model: &str) -> bool {
+            async fn test_ollama_embed(client: &rig::providers::ollama::Client, model: &str, tx: &std::sync::mpsc::Sender<ProcessingEvent>) -> bool {
                 use rig::client::EmbeddingsClient;
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
                     rig::embeddings::EmbeddingsBuilder::new(
                         client.embedding_model(model),
                     )
@@ -2231,16 +2231,27 @@ async fn process_files(
                     .unwrap()
                     .build(),
                 )
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .is_some()
+                .await {
+                    Ok(Ok(_)) => true,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Ollama embed test failed: {e}"
+                        )));
+                        false
+                    }
+                    Err(_) => {
+                        let _ = tx.send(ProcessingEvent::Status(
+                            "⚠ Ollama embed test timed out (30s)".to_string()
+                        ));
+                        false
+                    }
+                }
             }
 
             match embedding_choice {
                 crate::rag::EmbeddingChoice::OllamaNomicEmbedText => {
                     if let Some((client, model)) = try_ollama("nomic-embed-text") {
-                        if test_ollama_embed(&client, &model).await {
+                        if test_ollama_embed(&client, &model, &tx).await {
                             let _ = tx.send(ProcessingEvent::Status(
                                 "🧠 Using Ollama (nomic-embed-text) for RAG embeddings".to_string(),
                             ));
@@ -2257,7 +2268,7 @@ async fn process_files(
                 }
                 crate::rag::EmbeddingChoice::OllamaMxbaiEmbedLarge => {
                     if let Some((client, model)) = try_ollama("mxbai-embed-large") {
-                        if test_ollama_embed(&client, &model).await {
+                        if test_ollama_embed(&client, &model, &tx).await {
                             let _ = tx.send(ProcessingEvent::Status(
                                 "🧠 Using Ollama (mxbai-embed-large) for RAG embeddings".to_string(),
                             ));
@@ -2279,9 +2290,8 @@ async fn process_files(
                     crate::rag::EmbeddingProvider::FastEmbed
                 }
                 crate::rag::EmbeddingChoice::Auto | crate::rag::EmbeddingChoice::None => {
-                    // Auto: try Ollama nomic-embed-text first, fall back to FastEmbed
                     if let Some((client, model)) = try_ollama("nomic-embed-text") {
-                        if test_ollama_embed(&client, &model).await {
+                        if test_ollama_embed(&client, &model, &tx).await {
                             let _ = tx.send(ProcessingEvent::Status(
                                 "🧠 Using Ollama (nomic-embed-text) for RAG embeddings".to_string(),
                             ));
@@ -2303,19 +2313,34 @@ async fn process_files(
         };
 
         // Chunk all files and build the index
+        let _ = tx.send(ProcessingEvent::Status(
+            "📦 Chunking all files for RAG indexing…".to_string(),
+        ));
+        eprintln!("[DEBUG RAG] About to lock context for chunking…");
         let chunks = {
             let ctx = context.lock().map(|c| c.clone()).unwrap_or_default();
+            eprintln!("[DEBUG RAG] Context cloned, {} files, calling chunk_all_files…", ctx.file_contents.len());
             ctx.chunk_all_files()
         };
+        eprintln!("[DEBUG RAG] Chunking done: {} chunks", chunks.len());
+        let _ = tx.send(ProcessingEvent::Status(format!(
+            "📦 Chunked into {} text segments", chunks.len()
+        )));
 
         let collection = crate::rag::chunks_collection(&mongo_client);
+        eprintln!("[DEBUG RAG] Got chunks collection, calling build_index…");
 
         let _ = tx.send(ProcessingEvent::Status(format!(
             "🔨 Building RAG index ({} chunks)…", chunks.len()
         )));
 
+        let tx_progress = tx.clone();
         match crate::rag::build_index(
             &embedding_provider, &chunks, &collection, &cancel_token,
+            move |msg| {
+                eprintln!("[DEBUG RAG] progress: {msg}");
+                let _ = tx_progress.send(ProcessingEvent::Status(msg.to_string()));
+            },
         ).await {
             Ok(true) => {
                 let _ = tx.send(ProcessingEvent::Status(format!(
