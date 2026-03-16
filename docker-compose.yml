@@ -136,7 +136,21 @@ services:
       - openspec_workspace:/workspace
     restart: unless-stopped
 
+  # MongoDB – vector store for RAG embeddings & persistent memories
+  mongo:
+    image: mongodb/mongodb-atlas-local:7
+    container_name: dockock-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      - MONGODB_INITDB_DATABASE=dockock
+    restart: unless-stopped
+
 volumes:
+  mongo_data:
+    driver: local
   ollama_data_generator:
     driver: local
   ollama_data_extractor:
