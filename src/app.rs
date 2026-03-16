@@ -2022,7 +2022,7 @@ async fn process_files(
     let _ = tx.send(ProcessingEvent::Status(
         "🔥 Warming up models…".to_string(),
     ));
-    let orchestrator = Arc::new(orchestrator);
+    let mut orchestrator = Arc::new(orchestrator);
     let warmup_orch = Arc::clone(&orchestrator);
     let warmup_handle = tokio::spawn(async move {
         warmup_orch.warm_up().await;
@@ -2189,7 +2189,7 @@ async fn process_files(
         let _ = tx.send(ProcessingEvent::Status(
             "🔗 Connecting to MongoDB for RAG index…".to_string(),
         ));
-        let mongo_client = match crate::rag::connect_mongo("mongodb://localhost:27017").await {
+        let mongo_client = match crate::rag::connect_mongo("mongodb://localhost:27017/?directConnection=true").await {
             Ok(c) => c,
             Err(e) => {
                 let _ = tx.send(ProcessingEvent::Status(format!(
@@ -2198,6 +2198,9 @@ async fn process_files(
                 break 'rag None;
             }
         };
+
+        // Ensure vector search indexes exist (idempotent — ignores "already exists")
+        crate::rag::ensure_search_indexes(&mongo_client).await;
 
         // Determine embedding provider based on user's choice
         let embedding_provider = {
@@ -2343,7 +2346,22 @@ async fn process_files(
         Some((embedding_provider, mongo_client))
     };
 
-    let rag_state = rag_state.map(Arc::new);
+    // Wire RAG dynamic_context into the orchestrator so rig-core injects
+    // retrieved chunks automatically during generation.  This replaces the
+    // per-file manual retrieve_full_context calls.
+    if let Some((ref provider, ref mongo)) = rag_state {
+        let indexes = crate::rag::create_dynamic_indexes(provider, mongo).await;
+        if !indexes.is_empty() {
+            let _ = tx.send(ProcessingEvent::Status(format!(
+                "🔗 RAG dynamic context: {} vector index(es) configured", indexes.len()
+            )));
+            if let Some(orch) = Arc::get_mut(&mut orchestrator) {
+                orch.set_rag_indexes(indexes);
+            }
+        }
+    }
+    // rag_state is only needed for post-pipeline factoid extraction below;
+    // it is no longer cloned into spawned tasks.
 
     // Take a snapshot of context now (after all files are parsed)
     let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
@@ -2396,7 +2414,6 @@ async fn process_files(
             let gdocs = Arc::clone(&gherkin_docs);
             let force_regen = force_regenerate;
             let child_token = cancel_token.child_token();
-            let rag_st = rag_state.clone();
 
             tracker.spawn(async move {
                 // Cancel-aware semaphore wait
@@ -2411,16 +2428,6 @@ async fn process_files(
                 let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
                 let file_start = std::time::Instant::now();
 
-                // RAG retrieval: query chunks + memories for cross-file context
-                let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
-                    let (ref provider, ref mongo) = **rs;
-                    let query = crate::rag::build_query_text(&raw_text, &file_name);
-                    let ctx_str = crate::rag::retrieve_full_context(provider, mongo, &query, &file_name, &child_token).await;
-                    if ctx_str.is_empty() { None } else { Some(ctx_str) }
-                } else {
-                    None
-                };
-
                 let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
                 let tx_fwd = tx.clone();
                 let fwd = std::thread::spawn(move || {
@@ -2430,7 +2437,7 @@ async fn process_files(
                 });
 
                 let result = orch
-                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, rag_ctx.as_deref(), &status_tx, force_regen, &child_token)
+                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
                     .await;
 
                 drop(status_tx);
@@ -2477,7 +2484,6 @@ async fn process_files(
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
         let child_token = cancel_token.child_token();
-        let rag_st = rag_state.clone();
 
         tracker.spawn(async move {
             // Cancel-aware semaphore wait
@@ -2496,18 +2502,6 @@ async fn process_files(
             }
             let group_start = std::time::Instant::now();
 
-            // RAG retrieval for group: query chunks + memories using merged member content
-            let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
-                let (ref provider, ref mongo) = **rs;
-                let merged_query: String = members_data.iter()
-                    .map(|(name, _, text, _)| crate::rag::build_query_text(text, name))
-                    .collect::<Vec<_>>().join("\n");
-                let ctx_str = crate::rag::retrieve_full_context(provider, mongo, &merged_query, &group_name, &child_token).await;
-                if ctx_str.is_empty() { None } else { Some(ctx_str) }
-            } else {
-                None
-            };
-
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();
             let fwd = std::thread::spawn(move || {
@@ -2520,7 +2514,7 @@ async fn process_files(
                 members_data;
 
             let result = orch
-                .process_group(&group_name, &members_ref, &ctx, rag_ctx.as_deref(), &status_tx, force_regen, &child_token)
+                .process_group(&group_name, &members_ref, &ctx, &status_tx, force_regen, &child_token)
                 .await;
 
             drop(status_tx);
@@ -2586,7 +2580,6 @@ async fn process_files(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let rag_st = rag_state.clone();
 
         tracker.spawn(async move {
             // Cancel-aware semaphore wait
@@ -2604,16 +2597,6 @@ async fn process_files(
             )));
             let file_start = std::time::Instant::now();
 
-            // RAG retrieval: query chunks + memories for cross-file context
-            let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
-                let (ref provider, ref mongo) = **rs;
-                let query = crate::rag::build_query_text(&raw_text, &file_name);
-                let ctx_str = crate::rag::retrieve_full_context(provider, mongo, &query, &file_name, &child_token).await;
-                if ctx_str.is_empty() { None } else { Some(ctx_str) }
-            } else {
-                None
-            };
-
             let (status_tx, status_rx) = std::sync::mpsc::channel::<String>();
             let tx_fwd = tx.clone();
             let fwd = std::thread::spawn(move || {
@@ -2623,7 +2606,7 @@ async fn process_files(
             });
 
             let result = orch
-                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, rag_ctx.as_deref(), &status_tx, force_regen, &child_token)
+                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
                 .await;
 
             drop(status_tx);
@@ -2671,7 +2654,7 @@ async fn process_files(
 
     // ── Phase 2.5: Extract & store factoid memories for future runs ──
     if let Some(ref rs) = rag_state {
-        let (ref provider, ref mongo) = **rs;
+        let (ref provider, ref mongo) = *rs;
         let docs_for_memory = gherkin_docs.lock().map(|d| d.clone()).unwrap_or_default();
         if !docs_for_memory.is_empty() && !cancel_token.is_cancelled() {
             let _ = tx.send(ProcessingEvent::Status(

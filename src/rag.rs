@@ -7,13 +7,20 @@
 //! 4. At generation time, retrieves the top-N most relevant chunks from OTHER
 //!    files to inject as cross-file context
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+
 use anyhow::Result;
 use mongodb::bson::{self, doc};
 use mongodb::options::ClientOptions;
 use mongodb::{Client as MongoClient, Collection};
 use rig::client::EmbeddingsClient;
 use rig::embeddings::EmbeddingsBuilder;
-use rig::vector_store::{VectorSearchRequest, VectorStoreIndex};
+use rig::vector_store::{
+    TopNResults, VectorSearchRequest, VectorStoreError, VectorStoreIndex, VectorStoreIndexDyn,
+    request::Filter,
+};
 use rig_fastembed::FastembedModel;
 use rig_mongodb::{MongoDbVectorIndex, SearchParams};
 use serde::{Deserialize, Serialize};
@@ -149,6 +156,71 @@ pub async fn connect_mongo(connection_string: &str) -> Result<MongoClient> {
 /// Get the chunks collection.
 pub fn chunks_collection(client: &MongoClient) -> Collection<bson::Document> {
     client.database("dockock").collection("chunks")
+}
+
+/// Ensure that the required Atlas Search vector indexes exist on both the
+/// `chunks` and `memories` collections.  On `mongodb-atlas-local` the indexes
+/// are created via `createSearchIndexes`; if they already exist the command
+/// returns an error that we silently ignore.
+#[instrument(skip_all)]
+pub async fn ensure_search_indexes(client: &MongoClient) {
+    let db = client.database("dockock");
+
+    // Index for `chunks` collection
+    let chunks_cmd = doc! {
+        "createSearchIndexes": "chunks",
+        "indexes": [{
+            "name": "vector_index",
+            "type": "vectorSearch",
+            "definition": {
+                "fields": [{
+                    "type": "vector",
+                    "path": "embedding",
+                    "numDimensions": 768,
+                    "similarity": "cosine"
+                }]
+            }
+        }]
+    };
+    match db.run_command(chunks_cmd).await {
+        Ok(_) => info!("Created vector_index on chunks collection"),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already exists") || msg.contains("Duplicate") {
+                info!("vector_index already exists on chunks collection");
+            } else {
+                warn!("Failed to create vector_index on chunks: {e}");
+            }
+        }
+    }
+
+    // Index for `memories` collection
+    let memories_cmd = doc! {
+        "createSearchIndexes": "memories",
+        "indexes": [{
+            "name": "memory_vector_index",
+            "type": "vectorSearch",
+            "definition": {
+                "fields": [{
+                    "type": "vector",
+                    "path": "embedding",
+                    "numDimensions": 768,
+                    "similarity": "cosine"
+                }]
+            }
+        }]
+    };
+    match db.run_command(memories_cmd).await {
+        Ok(_) => info!("Created memory_vector_index on memories collection"),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("already exists") || msg.contains("Duplicate") {
+                info!("memory_vector_index already exists on memories collection");
+            } else {
+                warn!("Failed to create memory_vector_index on memories: {e}");
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -338,6 +410,7 @@ async fn upsert_embeddings(
 ///
 /// Returns a formatted context string, or empty string if retrieval fails.
 #[instrument(skip_all, fields(exclude_file, result_count))]
+#[allow(dead_code)]
 pub async fn retrieve_context(
     provider: &EmbeddingProvider,
     collection: &Collection<bson::Document>,
@@ -366,6 +439,7 @@ pub async fn retrieve_context(
     }
 }
 
+#[allow(dead_code)]
 async fn retrieve_ollama(
     client: &rig::providers::ollama::Client,
     model_name: &str,
@@ -386,6 +460,7 @@ async fn retrieve_ollama(
     do_retrieve(&index, query_text, exclude_file, cancel_token).await
 }
 
+#[allow(dead_code)]
 async fn retrieve_fastembed(
     collection: &Collection<bson::Document>,
     query_text: &str,
@@ -405,6 +480,7 @@ async fn retrieve_fastembed(
     do_retrieve(&index, query_text, exclude_file, cancel_token).await
 }
 
+#[allow(dead_code)]
 async fn do_retrieve<I: VectorStoreIndex>(
     index: &I,
     query_text: &str,
@@ -460,6 +536,7 @@ async fn do_retrieve<I: VectorStoreIndex>(
 /// Build a short representative query from a file's raw text for RAG retrieval.
 ///
 /// Takes headings + key lines from the first ~200 lines plus a text excerpt.
+#[allow(dead_code)]
 pub fn build_query_text(raw_text: &str, file_name: &str) -> String {
     let mut query = format!("Document: {}\n", file_name);
 
@@ -539,6 +616,7 @@ pub async fn cleanup_orphaned_chunks(
 /// embeddings) and the `memories` collection (historical factoids), merging
 /// both into a single context string.
 #[instrument(skip_all)]
+#[allow(dead_code)]
 pub async fn retrieve_full_context(
     provider: &EmbeddingProvider,
     mongo_client: &MongoClient,
@@ -561,4 +639,99 @@ pub async fn retrieve_full_context(
         combined.push_str(&mem_ctx);
     }
     combined
+}
+
+// ─────────────────────────────────────────────
+// Shared vector store index (for dynamic_context)
+// ─────────────────────────────────────────────
+
+/// A cloneable, type-erased vector store index for use with rig-core's
+/// `dynamic_context()` agent builder method.
+///
+/// Wraps an `Arc` so the same index can be shared across multiple
+/// agent builds without re-creating the MongoDB index handle each time.
+#[derive(Clone)]
+pub struct SharedVectorIndex(Arc<dyn VectorStoreIndexDyn + Send + Sync>);
+
+impl std::fmt::Debug for SharedVectorIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedVectorIndex").finish_non_exhaustive()
+    }
+}
+
+impl SharedVectorIndex {
+    pub fn new(index: impl VectorStoreIndexDyn + Send + Sync + 'static) -> Self {
+        Self(Arc::new(index))
+    }
+}
+
+impl VectorStoreIndexDyn for SharedVectorIndex {
+    fn top_n<'a>(
+        &'a self,
+        req: VectorSearchRequest<Filter<serde_json::Value>>,
+    ) -> Pin<Box<dyn Future<Output = TopNResults> + Send + 'a>> {
+        self.0.top_n(req)
+    }
+
+    fn top_n_ids<'a>(
+        &'a self,
+        req: VectorSearchRequest<Filter<serde_json::Value>>,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<(f64, String)>, VectorStoreError>> + Send + 'a>>
+    {
+        self.0.top_n_ids(req)
+    }
+}
+
+/// Create shared, cloneable vector store indexes for both the `chunks` and
+/// `memories` collections.  The returned indexes are suitable for rig-core's
+/// `.dynamic_context()` on agent builders.
+///
+/// Index creation may fail if the search index isn't queryable yet — failed
+/// indexes are silently omitted (the caller treats an empty vec as "no RAG").
+#[instrument(skip_all)]
+pub async fn create_dynamic_indexes(
+    provider: &EmbeddingProvider,
+    mongo_client: &MongoClient,
+) -> Vec<SharedVectorIndex> {
+    let mut indexes = Vec::new();
+
+    // Chunks index (top-4 cross-file chunks)
+    let chunks_coll = chunks_collection(mongo_client);
+    match create_index_for_provider(provider, chunks_coll, "vector_index").await {
+        Ok(idx) => indexes.push(idx),
+        Err(e) => warn!("Failed to create chunks dynamic index: {e}"),
+    }
+
+    // Memories index (top-3 historical factoids)
+    let mem_coll = crate::memory::memories_collection(mongo_client);
+    match create_index_for_provider(provider, mem_coll, "memory_vector_index").await {
+        Ok(idx) => indexes.push(idx),
+        Err(e) => warn!("Failed to create memories dynamic index: {e}"),
+    }
+
+    indexes
+}
+
+async fn create_index_for_provider(
+    provider: &EmbeddingProvider,
+    collection: Collection<bson::Document>,
+    index_name: &str,
+) -> Result<SharedVectorIndex> {
+    match provider {
+        EmbeddingProvider::Ollama { client, model } => {
+            let model = client.embedding_model(model);
+            let index =
+                MongoDbVectorIndex::new(collection, model, index_name, SearchParams::new())
+                    .await?;
+            Ok(SharedVectorIndex::new(index))
+        }
+        EmbeddingProvider::FastEmbed => {
+            let fe_client = rig_fastembed::Client::new();
+            let model = fe_client.embedding_model(&FastembedModel::AllMiniLML6V2Q);
+            let index =
+                MongoDbVectorIndex::new(collection, model, index_name, SearchParams::new())
+                    .await?;
+            Ok(SharedVectorIndex::new(index))
+        }
+    }
 }

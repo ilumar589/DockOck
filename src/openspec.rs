@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tracing::instrument;
 
 /// Default endpoint for the OpenSpec service container.
 pub const DEFAULT_OPENSPEC_URL: &str = "http://localhost:11438";
@@ -52,6 +53,7 @@ pub struct OpenSpecExportResult {
 }
 
 /// Check whether the OpenSpec service is reachable.
+#[instrument(skip_all)]
 pub async fn check_service(base_url: &str) -> Result<(), String> {
     let url = format!("{}/health", base_url.trim_end_matches('/'));
     let resp = reqwest::get(&url)
@@ -65,6 +67,7 @@ pub async fn check_service(base_url: &str) -> Result<(), String> {
 }
 
 /// Post Gherkin text to the OpenSpec service and receive generated artifacts.
+#[instrument(skip(gherkin_text), fields(change_name))]
 pub async fn generate(
     base_url: &str,
     change_name: &str,
@@ -103,6 +106,7 @@ pub async fn generate(
 /// Save artifacts from a `GenerateResponse` into the given output directory.
 ///
 /// Files are written under `<output_dir>/openspec/<change_name>/`.
+#[instrument(skip_all, fields(change_name = %response.change_name))]
 pub fn save_artifacts(
     output_dir: &Path,
     response: &GenerateResponse,

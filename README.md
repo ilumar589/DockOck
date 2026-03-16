@@ -74,15 +74,22 @@ DockOck/
 │   ├── app.rs           – egui application (state, UI, event loop)
 │   ├── context.rs       – Shared cross-file context accumulator
 │   ├── gherkin.rs       – Gherkin data structures + LLM output parser
+│   ├── rag.rs           – RAG pipeline (chunking, embedding, MongoDB vector store)
+│   ├── memory.rs        – Cross-session factoid persistence
+│   ├── cache.rs         – Content-addressed disk cache (SHA-256)
+│   ├── session.rs       – Session save/load (JSON)
+│   ├── openspec.rs      – OpenSpec HTTP client
 │   ├── parser/
 │   │   ├── mod.rs       – File-type dispatcher
 │   │   ├── word.rs      – .docx parser (ZIP + XML)
 │   │   ├── excel.rs     – .xlsx parser (calamine)
 │   │   └── visio.rs     – .vsdx parser (ZIP + XML)
 │   └── llm/
-│       └── mod.rs       – Ollama integration via rig-core
+│       ├── mod.rs       – LLM orchestration (4-agent pipeline via rig-core)
+│       ├── prefix_cache.rs – KV-cache prefix priming
+│       └── provider.rs  – Custom provider abstraction
 ├── Dockerfile.ollama    – Stand-alone Ollama Docker image
-├── docker-compose.yml   – Recommended way to run Ollama locally
+├── docker-compose.yml   – Services: 4× Ollama, MongoDB 7, OpenSpec
 └── docs/
     ├── SETUP.md         – Detailed setup guide
     └── ARCHITECTURE.md  – Architecture and design decisions
