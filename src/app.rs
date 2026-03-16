@@ -18,10 +18,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
 use crate::context::{FileGroup, ProjectContext};
@@ -262,8 +263,8 @@ pub struct DockOckApp {
     custom_providers: Vec<crate::llm::CustomProviderConfig>,
     /// Saved Ollama model selections (restored when switching back from custom)
     saved_ollama_models: (String, String, String, String),
-    /// Cancellation flag for stopping in-progress generation
-    cancel_flag: Arc<AtomicBool>,
+    /// Cancellation token for stopping in-progress generation
+    cancel_token: CancellationToken,
     /// File paths that failed processing, with error details
     failed_items: HashMap<PathBuf, String>,
     /// Group names that failed processing, with error details
@@ -332,7 +333,7 @@ impl DockOckApp {
                 crate::llm::DEFAULT_REVIEWER_MODEL.to_string(),
                 crate::llm::DEFAULT_VISION_MODEL.to_string(),
             ),
-            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancel_token: CancellationToken::new(),
             failed_items: HashMap::new(),
             failed_groups: HashMap::new(),
         }
@@ -430,7 +431,8 @@ impl DockOckApp {
         self.state = AppState::Idle;
         self.progress = (0, 0);
         self.files_started = 0;
-        self.cancel_flag.store(false, Ordering::Relaxed);
+        self.cancel_token.cancel();
+        self.cancel_token = CancellationToken::new();
         self.file_groups.clear();
         self.openspec_results.clear();
         if let Ok(mut ctx) = self.context.lock() {
@@ -624,7 +626,8 @@ impl DockOckApp {
 
         self.progress = (0, total_items);
         self.files_started = 0;
-        self.cancel_flag.store(false, Ordering::Relaxed);
+        // Create a fresh token for this run (the old token, if any, stays cancelled)
+        self.cancel_token = CancellationToken::new();
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -651,7 +654,7 @@ impl DockOckApp {
         let cache = crate::cache::DiskCache::new(Some(&local_cache_root));
         let force_regenerate = self.force_regenerate;
         let backend = self.backend.clone();
-        let cancel_flag = Arc::clone(&self.cancel_flag);
+        let cancel_token = self.cancel_token.clone();
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
@@ -660,7 +663,7 @@ impl DockOckApp {
                 gen_model, ext_model, rev_model, vis_model,
                 mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
-                cache, force_regenerate, tx, cancel_flag,
+                cache, force_regenerate, tx, cancel_token,
             ));
         });
     }
@@ -1794,7 +1797,7 @@ impl DockOckApp {
 
             if is_processing {
                 if ui.button("⏹ Stop").clicked() {
-                    self.cancel_flag.store(true, Ordering::Relaxed);
+                    self.cancel_token.cancel();
                     self.log(LogLevel::Warning, "⏹ Cancellation requested…".to_string());
                 }
                 ui.spinner();
@@ -1962,7 +1965,7 @@ async fn process_files(
     cache: crate::cache::DiskCache,
     force_regenerate: bool,
     tx: Sender<ProcessingEvent>,
-    cancel_flag: Arc<AtomicBool>,
+    cancel_token: CancellationToken,
 ) {
     let total = files.len();
 
@@ -2164,7 +2167,7 @@ async fn process_files(
     // Take a snapshot of context now (after all files are parsed)
     let ctx_snapshot = context.lock().map(|c| c.clone()).unwrap_or_default();
 
-    let mut llm_handles = Vec::new();
+    let tracker = TaskTracker::new();
 
     // Shared collection for OpenSpec: (change_name, gherkin_feature_text)
     let gherkin_docs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2176,7 +2179,7 @@ async fn process_files(
 
     // ── Dispatch group work items ──
     for group in &groups {
-        if cancel_flag.load(Ordering::Relaxed) {
+        if cancel_token.is_cancelled() {
             let _ = tx.send(ProcessingEvent::Status("⏹ Cancelled by user.".to_string()));
             let _ = tx.send(ProcessingEvent::Done(Err("Cancelled by user".to_string())));
             let _ = tx.send(ProcessingEvent::OpenSpecDone(Err("Cancelled".to_string())));
@@ -2211,11 +2214,18 @@ async fn process_files(
             let ctx = ctx_snapshot.clone();
             let gdocs = Arc::clone(&gherkin_docs);
             let force_regen = force_regenerate;
-            let cflag = Arc::clone(&cancel_flag);
+            let child_token = cancel_token.child_token();
 
-            let handle = tokio::spawn(async move {
-                let _permit = sem.acquire().await;
-                if cflag.load(Ordering::Relaxed) { return; }
+            tracker.spawn(async move {
+                // Cancel-aware semaphore wait
+                let _permit = tokio::select! {
+                    permit = sem.acquire() => match permit {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    },
+                    _ = child_token.cancelled() => { return; }
+                };
+                if child_token.is_cancelled() { return; }
                 let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
                 let file_start = std::time::Instant::now();
 
@@ -2230,7 +2240,7 @@ async fn process_files(
                 });
 
                 let result = orch
-                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, rag_ctx.as_deref(), &status_tx, force_regen)
+                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, rag_ctx.as_deref(), &status_tx, force_regen, &child_token)
                     .await;
 
                 drop(status_tx);
@@ -2265,7 +2275,6 @@ async fn process_files(
                     }
                 }
             });
-            llm_handles.push(handle);
             continue;
         }
 
@@ -2277,11 +2286,18 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
-        let cflag = Arc::clone(&cancel_flag);
+        let child_token = cancel_token.child_token();
 
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await;
-            if cflag.load(Ordering::Relaxed) { return; }
+        tracker.spawn(async move {
+            // Cancel-aware semaphore wait
+            let _permit = tokio::select! {
+                permit = sem.acquire() => match permit {
+                    Ok(p) => p,
+                    Err(_) => return,
+                },
+                _ = child_token.cancelled() => { return; }
+            };
+            if child_token.is_cancelled() { return; }
 
             // Use the first member path for FileStarted signal
             if let Some(first) = member_paths.first() {
@@ -2303,7 +2319,7 @@ async fn process_files(
                 members_data;
 
             let result = orch
-                .process_group(&group_name, &members_ref, &ctx, rag_ctx.as_deref(), &status_tx, force_regen)
+                .process_group(&group_name, &members_ref, &ctx, rag_ctx.as_deref(), &status_tx, force_regen, &child_token)
                 .await;
 
             drop(status_tx);
@@ -2335,12 +2351,11 @@ async fn process_files(
                 }
             }
         });
-        llm_handles.push(handle);
     }
 
     let _ = tx.send(ProcessingEvent::Status(format!(
         "🔧 Dispatched {} group tasks, now spawning ungrouped file tasks…",
-        llm_handles.len()
+        tracker.len()
     )));
 
     // ── Dispatch ungrouped single-file work items ──
@@ -2348,7 +2363,7 @@ async fn process_files(
         if grouped_paths.contains(path) {
             continue;
         }
-        if cancel_flag.load(Ordering::Relaxed) {
+        if cancel_token.is_cancelled() {
             let _ = tx.send(ProcessingEvent::Status("⏹ Cancelled by user.".to_string()));
             let _ = tx.send(ProcessingEvent::Done(Err("Cancelled by user".to_string())));
             let _ = tx.send(ProcessingEvent::OpenSpecDone(Err("Cancelled".to_string())));
@@ -2365,15 +2380,22 @@ async fn process_files(
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
-        let cflag = Arc::clone(&cancel_flag);
+        let child_token = cancel_token.child_token();
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await;
-            if cflag.load(Ordering::Relaxed) { return; }
+        tracker.spawn(async move {
+            // Cancel-aware semaphore wait
+            let _permit = tokio::select! {
+                permit = sem.acquire() => match permit {
+                    Ok(p) => p,
+                    Err(_) => return,
+                },
+                _ = child_token.cancelled() => { return; }
+            };
+            if child_token.is_cancelled() { return; }
             let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
             let _ = tx.send(ProcessingEvent::Status(format!(
                 "🚀 Starting pipeline for {}…", file_name
@@ -2391,7 +2413,7 @@ async fn process_files(
             });
 
             let result = orch
-                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, rag_ctx.as_deref(), &status_tx, force_regen)
+                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, rag_ctx.as_deref(), &status_tx, force_regen, &child_token)
                 .await;
 
             drop(status_tx);
@@ -2426,19 +2448,16 @@ async fn process_files(
                 }
             }
         });
-
-        llm_handles.push(handle);
     }
 
     let _ = tx.send(ProcessingEvent::Status(format!(
         "⏳ All {} tasks spawned — waiting for LLM results…",
-        llm_handles.len()
+        tracker.len()
     )));
 
-    // Wait for all LLM tasks to complete
-    for handle in llm_handles {
-        let _ = handle.await;
-    }
+    // Close the tracker and wait for all LLM tasks to complete
+    tracker.close();
+    tracker.wait().await;
 
     let _ = tx.send(ProcessingEvent::Done(Ok(())));
 

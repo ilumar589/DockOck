@@ -28,6 +28,7 @@ use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
 use sha2::Digest;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::context::ProjectContext;
@@ -298,26 +299,29 @@ Rules:
 6. Do not add explanatory prose outside the Gherkin block.
 7. Always end with a blank line after the last Scenario."#;
 
-/// Response from Ollama's `/api/generate` endpoint (non-streaming).
+/// Streaming chunk from Ollama's `/api/generate` endpoint.
 #[derive(serde::Deserialize)]
-struct OllamaGenerateResponse {
+struct OllamaStreamGenerateChunk {
     response: String,
+    #[serde(default)]
+    done: bool,
 }
 
-/// Response from OpenAI-compatible `/chat/completions` endpoint.
+/// Streaming chunk from OpenAI-compatible `/chat/completions` endpoint (SSE).
 #[derive(serde::Deserialize)]
-struct OpenAIChatResponse {
-    choices: Vec<OpenAIChatChoice>,
-}
-
-#[derive(serde::Deserialize)]
-struct OpenAIChatChoice {
-    message: OpenAIChatMessage,
+struct OpenAIStreamChunk {
+    choices: Vec<OpenAIStreamChoice>,
 }
 
 #[derive(serde::Deserialize)]
-struct OpenAIChatMessage {
-    content: String,
+struct OpenAIStreamChoice {
+    delta: OpenAIStreamDelta,
+}
+
+#[derive(serde::Deserialize)]
+struct OpenAIStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 // ─────────────────────────────────────────────
@@ -696,16 +700,20 @@ impl AgentOrchestrator {
         file_name: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
         timeout: std::time::Duration,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         let num_ctx = context_window_for_model(model);
         let mut last_err = None;
         for attempt in 0..=Self::RETRY_DELAYS.len() {
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("{stage_name} cancelled for {file_name}");
+            }
             let agent = ollama_client
                 .agent(model)
                 .preamble(preamble)
                 .additional_params(serde_json::json!({"num_ctx": num_ctx}))
                 .build();
-            match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout).await {
+            match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout, cancel_token).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     let msg = format!("{e}");
@@ -715,7 +723,12 @@ impl AgentOrchestrator {
                             "⏳ [{stage_name}] {file_name}: rate-limited, retrying in {}s (attempt {}/{})…",
                             delay.as_secs(), attempt + 1, Self::RETRY_DELAYS.len()
                         ));
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {},
+                            _ = cancel_token.cancelled() => {
+                                anyhow::bail!("{stage_name} cancelled for {file_name} during retry backoff");
+                            }
+                        }
                         last_err = Some(e);
                         continue;
                     }
@@ -737,14 +750,18 @@ impl AgentOrchestrator {
         file_name: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
         timeout: std::time::Duration,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         let mut last_err = None;
         for attempt in 0..=Self::RETRY_DELAYS.len() {
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("{stage_name} cancelled for {file_name}");
+            }
             let agent = openai_client
                 .agent(model)
                 .preamble(preamble)
                 .build();
-            match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout).await {
+            match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout, cancel_token).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     let msg = format!("{e}");
@@ -754,7 +771,12 @@ impl AgentOrchestrator {
                             "⏳ [{stage_name}] {file_name}: rate-limited, retrying in {}s (attempt {}/{})…",
                             delay.as_secs(), attempt + 1, Self::RETRY_DELAYS.len()
                         ));
-                        tokio::time::sleep(delay).await;
+                        tokio::select! {
+                            _ = tokio::time::sleep(delay) => {},
+                            _ = cancel_token.cancelled() => {
+                                anyhow::bail!("{stage_name} cancelled for {file_name} during retry backoff");
+                            }
+                        }
                         last_err = Some(e);
                         continue;
                     }
@@ -816,6 +838,7 @@ impl AgentOrchestrator {
         rag_context: Option<&str>,
         status_tx: &std::sync::mpsc::Sender<String>,
         force_regenerate: bool,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         // Build LLM cache key from all inputs that affect the output
         let context_summary = match rag_context {
@@ -855,7 +878,7 @@ impl AgentOrchestrator {
             let _ = status_tx.send(format!(
                 "👁 [Vision] Describing {} image(s) from {}…", images.len(), file_name
             ));
-            self.enrich_text_with_images(raw_text, images, file_name, status_tx).await
+            self.enrich_text_with_images(raw_text, images, file_name, status_tx, cancel_token).await
         } else {
             raw_text.to_string()
         };
@@ -870,7 +893,7 @@ impl AgentOrchestrator {
         // ── Chunk-and-merge path for oversized documents ──
         if needs_chunking(&enriched_text, budget_model) {
             let result = self.process_file_chunked(
-                file_name, file_type, &enriched_text, context, rag_context, status_tx,
+                file_name, file_type, &enriched_text, context, rag_context, status_tx, cancel_token,
             ).await?;
             self.cache.put_text(crate::cache::NS_LLM, &llm_cache_key, &result);
             return Ok(result);
@@ -883,7 +906,7 @@ impl AgentOrchestrator {
             let _ = status_tx.send(format!(
                 "🔍 [Extractor] Analysing {}…", file_name
             ));
-            self.extract(file_name, file_type, &enriched_text, status_tx).await
+            self.extract(file_name, file_type, &enriched_text, status_tx, cancel_token).await
                 .unwrap_or_else(|e| {
                     warn!("Extraction failed for {}: {} — falling back to preprocessor", file_name, e);
                     preprocess_text(&enriched_text, file_name, file_type, budget)
@@ -902,7 +925,7 @@ impl AgentOrchestrator {
         ));
 
         let glossary = context.build_glossary();
-        let gherkin = self.generate(file_name, &summary, &context_summary, &glossary, status_tx).await?;
+        let gherkin = self.generate(file_name, &summary, &context_summary, &glossary, status_tx, cancel_token).await?;
 
         // ── Step 3: Review / refine (Standard and Full modes only) ──
         let do_review = self.mode != PipelineMode::Fast
@@ -911,7 +934,7 @@ impl AgentOrchestrator {
             let _ = status_tx.send(format!(
                 "✅ [Reviewer] Validating Gherkin for {}…", file_name
             ));
-            match self.review(file_name, &gherkin, status_tx).await {
+            match self.review(file_name, &gherkin, status_tx, cancel_token).await {
                 Ok(refined) => refined,
                 Err(e) => {
                     warn!("Review failed for {}: {} — using unreviewed output", file_name, e);
@@ -939,6 +962,7 @@ impl AgentOrchestrator {
         context: &ProjectContext,
         rag_context: Option<&str>,
         status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         let budget_model = if self.mode == PipelineMode::Full {
             if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
@@ -958,13 +982,16 @@ impl AgentOrchestrator {
         let mut summaries: Vec<String> = Vec::with_capacity(n);
 
         for chunk in &chunks {
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("Cancelled during chunked extraction for {file_name}");
+            }
             let chunk_label = format!("{} [{}/{}]", file_name, chunk.index + 1, chunk.total);
 
             let summary = if self.mode == PipelineMode::Full {
                 let _ = status_tx.send(format!(
                     "🔍 [Extractor] Analysing {}…", chunk_label
                 ));
-                self.extract(&chunk_label, file_type, &chunk.text, status_tx)
+                self.extract(&chunk_label, file_type, &chunk.text, status_tx, cancel_token)
                     .await
                     .unwrap_or_else(|e| {
                         warn!("Extraction failed for {}: {} — falling back to preprocessor", chunk_label, e);
@@ -988,6 +1015,9 @@ impl AgentOrchestrator {
         let mut chunk_gherkins: Vec<String> = Vec::with_capacity(n);
 
         for (i, summary) in summaries.iter().enumerate() {
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("Cancelled during chunked generation for {file_name}");
+            }
             let chunk_label = format!("{} [{}/{}]", file_name, i + 1, n);
             let _ = status_tx.send(format!(
                 "⚙ [Generator] Creating Gherkin for {}…", chunk_label
@@ -1013,13 +1043,13 @@ impl AgentOrchestrator {
             };
 
             let gherkin = self.generate(
-                &chunk_label, summary, &chunk_context, &glossary, status_tx,
+                &chunk_label, summary, &chunk_context, &glossary, status_tx, cancel_token,
             ).await?;
             chunk_gherkins.push(gherkin);
         }
 
         // Phase 3: Merge all chunk Gherkin via merge-reviewer
-        self.merge_chunk_gherkin(file_name, &chunk_gherkins, status_tx).await
+        self.merge_chunk_gherkin(file_name, &chunk_gherkins, status_tx, cancel_token).await
     }
 
     /// Merge Gherkin from multiple chunks of the same document into one cohesive Feature.
@@ -1028,6 +1058,7 @@ impl AgentOrchestrator {
         file_name: &str,
         chunk_gherkins: &[String],
         status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         // If only one chunk, no merge needed
         if chunk_gherkins.len() == 1 {
@@ -1065,6 +1096,7 @@ impl AgentOrchestrator {
                 openai, &self.generator_model, MERGE_REVIEWER_PREAMBLE,
                 &prompt, history, "Merge", file_name, status_tx,
                 std::time::Duration::from_secs(180),
+                cancel_token,
             ).await
         } else {
             Self::run_ollama_chat(
@@ -1072,6 +1104,7 @@ impl AgentOrchestrator {
                 &self.generator_model, MERGE_REVIEWER_PREAMBLE,
                 &prompt, history, "Merge", file_name, status_tx,
                 std::time::Duration::from_secs(180),
+                cancel_token,
             ).await
         }
     }
@@ -1082,6 +1115,7 @@ impl AgentOrchestrator {
         file_type: &str,
         raw_text: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         let model = self.effective_extractor_model();
         let history = vec![
@@ -1099,6 +1133,7 @@ impl AgentOrchestrator {
                 "Produce the structured summary now.",
                 history, "Extractor", file_name, status_tx,
                 std::time::Duration::from_secs(120),
+                cancel_token,
             ).await
         } else {
             Self::run_ollama_chat(
@@ -1106,6 +1141,7 @@ impl AgentOrchestrator {
                 "Produce the structured summary now.",
                 history, "Extractor", file_name, status_tx,
                 std::time::Duration::from_secs(120),
+                cancel_token,
             ).await
         }
     }
@@ -1117,6 +1153,7 @@ impl AgentOrchestrator {
         context_summary: &str,
         glossary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         // Try prefix-cached path first (Ollama only — skips recomputing shared prefix attention)
         if let Some(ref cache_mutex) = self.generator_prefix_cache {
@@ -1167,6 +1204,7 @@ impl AgentOrchestrator {
                 openai, &self.generator_model, GENERATOR_PREAMBLE,
                 &prompt, history, "Generator", file_name, status_tx,
                 std::time::Duration::from_secs(180),
+                cancel_token,
             ).await
         } else {
             Self::run_ollama_chat(
@@ -1174,6 +1212,7 @@ impl AgentOrchestrator {
                 &self.generator_model, GENERATOR_PREAMBLE,
                 &prompt, history, "Generator", file_name, status_tx,
                 std::time::Duration::from_secs(180),
+                cancel_token,
             ).await
         }
     }
@@ -1183,6 +1222,7 @@ impl AgentOrchestrator {
         file_name: &str,
         gherkin: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         let model = self.effective_reviewer_model();
         let history = vec![
@@ -1195,6 +1235,7 @@ impl AgentOrchestrator {
                 "Review and correct the Gherkin Feature above. Output only the corrected Gherkin:",
                 history, "Reviewer", file_name, status_tx,
                 std::time::Duration::from_secs(120),
+                cancel_token,
             ).await
         } else {
             Self::run_ollama_chat(
@@ -1202,6 +1243,7 @@ impl AgentOrchestrator {
                 "Review and correct the Gherkin Feature above. Output only the corrected Gherkin:",
                 history, "Reviewer", file_name, status_tx,
                 std::time::Duration::from_secs(120),
+                cancel_token,
             ).await
         }
     }
@@ -1216,6 +1258,7 @@ impl AgentOrchestrator {
         images: &[crate::parser::ExtractedImage],
         file_name: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
     ) -> String {
         let _ = status_tx.send(format!(
             "👁 [Vision] {}: describing {} image(s) in parallel…",
@@ -1230,7 +1273,7 @@ impl AgentOrchestrator {
             .map(|(i, image)| {
                 let label = image.label.clone();
                 async move {
-                    match self.describe_image(image).await {
+                    match self.describe_image(image, cancel_token, status_tx).await {
                         Ok(desc) => format!(
                             "[Image {}: {}]\n{}",
                             i + 1,
@@ -1282,6 +1325,7 @@ impl AgentOrchestrator {
         rag_context: Option<&str>,
         status_tx: &std::sync::mpsc::Sender<String>,
         force_regenerate: bool,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         // Build cache key from all member content + models + mode
         let group_cache_key = {
@@ -1344,7 +1388,7 @@ impl AgentOrchestrator {
             let owned_images: Vec<crate::parser::ExtractedImage> =
                 all_images.iter().map(|img| (*img).clone()).collect();
             merged_text =
-                self.enrich_text_with_images(&merged_text, &owned_images, group_name, status_tx)
+                self.enrich_text_with_images(&merged_text, &owned_images, group_name, status_tx, cancel_token)
                     .await;
         }
 
@@ -1356,7 +1400,7 @@ impl AgentOrchestrator {
         };
         if needs_chunking(&merged_text, budget_model) {
             let result = self.process_file_chunked(
-                group_name, "Multi-document group", &merged_text, context, rag_context, status_tx,
+                group_name, "Multi-document group", &merged_text, context, rag_context, status_tx, cancel_token,
             ).await?;
             self.cache.put_text(crate::cache::NS_LLM, &group_cache_key, &result);
             return Ok(result);
@@ -1368,7 +1412,7 @@ impl AgentOrchestrator {
                 "🔍 [Extractor] Analysing group {}…",
                 group_name
             ));
-            self.extract_group(group_name, &merged_text, status_tx)
+            self.extract_group(group_name, &merged_text, status_tx, cancel_token)
                 .await
                 .unwrap_or_else(|e| {
                     warn!(
@@ -1412,7 +1456,7 @@ impl AgentOrchestrator {
             None => context.build_summary_excluding(&exclude),
         };
         let gherkin = self
-            .generate_group(group_name, &summary, &context_summary, &context.build_glossary(), status_tx)
+            .generate_group(group_name, &summary, &context_summary, &context.build_glossary(), status_tx, cancel_token)
             .await?;
 
         // ── Step 3: Review / refine ──
@@ -1423,7 +1467,7 @@ impl AgentOrchestrator {
                 "✅ [Reviewer] Validating Gherkin for group {}…",
                 group_name
             ));
-            match self.review(group_name, &gherkin, status_tx).await {
+            match self.review(group_name, &gherkin, status_tx, cancel_token).await {
                 Ok(refined) => refined,
                 Err(e) => {
                     warn!(
@@ -1448,6 +1492,7 @@ impl AgentOrchestrator {
         group_name: &str,
         merged_text: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         let model = self.effective_extractor_model();
         let history = vec![
@@ -1465,6 +1510,7 @@ impl AgentOrchestrator {
                 "Produce a single unified structured summary for this document group.",
                 history, "Extractor", group_name, status_tx,
                 std::time::Duration::from_secs(180),
+                cancel_token,
             ).await
         } else {
             Self::run_ollama_chat(
@@ -1472,6 +1518,7 @@ impl AgentOrchestrator {
                 "Produce a single unified structured summary for this document group.",
                 history, "Extractor", group_name, status_tx,
                 std::time::Duration::from_secs(180),
+                cancel_token,
             ).await
         }
     }
@@ -1483,6 +1530,7 @@ impl AgentOrchestrator {
         context_summary: &str,
         glossary: &str,
         status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
     ) -> Result<String> {
         // Try prefix-cached path first (Ollama only)
         if let Some(ref cache_mutex) = self.generator_prefix_cache {
@@ -1541,6 +1589,7 @@ impl AgentOrchestrator {
                 openai, &self.generator_model, GROUP_GENERATOR_PREAMBLE,
                 &prompt, history, "Generator", group_name, status_tx,
                 std::time::Duration::from_secs(240),
+                cancel_token,
             ).await
         } else {
             Self::run_ollama_chat(
@@ -1548,6 +1597,7 @@ impl AgentOrchestrator {
                 &self.generator_model, GROUP_GENERATOR_PREAMBLE,
                 &prompt, history, "Generator", group_name, status_tx,
                 std::time::Duration::from_secs(240),
+                cancel_token,
             ).await
         }
     }
@@ -1558,6 +1608,8 @@ impl AgentOrchestrator {
     async fn describe_image(
         &self,
         image: &crate::parser::ExtractedImage,
+        cancel_token: &CancellationToken,
+        status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         // Check vision cache
         let cache_key = crate::cache::composite_key(&[
@@ -1571,9 +1623,9 @@ impl AgentOrchestrator {
         let description = if let (Some(base_url), Some(api_key)) =
             (&self.cloud_vision_base_url, &self.cloud_vision_api_key)
         {
-            self.describe_image_cloud(image, base_url, api_key).await?
+            self.describe_image_cloud(image, base_url, api_key, cancel_token, status_tx).await?
         } else {
-            self.describe_image_ollama(image).await?
+            self.describe_image_ollama(image, cancel_token, status_tx).await?
         };
 
         // Store in cache
@@ -1582,13 +1634,15 @@ impl AgentOrchestrator {
         Ok(description)
     }
 
-    /// Describe an image via an OpenAI-compatible chat completions endpoint.
+    /// Describe an image via an OpenAI-compatible chat completions endpoint (streaming).
     /// Sends the image as a base64 data URI in a multimodal user message.
     async fn describe_image_cloud(
         &self,
         image: &crate::parser::ExtractedImage,
         base_url: &str,
         api_key: &str,
+        cancel_token: &CancellationToken,
+        status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let b64 = BASE64_STANDARD.encode(&image.data);
         let content_type = if image.content_type.is_empty() {
@@ -1597,14 +1651,16 @@ impl AgentOrchestrator {
             &image.content_type
         };
         let data_uri = format!("data:{};base64,{}", content_type, b64);
+        let label = &image.label;
 
         let client = reqwest::Client::new();
-        let resp = client
+        let request_fut = client
             .post(format!("{}/chat/completions", base_url))
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&serde_json::json!({
                 "model": self.vision_model,
+                "stream": true,
                 "messages": [{
                     "role": "user",
                     "content": [
@@ -1615,50 +1671,193 @@ impl AgentOrchestrator {
                 "max_tokens": 4096
             }))
             .timeout(std::time::Duration::from_secs(120))
-            .send()
-            .await
-            .with_context(|| format!("Cloud vision API request failed for {}", image.label))?;
+            .send();
 
-        let body: OpenAIChatResponse = resp
-            .json()
-            .await
-            .with_context(|| "Failed to parse cloud vision response")?;
+        let resp = tokio::select! {
+            result = request_fut => result
+                .with_context(|| format!("Cloud vision API request failed for {}", label))?,
+            _ = cancel_token.cancelled() => {
+                anyhow::bail!("Vision cancelled for {}", label);
+            }
+        };
 
-        body.choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("Cloud vision returned no choices for {}", image.label))
+        let mut stream = resp.bytes_stream();
+        let mut accumulated = String::new();
+        let mut token_count: usize = 0;
+        let mut buf = Vec::new();
+        let chunk_timeout = std::time::Duration::from_secs(60);
+
+        loop {
+            tokio::select! {
+                chunk = tokio::time::timeout(chunk_timeout, stream.next()) => {
+                    match chunk {
+                        Ok(Some(Ok(bytes))) => {
+                            buf.extend_from_slice(&bytes);
+                            // SSE: lines prefixed with "data: "
+                            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                                let line = String::from_utf8_lossy(&line_bytes);
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                if let Some(data) = trimmed.strip_prefix("data: ") {
+                                    if data == "[DONE]" {
+                                        return if accumulated.is_empty() {
+                                            anyhow::bail!("Cloud vision returned empty response for {}", label)
+                                        } else {
+                                            Ok(accumulated)
+                                        };
+                                    }
+                                    if let Ok(chunk) = serde_json::from_str::<OpenAIStreamChunk>(data) {
+                                        for choice in &chunk.choices {
+                                            if let Some(ref text) = choice.delta.content {
+                                                accumulated.push_str(text);
+                                                token_count += 1;
+                                                if token_count % 20 == 0 {
+                                                    let _ = status_tx.send(format!(
+                                                        "\u{1f441} [Vision] {}: {} tokens\u{2026}", label, token_count
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            anyhow::bail!("Cloud vision stream error for {}: {}", label, e);
+                        }
+                        Ok(None) => {
+                            // Stream ended without [DONE]
+                            break;
+                        }
+                        Err(_) => {
+                            anyhow::bail!(
+                                "Cloud vision stream stalled for {} (no data for {}s after {} tokens)",
+                                label, chunk_timeout.as_secs(), token_count
+                            );
+                        }
+                    }
+                }
+                _ = cancel_token.cancelled() => {
+                    anyhow::bail!("Vision cancelled for {} after {} tokens", label, token_count);
+                }
+            }
+        }
+
+        if accumulated.is_empty() {
+            anyhow::bail!("Cloud vision returned empty response for {}", label);
+        }
+        Ok(accumulated)
     }
 
-    /// Describe an image via the local Ollama `/api/generate` endpoint.
+    /// Describe an image via the local Ollama `/api/generate` endpoint (streaming).
     async fn describe_image_ollama(
         &self,
         image: &crate::parser::ExtractedImage,
+        cancel_token: &CancellationToken,
+        status_tx: &std::sync::mpsc::Sender<String>,
     ) -> Result<String> {
         let endpoint_url = &self.vision_endpoint_url;
         let b64 = BASE64_STANDARD.encode(&image.data);
+        let label = &image.label;
 
         let client = reqwest::Client::new();
-        let resp = client
+        let request_fut = client
             .post(format!("{}/api/generate", endpoint_url))
             .json(&serde_json::json!({
                 "model": self.vision_model,
                 "prompt": VISION_DESCRIBE_PROMPT,
                 "images": [b64],
-                "stream": false
+                "stream": true
             }))
             .timeout(std::time::Duration::from_secs(120))
-            .send()
-            .await
-            .with_context(|| format!("Vision API request failed for {}", image.label))?;
+            .send();
 
-        let body: OllamaGenerateResponse = resp
-            .json()
-            .await
-            .with_context(|| "Failed to parse vision model response")?;
+        let resp = tokio::select! {
+            result = request_fut => result
+                .with_context(|| format!("Vision API request failed for {}", label))?,
+            _ = cancel_token.cancelled() => {
+                anyhow::bail!("Vision cancelled for {}", label);
+            }
+        };
 
-        Ok(body.response)
+        let mut stream = resp.bytes_stream();
+        let mut accumulated = String::new();
+        let mut token_count: usize = 0;
+        let mut buf = Vec::new();
+        let chunk_timeout = std::time::Duration::from_secs(60);
+
+        loop {
+            tokio::select! {
+                chunk = tokio::time::timeout(chunk_timeout, stream.next()) => {
+                    match chunk {
+                        Ok(Some(Ok(bytes))) => {
+                            buf.extend_from_slice(&bytes);
+                            // Ollama streams newline-delimited JSON
+                            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                                let line = String::from_utf8_lossy(&line_bytes);
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                if let Ok(chunk) = serde_json::from_str::<OllamaStreamGenerateChunk>(trimmed) {
+                                    if !chunk.response.is_empty() {
+                                        accumulated.push_str(&chunk.response);
+                                        token_count += 1;
+                                        if token_count % 20 == 0 {
+                                            let _ = status_tx.send(format!(
+                                                "\u{1f441} [Vision] {}: {} tokens\u{2026}", label, token_count
+                                            ));
+                                        }
+                                    }
+                                    if chunk.done {
+                                        // Process any remaining buffer
+                                        if !buf.is_empty() {
+                                            let tail = String::from_utf8_lossy(&buf);
+                                            let tail_trimmed = tail.trim();
+                                            if !tail_trimmed.is_empty() {
+                                                if let Ok(c) = serde_json::from_str::<OllamaStreamGenerateChunk>(tail_trimmed) {
+                                                    accumulated.push_str(&c.response);
+                                                }
+                                            }
+                                        }
+                                        return if accumulated.is_empty() {
+                                            anyhow::bail!("Vision returned empty response for {}", label)
+                                        } else {
+                                            Ok(accumulated)
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Some(Err(e))) => {
+                            anyhow::bail!("Vision stream error for {}: {}", label, e);
+                        }
+                        Ok(None) => {
+                            // Stream ended
+                            break;
+                        }
+                        Err(_) => {
+                            anyhow::bail!(
+                                "Vision stream stalled for {} (no data for {}s after {} tokens)",
+                                label, chunk_timeout.as_secs(), token_count
+                            );
+                        }
+                    }
+                }
+                _ = cancel_token.cancelled() => {
+                    anyhow::bail!("Vision cancelled for {} after {} tokens", label, token_count);
+                }
+            }
+        }
+
+        if accumulated.is_empty() {
+            anyhow::bail!("Vision returned empty response for {}", label);
+        }
+        Ok(accumulated)
     }
 }
 
@@ -1903,6 +2102,7 @@ async fn stream_chat_with_progress<M, P>(
     file_name: &str,
     status_tx: &std::sync::mpsc::Sender<String>,
     timeout: std::time::Duration,
+    cancel_token: &CancellationToken,
 ) -> Result<String>
 where
     M: rig::completion::CompletionModel + 'static,
@@ -1912,12 +2112,15 @@ where
     // Overall deadline for the entire request (connection + streaming).
     let deadline = tokio::time::Instant::now() + timeout;
 
-    let mut stream = tokio::time::timeout(
-        timeout,
-        agent.stream_prompt(prompt).with_history(chat_history),
-    )
-    .await
-    .with_context(|| format!("{stage_name} timed out after {}s", timeout.as_secs()))?;
+    let mut stream = tokio::select! {
+        result = tokio::time::timeout(
+            timeout,
+            agent.stream_prompt(prompt).with_history(chat_history),
+        ) => result.with_context(|| format!("{stage_name} timed out after {}s", timeout.as_secs()))?,
+        _ = cancel_token.cancelled() => {
+            anyhow::bail!("{stage_name} cancelled for {file_name}");
+        }
+    };
 
     let mut accumulated = String::new();
     let mut token_count: usize = 0;
@@ -1934,37 +2137,44 @@ where
         }
         let wait = chunk_timeout.min(remaining);
 
-        match tokio::time::timeout(wait, stream.next()).await {
-            Ok(Some(item)) => match item {
-                Ok(MultiTurnStreamItem::StreamAssistantItem(
-                    StreamedAssistantContent::Text(Text { text }),
-                )) => {
-                    accumulated.push_str(&text);
-                    token_count += 1;
-                    if token_count % 20 == 0 {
-                        let _ = status_tx.send(format!(
-                            "🔄 [{stage_name}] {file_name}: {token_count} tokens…"
-                        ));
+        tokio::select! {
+            chunk = tokio::time::timeout(wait, stream.next()) => {
+                match chunk {
+                    Ok(Some(item)) => match item {
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(
+                            StreamedAssistantContent::Text(Text { text }),
+                        )) => {
+                            accumulated.push_str(&text);
+                            token_count += 1;
+                            if token_count % 20 == 0 {
+                                let _ = status_tx.send(format!(
+                                    "🔄 [{stage_name}] {file_name}: {token_count} tokens…"
+                                ));
+                            }
+                        }
+                        Ok(MultiTurnStreamItem::FinalResponse(_)) => {
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[{stage_name} STREAM ERROR] {file_name}: {e:?}");
+                            anyhow::bail!("{stage_name} stream error for {file_name}: {e}");
+                        }
+                        _ => {}
+                    },
+                    Ok(None) => {
+                        // Stream ended
+                        break;
+                    }
+                    Err(_) => {
+                        anyhow::bail!(
+                            "{stage_name} stream stalled for {file_name} (no data for {}s after {token_count} tokens)",
+                            wait.as_secs()
+                        );
                     }
                 }
-                Ok(MultiTurnStreamItem::FinalResponse(_)) => {
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("[{stage_name} STREAM ERROR] {file_name}: {e:?}");
-                    anyhow::bail!("{stage_name} stream error for {file_name}: {e}");
-                }
-                _ => {}
-            },
-            Ok(None) => {
-                // Stream ended
-                break;
             }
-            Err(_) => {
-                anyhow::bail!(
-                    "{stage_name} stream stalled for {file_name} (no data for {}s after {token_count} tokens)",
-                    wait.as_secs()
-                );
+            _ = cancel_token.cancelled() => {
+                anyhow::bail!("{stage_name} cancelled for {file_name} after {token_count} tokens");
             }
         }
     }

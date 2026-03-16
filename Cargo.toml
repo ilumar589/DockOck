@@ -61,3 +61,6 @@ postcard = { version = "1", features = ["alloc"] }
 
 # Text processing
 regex = "1"
+
+# Async utilities (CancellationToken, TaskTracker)
+tokio-util = { version = "0.7", features = ["rt"] }

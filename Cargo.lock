@@ -1033,6 +1033,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "zip 8.2.0",
@@ -4305,6 +4306,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
