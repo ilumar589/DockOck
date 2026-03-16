@@ -18,6 +18,7 @@ mod cache;
 mod context;
 mod gherkin;
 mod llm;
+mod memory;
 mod openspec;
 mod parser;
 mod rag;

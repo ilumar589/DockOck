@@ -90,7 +90,28 @@ DockOck/
 
 ---
 
-## 📚 Further Reading
+## � OpenTelemetry (Optional)
+
+DockOck supports exporting traces via OpenTelemetry when compiled with the `otel` feature:
+
+```bash
+cargo run --release --features otel
+```
+
+By default traces are sent to `http://localhost:4318` (HTTP/protobuf). Override with:
+
+```bash
+set OTEL_EXPORTER_OTLP_ENDPOINT=http://your-collector:4318
+cargo run --release --features otel
+```
+
+A ready-made collector config is provided in [`otel/config.yaml`](otel/config.yaml). To run the collector alongside Ollama, add it to your Docker Compose setup (see comments in the config file).
+
+Traces include spans for every LLM call, file parse, embedding build, and RAG retrieval — ideal for debugging latency and monitoring token usage in Jaeger or Langfuse.
+
+---
+
+## �📚 Further Reading
 
 - [docs/SETUP.md](docs/SETUP.md) – Detailed environment setup and troubleshooting
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) – Architecture overview and design decisions

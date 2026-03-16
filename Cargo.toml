@@ -21,7 +21,7 @@ eframe = "0.33.3"
 egui = "0.33.3"
 
 # LLM integration (Ollama via rig-core)
-rig-core = "0.32.0"
+rig-core = { version = "0.32.0", features = ["derive"] }
 
 # Environment file loading
 dotenv = "0.15"
@@ -77,6 +77,10 @@ rig-mongodb = "0.4.1"
 
 # RAG: Local CPU-only embeddings fallback
 rig-fastembed = "0.3.1"
+
+# Memory: unique IDs and timestamps for factoid storage
+nanoid = "0.4"
+chrono = "0.4"
 
 [features]
 default = []

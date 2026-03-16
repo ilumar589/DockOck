@@ -257,6 +257,8 @@ pub struct DockOckApp {
     refinement_input: String,
     /// Whether a session restore prompt should be shown
     session_restore_pending: bool,
+    /// User-selected embedding model for RAG
+    embedding_choice: crate::rag::EmbeddingChoice,
     /// Active LLM backend (Ollama or Custom provider)
     backend: crate::llm::ProviderBackend,
     /// Loaded custom provider configurations from custom_providers.json
@@ -313,6 +315,7 @@ impl DockOckApp {
             show_diff: false,
             refinement_input: String::new(),
             session_restore_pending: false,
+            embedding_choice: crate::rag::EmbeddingChoice::default(),
             backend: crate::llm::ProviderBackend::Ollama,
             custom_providers: {
                 // Look next to the executable first, then fall back to cwd.
@@ -654,6 +657,7 @@ impl DockOckApp {
         let cache = crate::cache::DiskCache::new(Some(&local_cache_root));
         let force_regenerate = self.force_regenerate;
         let backend = self.backend.clone();
+        let embedding_choice = self.embedding_choice;
         let cancel_token = self.cancel_token.clone();
 
         // Spawn a blocking thread that drives the async work
@@ -663,7 +667,7 @@ impl DockOckApp {
                 gen_model, ext_model, rev_model, vis_model,
                 mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
-                cache, force_regenerate, tx, cancel_token,
+                cache, force_regenerate, embedding_choice, tx, cancel_token,
             ));
         });
     }
@@ -1136,6 +1140,16 @@ impl DockOckApp {
             ui.label("∥");
             ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0).max_decimals(0).update_while_editing(false))
                 .on_hover_text("Max concurrent LLM tasks");
+            ui.separator();
+            ui.label("RAG:");
+            egui::ComboBox::from_id_salt("embedding_choice")
+                .selected_text(self.embedding_choice.to_string())
+                .width(180.0)
+                .show_ui(ui, |ui| {
+                    for &choice in crate::rag::EmbeddingChoice::ALL {
+                        ui.selectable_value(&mut self.embedding_choice, choice, choice.to_string());
+                    }
+                });
         });
     }
 
@@ -1964,6 +1978,7 @@ async fn process_files(
     openspec_output_dir: Option<PathBuf>,
     cache: crate::cache::DiskCache,
     force_regenerate: bool,
+    embedding_choice: crate::rag::EmbeddingChoice,
     tx: Sender<ProcessingEvent>,
     cancel_token: CancellationToken,
 ) {
@@ -2164,6 +2179,13 @@ async fn process_files(
     // Connect to MongoDB and build the semantic RAG index from all parsed file chunks.
     // Falls back to excerpt-based context if MongoDB is unreachable or embedding fails.
     let rag_state: Option<(crate::rag::EmbeddingProvider, mongodb::Client)> = 'rag: {
+        if matches!(embedding_choice, crate::rag::EmbeddingChoice::None) {
+            let _ = tx.send(ProcessingEvent::Status(
+                "ℹ RAG disabled by user — using excerpt-based context.".to_string(),
+            ));
+            break 'rag None;
+        }
+
         let _ = tx.send(ProcessingEvent::Status(
             "🔗 Connecting to MongoDB for RAG index…".to_string(),
         ));
@@ -2177,48 +2199,102 @@ async fn process_files(
             }
         };
 
-        // Determine embedding provider: try Ollama first, then FastEmbed
+        // Determine embedding provider based on user's choice
         let embedding_provider = {
-            // Check if the extractor Ollama instance has nomic-embed-text available
             let ollama_url = match &backend {
                 crate::llm::ProviderBackend::Ollama => "http://localhost:11435".to_string(),
                 crate::llm::ProviderBackend::Custom { .. } => "http://localhost:11435".to_string(),
             };
-            let ollama_client = rig::providers::ollama::Client::builder()
-                .api_key(rig::client::Nothing)
-                .base_url(&ollama_url)
-                .build()
-                .unwrap();
-            // Try a small test embed to verify Ollama embeddings work
-            let test_result = {
+
+            // Helper: try to create an Ollama embedding provider for the given model
+            let try_ollama = |model_name: &str| -> Option<(rig::providers::ollama::Client, String)> {
+                let client = rig::providers::ollama::Client::builder()
+                    .api_key(rig::client::Nothing)
+                    .base_url(&ollama_url)
+                    .build()
+                    .ok()?;
+                Some((client, model_name.to_string()))
+            };
+
+            // Helper: test that an Ollama embedding model actually works
+            async fn test_ollama_embed(client: &rig::providers::ollama::Client, model: &str) -> bool {
                 use rig::client::EmbeddingsClient;
                 tokio::time::timeout(
                     std::time::Duration::from_secs(10),
                     rig::embeddings::EmbeddingsBuilder::new(
-                        ollama_client.embedding_model("nomic-embed-text"),
+                        client.embedding_model(model),
                     )
                     .document("hello world".to_string())
                     .unwrap()
                     .build(),
                 )
                 .await
-            };
+                .ok()
+                .and_then(|r| r.ok())
+                .is_some()
+            }
 
-            match test_result {
-                Ok(Ok(_)) => {
-                    let _ = tx.send(ProcessingEvent::Status(
-                        "🧠 Using Ollama (nomic-embed-text) for RAG embeddings".to_string(),
-                    ));
-                    crate::rag::EmbeddingProvider::Ollama {
-                        client: ollama_client,
-                        model: "nomic-embed-text".to_string(),
+            match embedding_choice {
+                crate::rag::EmbeddingChoice::OllamaNomicEmbedText => {
+                    if let Some((client, model)) = try_ollama("nomic-embed-text") {
+                        if test_ollama_embed(&client, &model).await {
+                            let _ = tx.send(ProcessingEvent::Status(
+                                "🧠 Using Ollama (nomic-embed-text) for RAG embeddings".to_string(),
+                            ));
+                            crate::rag::EmbeddingProvider::Ollama { client, model }
+                        } else {
+                            let _ = tx.send(ProcessingEvent::Status(
+                                "⚠ Ollama nomic-embed-text unavailable — RAG disabled".to_string(),
+                            ));
+                            break 'rag None;
+                        }
+                    } else {
+                        break 'rag None;
                     }
                 }
-                _ => {
+                crate::rag::EmbeddingChoice::OllamaMxbaiEmbedLarge => {
+                    if let Some((client, model)) = try_ollama("mxbai-embed-large") {
+                        if test_ollama_embed(&client, &model).await {
+                            let _ = tx.send(ProcessingEvent::Status(
+                                "🧠 Using Ollama (mxbai-embed-large) for RAG embeddings".to_string(),
+                            ));
+                            crate::rag::EmbeddingProvider::Ollama { client, model }
+                        } else {
+                            let _ = tx.send(ProcessingEvent::Status(
+                                "⚠ Ollama mxbai-embed-large unavailable — RAG disabled".to_string(),
+                            ));
+                            break 'rag None;
+                        }
+                    } else {
+                        break 'rag None;
+                    }
+                }
+                crate::rag::EmbeddingChoice::FastEmbedMiniLM => {
                     let _ = tx.send(ProcessingEvent::Status(
-                        "🧠 Ollama embeddings unavailable — falling back to FastEmbed (local CPU)".to_string(),
+                        "🧠 Using FastEmbed (AllMiniLM, local CPU) for RAG embeddings".to_string(),
                     ));
                     crate::rag::EmbeddingProvider::FastEmbed
+                }
+                crate::rag::EmbeddingChoice::Auto | crate::rag::EmbeddingChoice::None => {
+                    // Auto: try Ollama nomic-embed-text first, fall back to FastEmbed
+                    if let Some((client, model)) = try_ollama("nomic-embed-text") {
+                        if test_ollama_embed(&client, &model).await {
+                            let _ = tx.send(ProcessingEvent::Status(
+                                "🧠 Using Ollama (nomic-embed-text) for RAG embeddings".to_string(),
+                            ));
+                            crate::rag::EmbeddingProvider::Ollama { client, model }
+                        } else {
+                            let _ = tx.send(ProcessingEvent::Status(
+                                "🧠 Ollama embeddings unavailable — falling back to FastEmbed (local CPU)".to_string(),
+                            ));
+                            crate::rag::EmbeddingProvider::FastEmbed
+                        }
+                    } else {
+                        let _ = tx.send(ProcessingEvent::Status(
+                            "🧠 Ollama client unavailable — falling back to FastEmbed (local CPU)".to_string(),
+                        ));
+                        crate::rag::EmbeddingProvider::FastEmbed
+                    }
                 }
             }
         };
@@ -2335,12 +2411,11 @@ async fn process_files(
                 let _ = tx.send(ProcessingEvent::FileStarted(member_path.clone()));
                 let file_start = std::time::Instant::now();
 
-                // RAG retrieval: query the vector index for cross-file context
+                // RAG retrieval: query chunks + memories for cross-file context
                 let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
                     let (ref provider, ref mongo) = **rs;
-                    let coll = crate::rag::chunks_collection(mongo);
                     let query = crate::rag::build_query_text(&raw_text, &file_name);
-                    let ctx_str = crate::rag::retrieve_context(provider, &coll, &query, &file_name, &child_token).await;
+                    let ctx_str = crate::rag::retrieve_full_context(provider, mongo, &query, &file_name, &child_token).await;
                     if ctx_str.is_empty() { None } else { Some(ctx_str) }
                 } else {
                     None
@@ -2421,14 +2496,13 @@ async fn process_files(
             }
             let group_start = std::time::Instant::now();
 
-            // RAG retrieval for group: query using merged member content
+            // RAG retrieval for group: query chunks + memories using merged member content
             let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
                 let (ref provider, ref mongo) = **rs;
-                let coll = crate::rag::chunks_collection(mongo);
                 let merged_query: String = members_data.iter()
                     .map(|(name, _, text, _)| crate::rag::build_query_text(text, name))
                     .collect::<Vec<_>>().join("\n");
-                let ctx_str = crate::rag::retrieve_context(provider, &coll, &merged_query, &group_name, &child_token).await;
+                let ctx_str = crate::rag::retrieve_full_context(provider, mongo, &merged_query, &group_name, &child_token).await;
                 if ctx_str.is_empty() { None } else { Some(ctx_str) }
             } else {
                 None
@@ -2530,12 +2604,11 @@ async fn process_files(
             )));
             let file_start = std::time::Instant::now();
 
-            // RAG retrieval: query the vector index for cross-file context
+            // RAG retrieval: query chunks + memories for cross-file context
             let rag_ctx: Option<String> = if let Some(ref rs) = rag_st {
                 let (ref provider, ref mongo) = **rs;
-                let coll = crate::rag::chunks_collection(mongo);
                 let query = crate::rag::build_query_text(&raw_text, &file_name);
-                let ctx_str = crate::rag::retrieve_context(provider, &coll, &query, &file_name, &child_token).await;
+                let ctx_str = crate::rag::retrieve_full_context(provider, mongo, &query, &file_name, &child_token).await;
                 if ctx_str.is_empty() { None } else { Some(ctx_str) }
             } else {
                 None
@@ -2595,6 +2668,32 @@ async fn process_files(
     // Close the tracker and wait for all LLM tasks to complete
     tracker.close();
     tracker.wait().await;
+
+    // ── Phase 2.5: Extract & store factoid memories for future runs ──
+    if let Some(ref rs) = rag_state {
+        let (ref provider, ref mongo) = **rs;
+        let docs_for_memory = gherkin_docs.lock().map(|d| d.clone()).unwrap_or_default();
+        if !docs_for_memory.is_empty() && !cancel_token.is_cancelled() {
+            let _ = tx.send(ProcessingEvent::Status(
+                "🧠 Extracting factoids for cross-session memory…".to_string(),
+            ));
+            match crate::memory::extract_and_store_factoids(
+                provider, mongo, &docs_for_memory, &cancel_token,
+            ).await {
+                Ok(n) if n > 0 => {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "✅ Stored {n} factoid memories for future runs"
+                    )));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "⚠ Factoid extraction failed (non-fatal): {e}"
+                    )));
+                }
+            }
+        }
+    }
 
     let _ = tx.send(ProcessingEvent::Done(Ok(())));
 

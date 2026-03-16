@@ -155,6 +155,49 @@ pub fn chunks_collection(client: &MongoClient) -> Collection<bson::Document> {
 // Embedding provider selection
 // ─────────────────────────────────────────────
 
+/// User-facing embedding model selection in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingChoice {
+    /// Try Ollama first, fall back to FastEmbed.
+    Auto,
+    /// Ollama `nomic-embed-text` (768-dim, GPU-accelerated).
+    OllamaNomicEmbedText,
+    /// Ollama `mxbai-embed-large` (1024-dim, higher quality).
+    OllamaMxbaiEmbedLarge,
+    /// FastEmbed local CPU (`AllMiniLML6V2Q`, 384-dim, no external service).
+    FastEmbedMiniLM,
+    /// Disable RAG entirely; use excerpt-based context fallback.
+    None,
+}
+
+impl EmbeddingChoice {
+    pub const ALL: &[EmbeddingChoice] = &[
+        Self::Auto,
+        Self::OllamaNomicEmbedText,
+        Self::OllamaMxbaiEmbedLarge,
+        Self::FastEmbedMiniLM,
+        Self::None,
+    ];
+}
+
+impl std::fmt::Display for EmbeddingChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auto => write!(f, "Auto (Ollama → FastEmbed)"),
+            Self::OllamaNomicEmbedText => write!(f, "nomic-embed-text (Ollama)"),
+            Self::OllamaMxbaiEmbedLarge => write!(f, "mxbai-embed-large (Ollama)"),
+            Self::FastEmbedMiniLM => write!(f, "AllMiniLM (FastEmbed, CPU)"),
+            Self::None => write!(f, "None (disable RAG)"),
+        }
+    }
+}
+
+impl Default for EmbeddingChoice {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
 /// Which embedding backend to use.
 #[derive(Debug, Clone)]
 pub enum EmbeddingProvider {
@@ -486,4 +529,36 @@ pub async fn cleanup_orphaned_chunks(
         info!("RAG: cleaned up {} orphaned chunks", result.deleted_count);
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────
+// Combined retrieval (chunks + memories)
+// ─────────────────────────────────────────────
+
+/// Retrieve cross-file context from both the `chunks` collection (raw file
+/// embeddings) and the `memories` collection (historical factoids), merging
+/// both into a single context string.
+#[instrument(skip_all)]
+pub async fn retrieve_full_context(
+    provider: &EmbeddingProvider,
+    mongo_client: &MongoClient,
+    query_text: &str,
+    exclude_file: &str,
+    cancel_token: &CancellationToken,
+) -> String {
+    let chunks_coll = chunks_collection(mongo_client);
+    let chunk_ctx = retrieve_context(provider, &chunks_coll, query_text, exclude_file, cancel_token).await;
+
+    let mem_coll = crate::memory::memories_collection(mongo_client);
+    let mem_ctx = crate::memory::retrieve_memories(provider, &mem_coll, query_text, cancel_token).await;
+
+    if chunk_ctx.is_empty() && mem_ctx.is_empty() {
+        return String::new();
+    }
+
+    let mut combined = chunk_ctx;
+    if !mem_ctx.is_empty() {
+        combined.push_str(&mem_ctx);
+    }
+    combined
 }
