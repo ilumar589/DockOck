@@ -188,8 +188,9 @@ Rules:
 1. Identify the key actors, systems, data entities, and processes described.
 2. List preconditions and postconditions for each process.
 3. Capture business rules and validation logic.
-4. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES, IMAGE_CONTENT.
-5. Be concise — no more than 500 words.
+4. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES,
+   FIELD_SCOPING, LIFECYCLE_PHASES, SETUP_VS_RUNTIME, IMAGE_CONTENT.
+5. Be concise — no more than 600 words.
 6. Do not add conversational prose.
 7. If the input contains an "=== Embedded Image Descriptions ===" section, you MUST include a
    dedicated IMAGE_CONTENT section in your summary that preserves:
@@ -197,7 +198,17 @@ Rules:
    - All diagram flows, decision points, and entity relationships
    - All reviewer/sidebar comments with author names and their full text
    - All cross-references to other documents
-   Image-derived information is business-critical and must NOT be summarized away or omitted."#;
+   Image-derived information is business-critical and must NOT be summarized away or omitted.
+8. FIELD_SCOPING: For every entity that has a Create/New dialog, list ONLY the fields explicitly
+   mentioned in that dialog section. Separately list fields that appear in FactBoxes, Consumers,
+   or downstream documents. Never merge these two sets — they serve different purposes.
+9. LIFECYCLE_PHASES: For every validation rule or business rule, tag it with the exact lifecycle
+   phase it applies to (Creation, Edit, Category-change, Status-transition, Deletion). Only tag
+   a rule as applying at Creation if the document explicitly states it applies during creation.
+10. SETUP_VS_RUNTIME: Classify each entity or rule as either Setup/Configuration (e.g., category
+    definitions, parameter tables, code lists) or Runtime/Business-object (e.g., premises,
+    inspections, meters). Rules defined on a Setup entity must NOT be attributed to the
+    corresponding Runtime entity unless the document explicitly says so."#;
 
 pub const GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 Your task is to read a structured document summary and produce well-structured Gherkin
@@ -214,7 +225,22 @@ Rules:
    image description as a first-class source of business requirements. Generate dedicated
    Scenarios for data structures (e.g. XML schemas), process flows, entity relationships,
    reviewer comments, and any business rules visible in those images. Do NOT ignore or
-   skip image-derived content — it is equally important as the document text."#;
+   skip image-derived content — it is equally important as the document text.
+8. FIELD SCOPING — Creation scenarios must ONLY assert fields that are explicitly listed in the
+   document's Create/New dialog section for that entity. Do NOT include fields from FactBoxes,
+   Consumers, related entities, or downstream service documents in creation scenarios. If a field
+   belongs to a FactBox or Consumer, place it in a separate viewing/navigation scenario instead.
+9. SETUP vs RUNTIME — Clearly separate Setup/Configuration scenarios from Runtime/Business-object
+   scenarios. If a rule (e.g., field immutability) is defined on a Setup entity (like a Category
+   definition), do NOT apply it to the Runtime entity (like the business record that uses the
+   category). Only assert runtime editability rules when the document ties them to a specific
+   parameter or runtime condition.
+10. LIFECYCLE PHASE ACCURACY — Each validation or business rule must be placed in a scenario that
+    matches the exact lifecycle phase stated in the document (Creation, Edit, Category-change,
+    Status-transition). Do NOT promote a validation to a creation scenario unless the document
+    explicitly states it applies at creation time. Tag scenarios with the phase, e.g.:
+    Scenario: [Creation] Manually create a new premises
+    Scenario: [Category-change] Validate premises category change"#;
 
 const REVIEWER_PREAMBLE: &str = r#"You are a Gherkin quality reviewer.
 Your task is to review and improve a Gherkin Feature document.
@@ -225,7 +251,17 @@ Rules:
 3. Improve step clarity and business readability where needed.
 4. Remove duplicate scenarios.
 5. Output ONLY the corrected Gherkin — no explanations.
-6. If the input is already good, return it unchanged."#;
+6. If the input is already good, return it unchanged.
+7. FIELD SCOPING CHECK — If a creation scenario asserts fields that are typical of FactBoxes,
+   Consumers, or related entities (e.g., hyperlinks to contracts, registration-level lookups,
+   consumer lists), move those assertions to a separate viewing scenario or remove them from
+   the creation scenario.
+8. SETUP vs RUNTIME CHECK — If a scenario applies a Setup/Configuration rule (e.g., category
+   name immutability) to a Runtime business object, correct it: either move the rule to a Setup
+   scenario or rewrite it to reference the documented parameter that controls runtime behaviour.
+9. LIFECYCLE PHASE CHECK — If a validation rule is asserted during creation but the context
+   indicates it applies to a different phase (e.g., category change, status transition), move
+   it to the correct lifecycle-phase scenario."#;
 
 const GROUP_EXTRACTOR_PREAMBLE: &str = r#"You are an expert document analyst.
 You will receive content extracted from MULTIPLE related documents that describe the same
@@ -237,12 +273,20 @@ Rules:
 2. List preconditions and postconditions for each process.
 3. Capture business rules and validation logic from every document.
 4. Merge overlapping information — do not repeat the same fact from different documents.
-5. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES, IMAGE_CONTENT.
-6. Be concise — no more than 800 words.
+5. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES,
+   FIELD_SCOPING, LIFECYCLE_PHASES, SETUP_VS_RUNTIME, IMAGE_CONTENT.
+6. Be concise — no more than 900 words.
 7. Do not add conversational prose.
 8. If the input contains "=== Embedded Image Descriptions ===" sections, you MUST include a
    dedicated IMAGE_CONTENT section that preserves XML/data structure hierarchies, diagram flows,
-   reviewer comments (with author names), and cross-references. Image content is business-critical."#;
+   reviewer comments (with author names), and cross-references. Image content is business-critical.
+9. FIELD_SCOPING: For every entity that has a Create/New dialog, list ONLY the fields explicitly
+   mentioned in that dialog section. Separately list fields from FactBoxes, Consumers, or
+   downstream documents. Never merge these two sets.
+10. LIFECYCLE_PHASES: Tag every validation/business rule with its exact lifecycle phase
+    (Creation, Edit, Category-change, Status-transition, Deletion) as stated in the source docs.
+11. SETUP_VS_RUNTIME: Classify each entity or rule as Setup/Configuration or Runtime/Business-object.
+    Rules from Setup entities must NOT be attributed to Runtime entities unless explicitly stated."#;
 
 const GROUP_GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 You will receive a structured summary synthesised from MULTIPLE related documents that
@@ -261,7 +305,13 @@ Rules:
    image description as a first-class source of business requirements. Generate dedicated
    Scenarios for data structures (e.g. XML schemas), process flows, entity relationships,
    reviewer comments, and any business rules visible in those images. Do NOT ignore or
-   skip image-derived content — it is equally important as the document text."#;
+   skip image-derived content — it is equally important as the document text.
+9. FIELD SCOPING — Creation scenarios must ONLY assert fields explicitly listed in the Create/New
+   dialog section. FactBox, Consumer, and downstream fields belong in separate viewing scenarios.
+10. SETUP vs RUNTIME — Do not apply Setup/Configuration rules to Runtime business objects.
+    Runtime editability must reference the documented parameter that controls it.
+11. LIFECYCLE PHASE ACCURACY — Place each validation in the correct lifecycle-phase scenario.
+    Tag scenarios with the phase, e.g.: Scenario: [Creation] ..., Scenario: [Category-change] ..."#;
 
 const VISION_DESCRIBE_PROMPT: &str = "\
 IMPORTANT: Every image in this document carries business-critical information that MUST be \
@@ -2114,6 +2164,31 @@ fn score_line(line: &str) -> u32 {
     for kw in &["user", "system", "admin", "actor", "service", "module", "role"] {
         if lower.contains(kw) {
             score += 3;
+            break;
+        }
+    }
+
+    // UI dialog / form section markers — critical for field scoping
+    for kw in &["create ", "new ", "dialog", "factbox", "consumer", "fast tab", "fasttab"] {
+        if lower.contains(kw) {
+            score += 6;
+            break;
+        }
+    }
+
+    // Setup vs Runtime boundary markers
+    for kw in &["setup", "configuration", "parameter", "category definition", "code list"] {
+        if lower.contains(kw) {
+            score += 5;
+            break;
+        }
+    }
+
+    // Lifecycle phase markers — essential for correct phase attribution
+    for kw in &["on create", "on insert", "on modify", "on delete", "on validate",
+                "status change", "category change", "lifecycle", "phase"] {
+        if lower.contains(kw) {
+            score += 7;
             break;
         }
     }
