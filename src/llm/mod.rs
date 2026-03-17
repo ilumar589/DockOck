@@ -37,7 +37,7 @@ pub mod prefix_cache;
 pub mod provider;
 pub use prefix_cache::PrefixCache;
 pub use provider::ProviderBackend;
-pub use provider::{load_custom_providers, build_custom_backend, custom_model_ids, CustomProviderConfig};
+pub use provider::{load_custom_providers, build_custom_backend, custom_model_ids, custom_model_limits, CustomProviderConfig};
 
 /// Default model used for the generator agent.
 pub const DEFAULT_GENERATOR_MODEL: &str = "qwen2.5-coder:32b";
@@ -360,10 +360,10 @@ Rules:
 
 /// Streaming chunk from Ollama's `/api/generate` endpoint.
 #[derive(serde::Deserialize)]
-struct OllamaStreamGenerateChunk {
-    response: String,
+pub(crate) struct OllamaStreamGenerateChunk {
+    pub response: String,
     #[serde(default)]
-    done: bool,
+    pub done: bool,
 }
 
 /// Streaming chunk from OpenAI-compatible `/chat/completions` endpoint (SSE).
@@ -423,6 +423,8 @@ pub struct AgentOrchestrator {
     /// Shared RAG indexes for `dynamic_context()` (chunks + memories).
     /// When non-empty, agents automatically inject relevant context per call.
     rag_indexes: Vec<crate::rag::SharedVectorIndex>,
+    /// Custom provider configs for looking up real model token limits.
+    custom_configs: Vec<CustomProviderConfig>,
 }
 
 /// Result of checking which Ollama endpoints are reachable.
@@ -542,6 +544,7 @@ impl AgentOrchestrator {
                             PrefixCache::new(ENDPOINT_GENERATOR.url, generator_model)
                         )),
                         rag_indexes: Vec::new(),
+                        custom_configs: Vec::new(),
                     },
                     statuses,
                 ))
@@ -615,6 +618,7 @@ impl AgentOrchestrator {
                         cache,
                         generator_prefix_cache: None, // not applicable for cloud APIs
                         rag_indexes: Vec::new(),
+                        custom_configs: Vec::new(),
                     },
                     statuses,
                 ))
@@ -627,6 +631,23 @@ impl AgentOrchestrator {
     /// from MongoDB vector indexes on each LLM call.
     pub fn set_rag_indexes(&mut self, indexes: Vec<crate::rag::SharedVectorIndex>) {
         self.rag_indexes = indexes;
+    }
+
+    /// Store custom provider configs for model limit lookups.
+    pub fn set_custom_configs(&mut self, configs: Vec<CustomProviderConfig>) {
+        self.custom_configs = configs;
+    }
+
+    /// Compute the input character budget for a model, using real token limits
+    /// from `custom_providers.json` when available, falling back to name-based heuristics.
+    fn model_input_budget(&self, model: &str) -> usize {
+        if let Some(limits) = custom_model_limits(&self.custom_configs, model) {
+            // Reserve ~30% of context for system prompt + output.
+            // Convert tokens to chars (~4 chars per token).
+            let usable_tokens = (limits.context_tokens as f64 * 0.70) as usize;
+            return usable_tokens * 4;
+        }
+        input_budget_for_model(model)
     }
 
     /// Prime the generator's KV-cache prefix (Ollama only).
@@ -988,13 +1009,14 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
+        let model_budget = self.model_input_budget(budget_model);
 
         // Pre-compute cross-file context overhead so chunking accounts for it
         let glossary = context.build_glossary();
         let context_overhead = context_summary.len() + glossary.len();
 
         // ── Chunk-and-merge path for oversized documents ──
-        if needs_chunking(&enriched_text, budget_model, context_overhead) {
+        if needs_chunking(&enriched_text, model_budget, context_overhead) {
             let result = self.process_file_chunked(
                 file_name, file_type, &enriched_text, context, context_overhead, status_tx, cancel_token,
             ).await?;
@@ -1003,7 +1025,7 @@ impl AgentOrchestrator {
         }
 
         // ── Step 1: Prepare input for the generator ──
-        let budget = input_budget_for_model(&self.generator_model);
+        let budget = self.model_input_budget(&self.generator_model);
         let summary = if self.mode == PipelineMode::Full {
             // Full mode: use LLM extractor
             let _ = status_tx.send(format!(
@@ -1076,7 +1098,8 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
-        let chunks = chunk_for_llm(enriched_text, budget_model, context_overhead);
+        let model_budget = self.model_input_budget(budget_model);
+        let chunks = chunk_for_llm(enriched_text, model_budget, context_overhead);
         let n = chunks.len();
 
         let _ = status_tx.send(format!(
@@ -1085,7 +1108,7 @@ impl AgentOrchestrator {
         ));
 
         // Phase 1: Extract/preprocess each chunk (can run concurrently)
-        let budget = input_budget_for_model(&self.generator_model);
+        let budget = self.model_input_budget(&self.generator_model);
         let mut summaries: Vec<String> = Vec::with_capacity(n);
 
         for chunk in &chunks {
@@ -1513,7 +1536,7 @@ impl AgentOrchestrator {
         }
 
         // ── Step 0: Build merged text and images from all members ──
-        let budget = input_budget_for_model(&self.generator_model);
+        let budget = self.model_input_budget(&self.generator_model);
         let mut merged_text = String::new();
         let mut all_images: Vec<&crate::parser::ExtractedImage> = Vec::new();
         let chars_per_member = budget / members.len().max(1);
@@ -1579,7 +1602,8 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
-        if needs_chunking(&merged_text, budget_model, context_overhead) {
+        let group_budget = self.model_input_budget(budget_model);
+        if needs_chunking(&merged_text, group_budget, context_overhead) {
             let result = self.process_file_chunked(
                 group_name, "Multi-document group", &merged_text, context, context_overhead, status_tx, cancel_token,
             ).await?;
@@ -2242,20 +2266,18 @@ struct LlmChunk {
 
 /// Returns `true` when the document text exceeds the model's effective
 /// character budget after reserving space for cross-file context overhead.
-fn needs_chunking(text: &str, model: &str, context_overhead: usize) -> bool {
-    let budget = input_budget_for_model(model);
+fn needs_chunking(text: &str, budget: usize, context_overhead: usize) -> bool {
     let effective = budget.saturating_sub(context_overhead);
     // Ensure a minimum workable budget (2 000 chars) even with large context
     text.len() > effective.max(2_000)
 }
 
-/// Split text into overlapping windows that fit within the model's input budget
+/// Split text into overlapping windows that fit within the given `budget`
 /// minus the `context_overhead` (cross-file context + glossary injected per call).
 /// Breaks are snapped to line boundaries to avoid cutting mid-sentence.
-fn chunk_for_llm(text: &str, model: &str, context_overhead: usize) -> Vec<LlmChunk> {
-    let raw_budget = input_budget_for_model(model);
+fn chunk_for_llm(text: &str, budget: usize, context_overhead: usize) -> Vec<LlmChunk> {
     // Reserve space for context injected into every chunk, with a floor
-    let budget = raw_budget.saturating_sub(context_overhead).max(2_000);
+    let budget = budget.saturating_sub(context_overhead).max(2_000);
     if text.len() <= budget {
         return vec![LlmChunk { index: 0, total: 1, text: text.to_string() }];
     }
@@ -2352,8 +2374,11 @@ where
     let mut accumulated = String::new();
     let mut token_count: usize = 0;
 
-    // Per-chunk timeout: if no data arrives for 60s the stream is considered stalled.
-    let chunk_timeout = std::time::Duration::from_secs(60);
+    // Stall detection: use a longer timeout for the first token (cloud APIs
+    // can take a while to process large prompts before streaming starts),
+    // then a shorter timeout between subsequent tokens.
+    let initial_chunk_timeout = std::time::Duration::from_secs(120);
+    let stream_chunk_timeout = std::time::Duration::from_secs(60);
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2362,6 +2387,7 @@ where
                 "{stage_name} overall deadline exceeded for {file_name} after {token_count} tokens"
             );
         }
+        let chunk_timeout = if token_count == 0 { initial_chunk_timeout } else { stream_chunk_timeout };
         let wait = chunk_timeout.min(remaining);
 
         tokio::select! {

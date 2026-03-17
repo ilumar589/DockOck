@@ -716,6 +716,7 @@ impl DockOckApp {
         let backend = self.backend.clone();
         let embedding_choice = self.embedding_choice;
         let cancel_token = self.cancel_token.clone();
+        let custom_providers = self.custom_providers.clone();
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
@@ -724,7 +725,7 @@ impl DockOckApp {
                 gen_model, ext_model, rev_model, vis_model,
                 mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
-                cache, force_regenerate, embedding_choice, tx, cancel_token,
+                cache, force_regenerate, embedding_choice, custom_providers, tx, cancel_token,
             ));
         });
     }
@@ -765,7 +766,8 @@ impl DockOckApp {
 
                 let result = match &backend {
                     crate::llm::ProviderBackend::Ollama => {
-                        // Raw HTTP to local Ollama
+                        // Raw HTTP streaming to local Ollama
+                        use futures::StreamExt;
                         let num_ctx = crate::llm::context_window_for_model(&model);
                         let client = reqwest::Client::new();
                         let resp = client
@@ -773,29 +775,79 @@ impl DockOckApp {
                             .json(&serde_json::json!({
                                 "model": model,
                                 "prompt": preamble,
-                                "stream": false,
+                                "stream": true,
                                 "options": { "num_ctx": num_ctx },
                             }))
+                            .timeout(std::time::Duration::from_secs(600))
                             .send()
                             .await;
                         match resp {
-                            Ok(r) => match r.json::<serde_json::Value>().await {
-                                Ok(body) => body["response"].as_str().map(|s| s.to_string()),
-                                Err(_) => None,
-                            },
+                            Ok(r) => {
+                                let mut stream = r.bytes_stream();
+                                let mut accumulated = String::new();
+                                let mut token_count: usize = 0;
+                                let mut buf = Vec::new();
+                                let chunk_timeout = std::time::Duration::from_secs(120);
+                                let mut failed = false;
+
+                                loop {
+                                    match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                                        Ok(Some(Ok(bytes))) => {
+                                            buf.extend_from_slice(&bytes);
+                                            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                                                let line = String::from_utf8_lossy(&line_bytes);
+                                                let trimmed = line.trim();
+                                                if trimmed.is_empty() { continue; }
+                                                if let Ok(chunk) = serde_json::from_str::<crate::llm::OllamaStreamGenerateChunk>(trimmed) {
+                                                    if !chunk.response.is_empty() {
+                                                        accumulated.push_str(&chunk.response);
+                                                        token_count += 1;
+                                                        if token_count % 20 == 0 {
+                                                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                                                "\u{270f} Refining: {} tokens\u{2026}", token_count
+                                                            )));
+                                                        }
+                                                    }
+                                                    if chunk.done { break; }
+                                                }
+                                            }
+                                        }
+                                        Ok(Some(Err(e))) => {
+                                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                                "\u{26a0} Refinement stream error: {}", e
+                                            )));
+                                            failed = true;
+                                            break;
+                                        }
+                                        Ok(None) => break, // stream ended
+                                        Err(_) => {
+                                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                                "\u{26a0} Refinement stalled after {} tokens", token_count
+                                            )));
+                                            failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if failed || accumulated.is_empty() { None } else { Some(accumulated) }
+                            }
                             Err(e) => {
                                 let _ = tx.send(ProcessingEvent::Status(format!(
-                                    "⚠ Refinement failed: {}", e
+                                    "\u{26a0} Refinement failed: {}", e
                                 )));
                                 None
                             }
                         }
                     }
                     crate::llm::ProviderBackend::Custom { base_url, api_key, .. } => {
-                        // OpenAI-compatible API
+                        // OpenAI-compatible API (streaming)
+                        use futures::StreamExt;
                         use rig::client::CompletionClient;
-                        use rig::completion::Prompt;
                         use rig::providers::openai;
+                        use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+                        use rig::agent::MultiTurnStreamItem;
+                        use rig::agent::Text;
 
                         match openai::CompletionsClient::builder()
                             .api_key(api_key)
@@ -804,19 +856,65 @@ impl DockOckApp {
                         {
                             Ok(client) => {
                                 let agent = client.agent(&model).build();
-                                match agent.prompt(&preamble).await {
-                                    Ok(text) => Some(text),
-                                    Err(e) => {
-                                        let _ = tx.send(ProcessingEvent::Status(format!(
-                                            "⚠ Refinement failed: {}", e
-                                        )));
+                                let timeout = std::time::Duration::from_secs(600);
+                                let stream_result = tokio::time::timeout(
+                                    timeout,
+                                    agent.stream_prompt(&preamble),
+                                ).await;
+                                match stream_result {
+                                    Ok(mut stream) => {
+                                        let mut accumulated = String::new();
+                                        let mut token_count: usize = 0;
+                                        let chunk_timeout = std::time::Duration::from_secs(120);
+                                        let mut failed = false;
+
+                                        loop {
+                                            match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                                                Ok(Some(Ok(item))) => match item {
+                                                    MultiTurnStreamItem::StreamAssistantItem(
+                                                        StreamedAssistantContent::Text(Text { text }),
+                                                    ) => {
+                                                        accumulated.push_str(&text);
+                                                        token_count += 1;
+                                                        if token_count % 20 == 0 {
+                                                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                                                "\u{270f} Refining: {} tokens\u{2026}", token_count
+                                                            )));
+                                                        }
+                                                    }
+                                                    MultiTurnStreamItem::FinalResponse(_) => break,
+                                                    _ => {}
+                                                },
+                                                Ok(Some(Err(e))) => {
+                                                    let _ = tx.send(ProcessingEvent::Status(format!(
+                                                        "\u{26a0} Refinement stream error: {}", e
+                                                    )));
+                                                    failed = true;
+                                                    break;
+                                                }
+                                                Ok(None) => break,
+                                                Err(_) => {
+                                                    let _ = tx.send(ProcessingEvent::Status(format!(
+                                                        "\u{26a0} Refinement stalled after {} tokens", token_count
+                                                    )));
+                                                    failed = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if failed || accumulated.is_empty() { None } else { Some(accumulated) }
+                                    }
+                                    Err(_) => {
+                                        let _ = tx.send(ProcessingEvent::Status(
+                                            "\u{26a0} Refinement timed out".to_string(),
+                                        ));
                                         None
                                     }
                                 }
                             }
                             Err(e) => {
                                 let _ = tx.send(ProcessingEvent::Status(format!(
-                                    "⚠ Failed to create client: {}", e
+                                    "\u{26a0} Failed to create client: {}", e
                                 )));
                                 None
                             }
@@ -2042,6 +2140,7 @@ async fn process_files(
     cache: crate::cache::DiskCache,
     force_regenerate: bool,
     embedding_choice: crate::rag::EmbeddingChoice,
+    custom_providers: Vec<crate::llm::CustomProviderConfig>,
     tx: Sender<ProcessingEvent>,
     cancel_token: CancellationToken,
 ) {
@@ -2085,7 +2184,9 @@ async fn process_files(
     let _ = tx.send(ProcessingEvent::Status(
         "🔥 Warming up models…".to_string(),
     ));
-    let mut orchestrator = Arc::new(orchestrator);
+    let mut orchestrator_mut = orchestrator;
+    orchestrator_mut.set_custom_configs(custom_providers);
+    let mut orchestrator = Arc::new(orchestrator_mut);
     let warmup_orch = Arc::clone(&orchestrator);
     let warmup_handle = tokio::spawn(async move {
         warmup_orch.warm_up().await;

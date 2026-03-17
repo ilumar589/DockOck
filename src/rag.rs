@@ -790,12 +790,55 @@ impl SharedVectorIndex {
     }
 }
 
+/// Maximum character length for embedding queries.
+/// Embedding models have much smaller context windows than LLMs (typically 512-8192 tokens).
+/// We truncate queries to ~2048 chars (~512 tokens) which is safe for all common models
+/// and still captures enough semantic signal for similarity search.
+const MAX_EMBEDDING_QUERY_CHARS: usize = 2048;
+
+/// Truncate a query string to fit within embedding model context limits,
+/// snapping to a word boundary to avoid splitting mid-token.
+fn truncate_query(query: &str) -> String {
+    if query.len() <= MAX_EMBEDDING_QUERY_CHARS {
+        return query.to_string();
+    }
+    let truncated = &query[..MAX_EMBEDDING_QUERY_CHARS];
+    // Snap to last whitespace to avoid cutting mid-word
+    if let Some(pos) = truncated.rfind(char::is_whitespace) {
+        truncated[..pos].to_string()
+    } else {
+        truncated.to_string()
+    }
+}
+
+/// Rebuild a VectorSearchRequest with a truncated query to prevent
+/// embedding model context overflow.
+fn truncate_request(
+    req: VectorSearchRequest<Filter<serde_json::Value>>,
+) -> VectorSearchRequest<Filter<serde_json::Value>> {
+    let query = req.query();
+    if query.len() <= MAX_EMBEDDING_QUERY_CHARS {
+        return req;
+    }
+    let short_query = truncate_query(query);
+    let mut builder = VectorSearchRequest::builder()
+        .query(short_query)
+        .samples(req.samples());
+    if let Some(t) = req.threshold() {
+        builder = builder.threshold(t);
+    }
+    if let Some(f) = req.filter().clone() {
+        builder = builder.filter(f);
+    }
+    builder.build().unwrap_or(req)
+}
+
 impl VectorStoreIndexDyn for SharedVectorIndex {
     fn top_n<'a>(
         &'a self,
         req: VectorSearchRequest<Filter<serde_json::Value>>,
     ) -> Pin<Box<dyn Future<Output = TopNResults> + Send + 'a>> {
-        self.0.top_n(req)
+        self.0.top_n(truncate_request(req))
     }
 
     fn top_n_ids<'a>(
@@ -803,7 +846,7 @@ impl VectorStoreIndexDyn for SharedVectorIndex {
         req: VectorSearchRequest<Filter<serde_json::Value>>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<(f64, String)>, VectorStoreError>> + Send + 'a>>
     {
-        self.0.top_n_ids(req)
+        self.0.top_n_ids(truncate_request(req))
     }
 }
 
