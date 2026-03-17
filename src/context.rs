@@ -82,8 +82,7 @@ impl ProjectContext {
         let mut summary = String::from("=== Cross-file project context ===\n\n");
         for (path, content) in &included {
             summary.push_str(&format!("File: {}\nType: {}\n", path, content.file_type));
-            let excerpt: String = content.raw_text.chars().take(400).collect();
-            summary.push_str(&format!("Excerpt:\n{}\n\n", excerpt));
+            summary.push_str(&format!("Content:\n{}\n\n", content.raw_text));
         }
 
         if !self.entities.is_empty() {

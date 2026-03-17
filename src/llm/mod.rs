@@ -930,10 +930,14 @@ impl AgentOrchestrator {
             &self.generator_model
         };
 
+        // Pre-compute cross-file context overhead so chunking accounts for it
+        let glossary = context.build_glossary();
+        let context_overhead = context_summary.len() + glossary.len();
+
         // ── Chunk-and-merge path for oversized documents ──
-        if needs_chunking(&enriched_text, budget_model) {
+        if needs_chunking(&enriched_text, budget_model, context_overhead) {
             let result = self.process_file_chunked(
-                file_name, file_type, &enriched_text, context, status_tx, cancel_token,
+                file_name, file_type, &enriched_text, context, context_overhead, status_tx, cancel_token,
             ).await?;
             self.cache.put_text(crate::cache::NS_LLM, &llm_cache_key, &result);
             return Ok(result);
@@ -964,7 +968,6 @@ impl AgentOrchestrator {
             "⚙ [Generator] Creating Gherkin for {}…", file_name
         ));
 
-        let glossary = context.build_glossary();
         let gherkin = self.generate(file_name, &summary, &context_summary, &glossary, status_tx, cancel_token).await?;
 
         // ── Step 3: Review / refine (Standard and Full modes only) ──
@@ -1005,6 +1008,7 @@ impl AgentOrchestrator {
         file_type: &str,
         enriched_text: &str,
         context: &ProjectContext,
+        context_overhead: usize,
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
@@ -1013,7 +1017,7 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
-        let chunks = chunk_for_llm(enriched_text, budget_model);
+        let chunks = chunk_for_llm(enriched_text, budget_model, context_overhead);
         let n = chunks.len();
 
         let _ = status_tx.send(format!(
@@ -1485,15 +1489,40 @@ impl AgentOrchestrator {
                     .await;
         }
 
+        // ── Pre-compute cross-file context overhead for budget-aware chunking ──
+        // Exclude group members from cross-file context
+        let member_names: std::collections::HashSet<&str> =
+            members.iter().map(|(name, _, _, _)| name.as_str()).collect();
+        let exclude: std::collections::HashSet<String> = context
+            .file_contents
+            .keys()
+            .filter(|path| {
+                let fname = std::path::Path::new(path.as_str())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                member_names.contains(fname.as_str())
+            })
+            .cloned()
+            .collect();
+
+        let context_summary = if self.rag_indexes.is_empty() {
+            context.build_summary_excluding(&exclude)
+        } else {
+            String::new()
+        };
+        let glossary = context.build_glossary();
+        let context_overhead = context_summary.len() + glossary.len();
+
         // ── Chunk-and-merge path for oversized merged groups ──
         let budget_model = if self.mode == PipelineMode::Full {
             if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
         } else {
             &self.generator_model
         };
-        if needs_chunking(&merged_text, budget_model) {
+        if needs_chunking(&merged_text, budget_model, context_overhead) {
             let result = self.process_file_chunked(
-                group_name, "Multi-document group", &merged_text, context, status_tx, cancel_token,
+                group_name, "Multi-document group", &merged_text, context, context_overhead, status_tx, cancel_token,
             ).await?;
             self.cache.put_text(crate::cache::NS_LLM, &group_cache_key, &result);
             return Ok(result);
@@ -1528,29 +1557,8 @@ impl AgentOrchestrator {
             group_name
         ));
 
-        // Exclude group members from cross-file context
-        let member_names: std::collections::HashSet<&str> =
-            members.iter().map(|(name, _, _, _)| name.as_str()).collect();
-        let exclude: std::collections::HashSet<String> = context
-            .file_contents
-            .keys()
-            .filter(|path| {
-                let fname = std::path::Path::new(path.as_str())
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                member_names.contains(fname.as_str())
-            })
-            .cloned()
-            .collect();
-
-        let context_summary = if self.rag_indexes.is_empty() {
-            context.build_summary_excluding(&exclude)
-        } else {
-            String::new()
-        };
         let gherkin = self
-            .generate_group(group_name, &summary, &context_summary, &context.build_glossary(), status_tx, cancel_token)
+            .generate_group(group_name, &summary, &context_summary, &glossary, status_tx, cancel_token)
             .await?;
 
         // ── Step 3: Review / refine ──
@@ -2148,15 +2156,22 @@ struct LlmChunk {
     text: String,
 }
 
-/// Returns `true` when the document text exceeds the model's character budget.
-fn needs_chunking(text: &str, model: &str) -> bool {
-    text.len() > input_budget_for_model(model)
+/// Returns `true` when the document text exceeds the model's effective
+/// character budget after reserving space for cross-file context overhead.
+fn needs_chunking(text: &str, model: &str, context_overhead: usize) -> bool {
+    let budget = input_budget_for_model(model);
+    let effective = budget.saturating_sub(context_overhead);
+    // Ensure a minimum workable budget (2 000 chars) even with large context
+    text.len() > effective.max(2_000)
 }
 
-/// Split text into overlapping windows that fit within the model's input budget.
+/// Split text into overlapping windows that fit within the model's input budget
+/// minus the `context_overhead` (cross-file context + glossary injected per call).
 /// Breaks are snapped to line boundaries to avoid cutting mid-sentence.
-fn chunk_for_llm(text: &str, model: &str) -> Vec<LlmChunk> {
-    let budget = input_budget_for_model(model);
+fn chunk_for_llm(text: &str, model: &str, context_overhead: usize) -> Vec<LlmChunk> {
+    let raw_budget = input_budget_for_model(model);
+    // Reserve space for context injected into every chunk, with a floor
+    let budget = raw_budget.saturating_sub(context_overhead).max(2_000);
     if text.len() <= budget {
         return vec![LlmChunk { index: 0, total: 1, text: text.to_string() }];
     }
