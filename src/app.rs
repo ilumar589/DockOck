@@ -29,6 +29,40 @@ use crate::context::{FileGroup, ProjectContext};
 use crate::gherkin::GherkinDocument;
 use std::collections::HashSet;
 
+/// Recursively collect files with accepted extensions from `root`.
+///
+/// Skips hidden files (`.` prefix) and Office temp files (`~` prefix).
+fn collect_supported_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let accepted: HashSet<&str> = crate::parser::ACCEPTED_EXTENSIONS.iter().copied().collect();
+    let mut results = Vec::new();
+
+    fn walk(dir: &std::path::Path, accepted: &HashSet<&str>, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            // Skip hidden and temp files
+            if name.starts_with('.') || name.starts_with('~') {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, accepted, out);
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if accepted.contains(ext.to_lowercase().as_str()) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+
+    walk(root, &accepted, &mut results);
+    results.sort();
+    results
+}
+
 /// A timestamped log entry.
 #[derive(Debug, Clone)]
 struct LogEntry {
@@ -405,7 +439,7 @@ impl DockOckApp {
         let paths = rfd::FileDialog::new()
             .add_filter(
                 "Supported documents",
-                &["docx", "xlsx", "xls", "xlsm", "xlsb", "ods", "vsdx", "vsd", "vsdm"],
+                crate::parser::ACCEPTED_EXTENSIONS,
             )
             .pick_files();
 
@@ -416,6 +450,29 @@ impl DockOckApp {
                     self.selected_files.push(p);
                 }
             }
+            self.recompute_groups();
+        }
+    }
+
+    /// Open a folder-picker dialog and recursively add all supported files.
+    fn open_folder_dialog(&mut self) {
+        let folder = rfd::FileDialog::new().pick_folder();
+
+        if let Some(folder) = folder {
+            let found = collect_supported_files(&folder);
+            let mut added = 0usize;
+            for p in found {
+                if !self.selected_files.contains(&p) {
+                    self.push_status(format!("Added: {}", p.display()));
+                    self.selected_files.push(p);
+                    added += 1;
+                }
+            }
+            self.push_status(format!(
+                "📁 Added {} file(s) from {}",
+                added,
+                folder.display()
+            ));
             self.recompute_groups();
         }
     }
@@ -1168,7 +1225,13 @@ impl DockOckApp {
                 self.open_file_dialog();
             }
             if ui
-                .add_enabled(!is_processing, egui::Button::new("🗑 Clear"))
+                .add_enabled(!is_processing, egui::Button::new("� Add Folder"))
+                .clicked()
+            {
+                self.open_folder_dialog();
+            }
+            if ui
+                .add_enabled(!is_processing, egui::Button::new("�🗑 Clear"))
                 .clicked()
             {
                 self.clear_all();

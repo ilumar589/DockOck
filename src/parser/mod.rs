@@ -15,6 +15,11 @@ pub mod word;
 use anyhow::{Result, anyhow};
 use std::path::Path;
 
+/// File extensions accepted by the parsers.
+pub const ACCEPTED_EXTENSIONS: &[&str] = &[
+    "docx", "xlsx", "xls", "xlsm", "xlsb", "ods", "vsdx", "vsd", "vsdm",
+];
+
 /// An image extracted from a document.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExtractedImage {
