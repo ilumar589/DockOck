@@ -15,6 +15,25 @@ pub mod word;
 use anyhow::{Result, anyhow};
 use std::path::Path;
 
+/// Whether a file produces its own Gherkin or only provides context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FileRole {
+    /// Transformed into Gherkin (Word documents).
+    Primary,
+    /// Parsed for context only; no Gherkin output (Excel, Visio).
+    Context,
+}
+
+impl FileRole {
+    /// Derive the role from a file extension.
+    pub fn from_extension(ext: &str) -> Self {
+        match ext.to_lowercase().as_str() {
+            "docx" => Self::Primary,
+            _ => Self::Context,
+        }
+    }
+}
+
 /// File extensions accepted by the parsers.
 pub const ACCEPTED_EXTENSIONS: &[&str] = &[
     "docx", "xlsx", "xls", "xlsm", "xlsb", "ods", "vsdx", "vsd", "vsdm",
@@ -41,6 +60,8 @@ pub struct ParseResult {
     pub text: String,
     /// Extracted images that can be sent to a vision model for description
     pub images: Vec<ExtractedImage>,
+    /// Whether this file produces Gherkin output or only provides context.
+    pub role: FileRole,
 }
 
 /// Determine MIME type from file extension.
@@ -72,16 +93,25 @@ pub fn parse_file(path: &Path) -> Result<ParseResult> {
         .map(|e| e.to_lowercase());
 
     match ext.as_deref() {
-        Some("docx") => word::parse(path),
+        Some("docx") => {
+            let mut result = word::parse(path)?;
+            result.role = FileRole::Primary;
+            Ok(result)
+        }
         Some("xlsx") | Some("xls") | Some("xlsm") | Some("xlsb") | Some("ods") => {
             let text = excel::parse(path)?;
             Ok(ParseResult {
                 file_type: "Excel".to_string(),
                 text,
                 images: Vec::new(),
+                role: FileRole::Context,
             })
         }
-        Some("vsdx") | Some("vsd") | Some("vsdm") => visio::parse(path),
+        Some("vsdx") | Some("vsd") | Some("vsdm") => {
+            let mut result = visio::parse(path)?;
+            result.role = FileRole::Context;
+            Ok(result)
+        }
         _ => Err(anyhow!(
             "Unsupported file type: {}",
             path.display()

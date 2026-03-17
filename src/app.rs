@@ -675,14 +675,26 @@ impl DockOckApp {
         self.failed_groups.clear();
         self.log_entries.clear();
 
-        // Count work items: each group counts as 1, each ungrouped file counts as 1
+        // Count work items: each group counts as 1 (if it has a primary doc),
+        // each ungrouped primary file counts as 1. Context-only files are excluded.
         let grouped = self.grouped_paths();
         let ungrouped_count = self
             .selected_files
             .iter()
-            .filter(|p| !grouped.contains(*p))
+            .filter(|p| {
+                if grouped.contains(*p) { return false; }
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                crate::parser::FileRole::from_extension(ext) == crate::parser::FileRole::Primary
+            })
             .count();
-        let total_items = self.file_groups.len() + ungrouped_count;
+        // Groups with at least one primary file count toward progress
+        let primary_group_count = self.file_groups.iter().filter(|g| {
+            g.members.iter().any(|m| {
+                let ext = m.extension().and_then(|e| e.to_str()).unwrap_or("");
+                crate::parser::FileRole::from_extension(ext) == crate::parser::FileRole::Primary
+            })
+        }).count();
+        let total_items = primary_group_count + ungrouped_count;
 
         self.progress = (0, total_items);
         self.files_started = 0;
@@ -1484,8 +1496,14 @@ impl DockOckApp {
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_default();
+                            let ext = member.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            let icon = if crate::parser::FileRole::from_extension(ext) == crate::parser::FileRole::Primary {
+                                "📄"
+                            } else {
+                                "📎"
+                            };
                             ui.horizontal(|ui| {
-                                ui.label(format!("   {}", name));
+                                ui.label(format!("   {} {}", icon, name));
                                 if !is_processing {
                                     if ui.small_button("✖").on_hover_text("Remove from group").clicked() {
                                         remove_from_group = Some((gi, mi));
@@ -1528,7 +1546,14 @@ impl DockOckApp {
                 if self.selected_files.iter().any(|p| !grouped_paths.contains(p)) {
                     ui.add_space(4.0);
                     ui.separator();
-                    ui.label(egui::RichText::new("Ungrouped").italics());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Ungrouped").italics());
+                        ui.label(
+                            egui::RichText::new("  📄 = Gherkin   📎 = context")
+                                .color(egui::Color32::from_rgb(120, 120, 140))
+                                .small(),
+                        );
+                    });
                 }
 
                 for (i, path) in self.selected_files.iter().enumerate() {
@@ -1540,11 +1565,20 @@ impl DockOckApp {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let file_role = crate::parser::FileRole::from_extension(ext);
+                    let is_context = file_role == crate::parser::FileRole::Context;
+
                     let has_result = self.results.contains_key(path);
                     let has_failed = self.failed_items.contains_key(path);
                     let selected = self.selection == Some(Selection::File(i));
 
-                    let resp = if has_result {
+                    let resp = if is_context {
+                        // Context files — dimmed with 📎 icon
+                        let label = egui::RichText::new(format!("📎 {}", name))
+                            .color(egui::Color32::from_rgb(140, 140, 160));
+                        ui.selectable_label(selected, label)
+                    } else if has_result {
                         let elapsed_text = self.elapsed_times.get(path).map(|dur| {
                             let secs = dur.as_secs_f64();
                             if secs >= 60.0 {
@@ -1578,7 +1612,11 @@ impl DockOckApp {
                     } else {
                         ui.selectable_label(selected, &name)
                     }
-                    .on_hover_text(path.to_string_lossy().as_ref());
+                    .on_hover_text(if is_context {
+                        format!("{} (reference context — no Gherkin output)", path.display())
+                    } else {
+                        path.to_string_lossy().to_string()
+                    });
 
                     if resp.clicked() {
                         self.selection = Some(Selection::File(i));
@@ -1655,6 +1693,62 @@ impl DockOckApp {
     fn render_right_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("📝 Gherkin Output");
         ui.separator();
+
+        // If a context-only file is selected, show an info panel instead of Gherkin
+        if let Some(Selection::File(idx)) = &self.selection {
+            if let Some(path) = self.selected_files.get(*idx) {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if crate::parser::FileRole::from_extension(ext) == crate::parser::FileRole::Context {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let file_type = match ext.to_lowercase().as_str() {
+                        "xlsx" | "xls" | "xlsm" | "xlsb" | "ods" => "Excel",
+                        "vsdx" | "vsd" | "vsdm" => "Visio",
+                        _ => "Unknown",
+                    };
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!("📎 {}", name))
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("Type: {}  ·  Role: Reference Context", file_type))
+                            .color(egui::Color32::from_rgb(160, 160, 180)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("This file provides reference data to Word document processing — no Gherkin scenarios are generated for it.");
+                    ui.add_space(12.0);
+
+                    // Show a preview of the parsed content if available
+                    if let Ok(ctx) = self.context.lock() {
+                        let key = path.to_string_lossy().to_string();
+                        if let Some(fc) = ctx.file_contents.get(&key) {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Preview (first 60 lines)").strong());
+                            ui.add_space(4.0);
+                            let preview: String = fc.raw_text
+                                .lines()
+                                .take(60)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut preview.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            });
+                        }
+                    }
+                    return;
+                }
+            }
+        }
 
         let content = match &self.selection {
             Some(Selection::File(idx)) => self
@@ -2226,7 +2320,7 @@ async fn process_files(
     }
 
     // Collect parsed results into a lookup
-    let mut parsed_map: HashMap<PathBuf, (String, String, Vec<crate::parser::ExtractedImage>)> =
+    let mut parsed_map: HashMap<PathBuf, (String, String, Vec<crate::parser::ExtractedImage>, crate::parser::FileRole)> =
         HashMap::new();
     let mut cache_hits = 0usize;
     for handle in parse_handles {
@@ -2242,19 +2336,28 @@ async fn process_files(
                     "📄 Parsed: {} ({} images found){}", name, img_count, cache_label
                 )));
 
+                let role = result.role;
+
                 // Store in shared context
                 {
                     let content = crate::context::FileContent {
                         path: path.clone(),
                         file_type: result.file_type.clone(),
                         raw_text: result.text.clone(),
+                        role,
                     };
                     if let Ok(mut ctx) = context.lock() {
                         ctx.add_file(content);
                     }
                 }
 
-                parsed_map.insert(path, (result.file_type, result.text, result.images));
+                if role == crate::parser::FileRole::Context {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📎 {} loaded as reference context", name
+                    )));
+                }
+
+                parsed_map.insert(path, (result.file_type, result.text, result.images, role));
             }
             Ok(Err(e)) => {
                 let _ = tx.send(ProcessingEvent::Status(format!("⚠ Parse error: {}", e)));
@@ -2576,12 +2679,16 @@ async fn process_files(
         // Collect parsed data for each member
         let mut members_data: Vec<(String, String, String, Vec<crate::parser::ExtractedImage>)> =
             Vec::new();
+        let mut has_primary = false;
         for member_path in &group.members {
-            if let Some((file_type, text, images)) = parsed_map.get(member_path) {
+            if let Some((file_type, text, images, role)) = parsed_map.get(member_path) {
                 let fname = member_path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
+                if *role == crate::parser::FileRole::Primary {
+                    has_primary = true;
+                }
                 members_data.push((fname, file_type.clone(), text.clone(), images.clone()));
             }
         }
@@ -2589,6 +2696,14 @@ async fn process_files(
         if members_data.is_empty() {
             let _ = tx.send(ProcessingEvent::ItemFailed { name: group.name.clone(), path: None, error: "All group members failed to parse".to_string() });
             let _ = tx.send(ProcessingEvent::Status(format!("⚠ Skipped group {} (all members failed to parse)", group.name)));
+            continue;
+        }
+
+        // Skip groups that contain only context files (Excel/Visio) — no primary documents
+        if !has_primary {
+            let _ = tx.send(ProcessingEvent::Status(format!(
+                "ℹ Group {} contains only reference files — skipped", group.name
+            )));
             continue;
         }
 
@@ -2743,8 +2858,12 @@ async fn process_files(
     )));
 
     // ── Dispatch ungrouped single-file work items ──
-    for (path, (file_type, raw_text, images)) in &parsed_map {
+    for (path, (file_type, raw_text, images, role)) in &parsed_map {
         if grouped_paths.contains(path) {
+            continue;
+        }
+        // Skip context-only files — they don't produce Gherkin
+        if *role == crate::parser::FileRole::Context {
             continue;
         }
         if cancel_token.is_cancelled() {

@@ -38,6 +38,7 @@ pub fn parse(path: &Path) -> Result<ParseResult> {
         file_type: "Word".to_string(),
         text,
         images,
+        role: super::FileRole::Primary,
     })
 }
 

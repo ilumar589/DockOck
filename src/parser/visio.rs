@@ -77,6 +77,7 @@ pub fn parse(path: &Path) -> Result<ParseResult> {
         file_type: "Visio".to_string(),
         text: output.trim().to_string(),
         images,
+        role: super::FileRole::Context,
     })
 }
 

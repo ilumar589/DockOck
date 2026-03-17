@@ -961,7 +961,13 @@ impl AgentOrchestrator {
         // and we leave context_summary empty (cache key changes only when
         // the document itself changes).
         let context_summary = if self.rag_indexes.is_empty() {
-            context.build_summary()
+            let mut cs = context.build_summary();
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
         } else {
             String::new()
         };
@@ -1139,7 +1145,13 @@ impl AgentOrchestrator {
         // Phase 2: Generate Gherkin for each chunk, with prior summaries as context hints
         let glossary = context.build_glossary();
         let context_summary = if self.rag_indexes.is_empty() {
-            context.build_summary()
+            let mut cs = context.build_summary();
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
         } else {
             String::new()
         };
@@ -1589,7 +1601,13 @@ impl AgentOrchestrator {
             .collect();
 
         let context_summary = if self.rag_indexes.is_empty() {
-            context.build_summary_excluding(&exclude)
+            let mut cs = context.build_summary_excluding(&exclude);
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
         } else {
             String::new()
         };
