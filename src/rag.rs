@@ -38,10 +38,10 @@ const CHUNK_SIZE_CHARS: usize = 1024;
 const CHUNK_OVERLAP_CHARS: usize = 256;
 
 /// How many top chunks to retrieve per query.
-const TOP_K: usize = 4;
+const TOP_K: usize = 8;
 
 /// Maximum total characters of cross-file context to inject into the prompt.
-const MAX_CONTEXT_CHARS: usize = 8_000;
+const MAX_CONTEXT_CHARS: usize = 24_000;
 
 // ─────────────────────────────────────────────
 // Data types

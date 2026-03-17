@@ -731,7 +731,7 @@ impl AgentOrchestrator {
                 .preamble(preamble)
                 .additional_params(serde_json::json!({"num_ctx": num_ctx}));
             for idx in rag_indexes {
-                builder = builder.dynamic_context(4, idx.clone());
+                builder = builder.dynamic_context(8, idx.clone());
             }
             let agent = builder.build();
             match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout, cancel_token).await {
@@ -788,7 +788,7 @@ impl AgentOrchestrator {
                 .agent(model)
                 .preamble(preamble);
             for idx in rag_indexes {
-                builder = builder.dynamic_context(4, idx.clone());
+                builder = builder.dynamic_context(8, idx.clone());
             }
             let agent = builder.build();
             match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout, cancel_token).await {
