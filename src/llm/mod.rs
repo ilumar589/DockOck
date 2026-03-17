@@ -208,7 +208,12 @@ Rules:
 10. SETUP_VS_RUNTIME: Classify each entity or rule as either Setup/Configuration (e.g., category
     definitions, parameter tables, code lists) or Runtime/Business-object (e.g., premises,
     inspections, meters). Rules defined on a Setup entity must NOT be attributed to the
-    corresponding Runtime entity unless the document explicitly says so."#;
+    corresponding Runtime entity unless the document explicitly says so.
+11. DOCUMENT VERSION: The input text represents the FINAL accepted version of the document.
+    Tracked changes, deleted text, and revision markup have already been stripped. If you see
+    any residual revision artefacts (e.g., conflicting duplicate sentences, strikethrough
+    markers, or inserted/deleted annotations), ignore them — treat only the final text as
+    authoritative. Do not generate scenarios for obsolete or deleted requirements."#;
 
 pub const GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 Your task is to read a structured document summary and produce well-structured Gherkin
@@ -286,7 +291,11 @@ Rules:
 10. LIFECYCLE_PHASES: Tag every validation/business rule with its exact lifecycle phase
     (Creation, Edit, Category-change, Status-transition, Deletion) as stated in the source docs.
 11. SETUP_VS_RUNTIME: Classify each entity or rule as Setup/Configuration or Runtime/Business-object.
-    Rules from Setup entities must NOT be attributed to Runtime entities unless explicitly stated."#;
+    Rules from Setup entities must NOT be attributed to Runtime entities unless explicitly stated.
+12. DOCUMENT VERSION: The input represents the FINAL accepted version of the documents.
+    Tracked changes and revision markup have been stripped. If residual revision artefacts
+    remain (duplicate sentences, strikethrough markers, inserted/deleted annotations), ignore
+    them and treat only the final text as authoritative."#;
 
 const GROUP_GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 You will receive a structured summary synthesised from MULTIPLE related documents that

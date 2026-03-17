@@ -97,10 +97,28 @@ fn extract_text_from_xml(xml: &str) -> Result<String> {
     let mut pre_heading_paragraphs = 0usize;
     let mut pre_heading_tables = 0usize;
 
-    for child in body.children() {
-        if !child.is_element() {
-            continue;
-        }
+    // Collect effective body children, skipping tracked-change deletions and
+    // unwrapping insertion wrappers so we see only the final accepted content.
+    let effective_children: Vec<roxmltree::Node> = body
+        .children()
+        .filter(|n| n.is_element())
+        .flat_map(|child| {
+            let tag = child.tag_name().name();
+            match tag {
+                // Deleted / moved-from content — skip entirely
+                "del" | "moveFrom" => Vec::new(),
+                // Inserted / moved-to wrappers — unwrap to inner elements
+                "ins" | "moveTo" => child
+                    .children()
+                    .filter(|n| n.is_element())
+                    .collect::<Vec<_>>(),
+                // Normal elements — keep as-is
+                _ => vec![child],
+            }
+        })
+        .collect();
+
+    for child in &effective_children {
         match child.tag_name().name() {
             "p" => {
                 let style = paragraph_style(&child);
@@ -176,10 +194,8 @@ fn extract_text_from_xml(xml: &str) -> Result<String> {
     }
 
     // ── Second pass: emit content ──
-    for child in body.children() {
-        if !child.is_element() {
-            continue;
-        }
+    // Reuse the same effective children (tracked-change deletions already removed).
+    for child in &effective_children {
         match child.tag_name().name() {
             "p" => {
                 let text = extract_paragraph(&child);
@@ -201,6 +217,32 @@ fn extract_text_from_xml(xml: &str) -> Result<String> {
     }
 
     Ok(output.trim().to_string())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tracked-changes helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if `node` (or any of its ancestors up to `root`) sits inside
+/// a tracked-change deletion element.  In OOXML these are:
+///
+/// * `<w:del>`       – deleted text shown in "All Markup" view
+/// * `<w:moveFrom>`  – original location of moved text
+///
+/// Text inside `<w:ins>` and `<w:moveTo>` is the *accepted* version and is
+/// intentionally kept.
+fn is_inside_deletion(node: &roxmltree::Node) -> bool {
+    let mut cursor = *node;
+    while let Some(parent) = cursor.parent() {
+        if parent.is_element() {
+            match parent.tag_name().name() {
+                "del" | "moveFrom" => return true,
+                _ => {}
+            }
+        }
+        cursor = parent;
+    }
+    false
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +276,10 @@ fn extract_paragraph(para: &roxmltree::Node) -> String {
 
     for node in para.descendants() {
         if !node.is_element() {
+            continue;
+        }
+        // Skip content inside tracked-change deletions (w:del, w:moveFrom)
+        if is_inside_deletion(&node) {
             continue;
         }
         match node.tag_name().name() {
@@ -298,6 +344,10 @@ fn collect_cell_text(cell: &roxmltree::Node) -> String {
 
     for node in cell.descendants() {
         if !node.is_element() {
+            continue;
+        }
+        // Skip content inside tracked-change deletions (w:del, w:moveFrom)
+        if is_inside_deletion(&node) {
             continue;
         }
         match node.tag_name().name() {
