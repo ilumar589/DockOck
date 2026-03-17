@@ -9,6 +9,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crate::parser::FileRole;
+
 /// A single piece of extracted content from one file.
 #[derive(Debug, Clone)]
 pub struct FileContent {
@@ -18,6 +20,8 @@ pub struct FileContent {
     pub file_type: String,
     /// Raw text / structured text extracted from the file
     pub raw_text: String,
+    /// Whether this file produces Gherkin output or only provides context.
+    pub role: FileRole,
 }
 
 /// A named collection of files whose content is merged into a single
@@ -82,8 +86,7 @@ impl ProjectContext {
         let mut summary = String::from("=== Cross-file project context ===\n\n");
         for (path, content) in &included {
             summary.push_str(&format!("File: {}\nType: {}\n", path, content.file_type));
-            let excerpt: String = content.raw_text.chars().take(400).collect();
-            summary.push_str(&format!("Excerpt:\n{}\n\n", excerpt));
+            summary.push_str(&format!("Content:\n{}\n\n", content.raw_text));
         }
 
         if !self.entities.is_empty() {
@@ -93,6 +96,36 @@ impl ProjectContext {
             }
         }
 
+        summary
+    }
+
+    /// Build a combined context string from all context-only files (Excel, Visio).
+    ///
+    /// Injected into every primary-file prompt so the LLM sees reference data
+    /// without attempting to generate Gherkin for it.
+    pub fn build_context_only_summary(&self) -> String {
+        let ctx_files: Vec<&FileContent> = self
+            .file_contents
+            .values()
+            .filter(|fc| fc.role == FileRole::Context)
+            .collect();
+        if ctx_files.is_empty() {
+            return String::new();
+        }
+        let mut summary = String::from(
+            "=== REFERENCE DATA (Excel / Visio — do NOT generate scenarios for these) ===\n\n",
+        );
+        for fc in &ctx_files {
+            let name = fc
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            summary.push_str(&format!(
+                "--- Reference: {} ({}) ---\n{}\n\n",
+                name, fc.file_type, fc.raw_text
+            ));
+        }
         summary
     }
 

@@ -37,7 +37,7 @@ pub mod prefix_cache;
 pub mod provider;
 pub use prefix_cache::PrefixCache;
 pub use provider::ProviderBackend;
-pub use provider::{load_custom_providers, build_custom_backend, custom_model_ids, CustomProviderConfig};
+pub use provider::{load_custom_providers, build_custom_backend, custom_model_ids, custom_model_limits, CustomProviderConfig};
 
 /// Default model used for the generator agent.
 pub const DEFAULT_GENERATOR_MODEL: &str = "qwen2.5-coder:32b";
@@ -188,8 +188,9 @@ Rules:
 1. Identify the key actors, systems, data entities, and processes described.
 2. List preconditions and postconditions for each process.
 3. Capture business rules and validation logic.
-4. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES, IMAGE_CONTENT.
-5. Be concise — no more than 500 words.
+4. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES,
+   FIELD_SCOPING, LIFECYCLE_PHASES, SETUP_VS_RUNTIME, IMAGE_CONTENT.
+5. Be concise — no more than 600 words.
 6. Do not add conversational prose.
 7. If the input contains an "=== Embedded Image Descriptions ===" section, you MUST include a
    dedicated IMAGE_CONTENT section in your summary that preserves:
@@ -197,7 +198,22 @@ Rules:
    - All diagram flows, decision points, and entity relationships
    - All reviewer/sidebar comments with author names and their full text
    - All cross-references to other documents
-   Image-derived information is business-critical and must NOT be summarized away or omitted."#;
+   Image-derived information is business-critical and must NOT be summarized away or omitted.
+8. FIELD_SCOPING: For every entity that has a Create/New dialog, list ONLY the fields explicitly
+   mentioned in that dialog section. Separately list fields that appear in FactBoxes, Consumers,
+   or downstream documents. Never merge these two sets — they serve different purposes.
+9. LIFECYCLE_PHASES: For every validation rule or business rule, tag it with the exact lifecycle
+   phase it applies to (Creation, Edit, Category-change, Status-transition, Deletion). Only tag
+   a rule as applying at Creation if the document explicitly states it applies during creation.
+10. SETUP_VS_RUNTIME: Classify each entity or rule as either Setup/Configuration (e.g., category
+    definitions, parameter tables, code lists) or Runtime/Business-object (e.g., premises,
+    inspections, meters). Rules defined on a Setup entity must NOT be attributed to the
+    corresponding Runtime entity unless the document explicitly says so.
+11. DOCUMENT VERSION: The input text represents the FINAL accepted version of the document.
+    Tracked changes, deleted text, and revision markup have already been stripped. If you see
+    any residual revision artefacts (e.g., conflicting duplicate sentences, strikethrough
+    markers, or inserted/deleted annotations), ignore them — treat only the final text as
+    authoritative. Do not generate scenarios for obsolete or deleted requirements."#;
 
 pub const GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 Your task is to read a structured document summary and produce well-structured Gherkin
@@ -214,7 +230,22 @@ Rules:
    image description as a first-class source of business requirements. Generate dedicated
    Scenarios for data structures (e.g. XML schemas), process flows, entity relationships,
    reviewer comments, and any business rules visible in those images. Do NOT ignore or
-   skip image-derived content — it is equally important as the document text."#;
+   skip image-derived content — it is equally important as the document text.
+8. FIELD SCOPING — Creation scenarios must ONLY assert fields that are explicitly listed in the
+   document's Create/New dialog section for that entity. Do NOT include fields from FactBoxes,
+   Consumers, related entities, or downstream service documents in creation scenarios. If a field
+   belongs to a FactBox or Consumer, place it in a separate viewing/navigation scenario instead.
+9. SETUP vs RUNTIME — Clearly separate Setup/Configuration scenarios from Runtime/Business-object
+   scenarios. If a rule (e.g., field immutability) is defined on a Setup entity (like a Category
+   definition), do NOT apply it to the Runtime entity (like the business record that uses the
+   category). Only assert runtime editability rules when the document ties them to a specific
+   parameter or runtime condition.
+10. LIFECYCLE PHASE ACCURACY — Each validation or business rule must be placed in a scenario that
+    matches the exact lifecycle phase stated in the document (Creation, Edit, Category-change,
+    Status-transition). Do NOT promote a validation to a creation scenario unless the document
+    explicitly states it applies at creation time. Tag scenarios with the phase, e.g.:
+    Scenario: [Creation] Manually create a new premises
+    Scenario: [Category-change] Validate premises category change"#;
 
 const REVIEWER_PREAMBLE: &str = r#"You are a Gherkin quality reviewer.
 Your task is to review and improve a Gherkin Feature document.
@@ -225,7 +256,17 @@ Rules:
 3. Improve step clarity and business readability where needed.
 4. Remove duplicate scenarios.
 5. Output ONLY the corrected Gherkin — no explanations.
-6. If the input is already good, return it unchanged."#;
+6. If the input is already good, return it unchanged.
+7. FIELD SCOPING CHECK — If a creation scenario asserts fields that are typical of FactBoxes,
+   Consumers, or related entities (e.g., hyperlinks to contracts, registration-level lookups,
+   consumer lists), move those assertions to a separate viewing scenario or remove them from
+   the creation scenario.
+8. SETUP vs RUNTIME CHECK — If a scenario applies a Setup/Configuration rule (e.g., category
+   name immutability) to a Runtime business object, correct it: either move the rule to a Setup
+   scenario or rewrite it to reference the documented parameter that controls runtime behaviour.
+9. LIFECYCLE PHASE CHECK — If a validation rule is asserted during creation but the context
+   indicates it applies to a different phase (e.g., category change, status transition), move
+   it to the correct lifecycle-phase scenario."#;
 
 const GROUP_EXTRACTOR_PREAMBLE: &str = r#"You are an expert document analyst.
 You will receive content extracted from MULTIPLE related documents that describe the same
@@ -237,12 +278,24 @@ Rules:
 2. List preconditions and postconditions for each process.
 3. Capture business rules and validation logic from every document.
 4. Merge overlapping information — do not repeat the same fact from different documents.
-5. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES, IMAGE_CONTENT.
-6. Be concise — no more than 800 words.
+5. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES,
+   FIELD_SCOPING, LIFECYCLE_PHASES, SETUP_VS_RUNTIME, IMAGE_CONTENT.
+6. Be concise — no more than 900 words.
 7. Do not add conversational prose.
 8. If the input contains "=== Embedded Image Descriptions ===" sections, you MUST include a
    dedicated IMAGE_CONTENT section that preserves XML/data structure hierarchies, diagram flows,
-   reviewer comments (with author names), and cross-references. Image content is business-critical."#;
+   reviewer comments (with author names), and cross-references. Image content is business-critical.
+9. FIELD_SCOPING: For every entity that has a Create/New dialog, list ONLY the fields explicitly
+   mentioned in that dialog section. Separately list fields from FactBoxes, Consumers, or
+   downstream documents. Never merge these two sets.
+10. LIFECYCLE_PHASES: Tag every validation/business rule with its exact lifecycle phase
+    (Creation, Edit, Category-change, Status-transition, Deletion) as stated in the source docs.
+11. SETUP_VS_RUNTIME: Classify each entity or rule as Setup/Configuration or Runtime/Business-object.
+    Rules from Setup entities must NOT be attributed to Runtime entities unless explicitly stated.
+12. DOCUMENT VERSION: The input represents the FINAL accepted version of the documents.
+    Tracked changes and revision markup have been stripped. If residual revision artefacts
+    remain (duplicate sentences, strikethrough markers, inserted/deleted annotations), ignore
+    them and treat only the final text as authoritative."#;
 
 const GROUP_GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 You will receive a structured summary synthesised from MULTIPLE related documents that
@@ -261,7 +314,13 @@ Rules:
    image description as a first-class source of business requirements. Generate dedicated
    Scenarios for data structures (e.g. XML schemas), process flows, entity relationships,
    reviewer comments, and any business rules visible in those images. Do NOT ignore or
-   skip image-derived content — it is equally important as the document text."#;
+   skip image-derived content — it is equally important as the document text.
+9. FIELD SCOPING — Creation scenarios must ONLY assert fields explicitly listed in the Create/New
+   dialog section. FactBox, Consumer, and downstream fields belong in separate viewing scenarios.
+10. SETUP vs RUNTIME — Do not apply Setup/Configuration rules to Runtime business objects.
+    Runtime editability must reference the documented parameter that controls it.
+11. LIFECYCLE PHASE ACCURACY — Place each validation in the correct lifecycle-phase scenario.
+    Tag scenarios with the phase, e.g.: Scenario: [Creation] ..., Scenario: [Category-change] ..."#;
 
 const VISION_DESCRIBE_PROMPT: &str = "\
 IMPORTANT: Every image in this document carries business-critical information that MUST be \
@@ -301,10 +360,10 @@ Rules:
 
 /// Streaming chunk from Ollama's `/api/generate` endpoint.
 #[derive(serde::Deserialize)]
-struct OllamaStreamGenerateChunk {
-    response: String,
+pub(crate) struct OllamaStreamGenerateChunk {
+    pub response: String,
     #[serde(default)]
-    done: bool,
+    pub done: bool,
 }
 
 /// Streaming chunk from OpenAI-compatible `/chat/completions` endpoint (SSE).
@@ -364,6 +423,8 @@ pub struct AgentOrchestrator {
     /// Shared RAG indexes for `dynamic_context()` (chunks + memories).
     /// When non-empty, agents automatically inject relevant context per call.
     rag_indexes: Vec<crate::rag::SharedVectorIndex>,
+    /// Custom provider configs for looking up real model token limits.
+    custom_configs: Vec<CustomProviderConfig>,
 }
 
 /// Result of checking which Ollama endpoints are reachable.
@@ -483,6 +544,7 @@ impl AgentOrchestrator {
                             PrefixCache::new(ENDPOINT_GENERATOR.url, generator_model)
                         )),
                         rag_indexes: Vec::new(),
+                        custom_configs: Vec::new(),
                     },
                     statuses,
                 ))
@@ -556,6 +618,7 @@ impl AgentOrchestrator {
                         cache,
                         generator_prefix_cache: None, // not applicable for cloud APIs
                         rag_indexes: Vec::new(),
+                        custom_configs: Vec::new(),
                     },
                     statuses,
                 ))
@@ -568,6 +631,23 @@ impl AgentOrchestrator {
     /// from MongoDB vector indexes on each LLM call.
     pub fn set_rag_indexes(&mut self, indexes: Vec<crate::rag::SharedVectorIndex>) {
         self.rag_indexes = indexes;
+    }
+
+    /// Store custom provider configs for model limit lookups.
+    pub fn set_custom_configs(&mut self, configs: Vec<CustomProviderConfig>) {
+        self.custom_configs = configs;
+    }
+
+    /// Compute the input character budget for a model, using real token limits
+    /// from `custom_providers.json` when available, falling back to name-based heuristics.
+    fn model_input_budget(&self, model: &str) -> usize {
+        if let Some(limits) = custom_model_limits(&self.custom_configs, model) {
+            // Reserve ~30% of context for system prompt + output.
+            // Convert tokens to chars (~4 chars per token).
+            let usable_tokens = (limits.context_tokens as f64 * 0.70) as usize;
+            return usable_tokens * 4;
+        }
+        input_budget_for_model(model)
     }
 
     /// Prime the generator's KV-cache prefix (Ollama only).
@@ -731,7 +811,7 @@ impl AgentOrchestrator {
                 .preamble(preamble)
                 .additional_params(serde_json::json!({"num_ctx": num_ctx}));
             for idx in rag_indexes {
-                builder = builder.dynamic_context(4, idx.clone());
+                builder = builder.dynamic_context(8, idx.clone());
             }
             let agent = builder.build();
             match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout, cancel_token).await {
@@ -788,7 +868,7 @@ impl AgentOrchestrator {
                 .agent(model)
                 .preamble(preamble);
             for idx in rag_indexes {
-                builder = builder.dynamic_context(4, idx.clone());
+                builder = builder.dynamic_context(8, idx.clone());
             }
             let agent = builder.build();
             match stream_chat_with_progress(&agent, prompt, history.clone(), stage_name, file_name, status_tx, timeout, cancel_token).await {
@@ -881,7 +961,13 @@ impl AgentOrchestrator {
         // and we leave context_summary empty (cache key changes only when
         // the document itself changes).
         let context_summary = if self.rag_indexes.is_empty() {
-            context.build_summary()
+            let mut cs = context.build_summary();
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
         } else {
             String::new()
         };
@@ -929,18 +1015,23 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
+        let model_budget = self.model_input_budget(budget_model);
+
+        // Pre-compute cross-file context overhead so chunking accounts for it
+        let glossary = context.build_glossary();
+        let context_overhead = context_summary.len() + glossary.len();
 
         // ── Chunk-and-merge path for oversized documents ──
-        if needs_chunking(&enriched_text, budget_model) {
+        if needs_chunking(&enriched_text, model_budget, context_overhead) {
             let result = self.process_file_chunked(
-                file_name, file_type, &enriched_text, context, status_tx, cancel_token,
+                file_name, file_type, &enriched_text, context, context_overhead, status_tx, cancel_token,
             ).await?;
             self.cache.put_text(crate::cache::NS_LLM, &llm_cache_key, &result);
             return Ok(result);
         }
 
         // ── Step 1: Prepare input for the generator ──
-        let budget = input_budget_for_model(&self.generator_model);
+        let budget = self.model_input_budget(&self.generator_model);
         let summary = if self.mode == PipelineMode::Full {
             // Full mode: use LLM extractor
             let _ = status_tx.send(format!(
@@ -964,7 +1055,6 @@ impl AgentOrchestrator {
             "⚙ [Generator] Creating Gherkin for {}…", file_name
         ));
 
-        let glossary = context.build_glossary();
         let gherkin = self.generate(file_name, &summary, &context_summary, &glossary, status_tx, cancel_token).await?;
 
         // ── Step 3: Review / refine (Standard and Full modes only) ──
@@ -1005,6 +1095,7 @@ impl AgentOrchestrator {
         file_type: &str,
         enriched_text: &str,
         context: &ProjectContext,
+        context_overhead: usize,
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
@@ -1013,7 +1104,8 @@ impl AgentOrchestrator {
         } else {
             &self.generator_model
         };
-        let chunks = chunk_for_llm(enriched_text, budget_model);
+        let model_budget = self.model_input_budget(budget_model);
+        let chunks = chunk_for_llm(enriched_text, model_budget, context_overhead);
         let n = chunks.len();
 
         let _ = status_tx.send(format!(
@@ -1022,7 +1114,7 @@ impl AgentOrchestrator {
         ));
 
         // Phase 1: Extract/preprocess each chunk (can run concurrently)
-        let budget = input_budget_for_model(&self.generator_model);
+        let budget = self.model_input_budget(&self.generator_model);
         let mut summaries: Vec<String> = Vec::with_capacity(n);
 
         for chunk in &chunks {
@@ -1053,7 +1145,13 @@ impl AgentOrchestrator {
         // Phase 2: Generate Gherkin for each chunk, with prior summaries as context hints
         let glossary = context.build_glossary();
         let context_summary = if self.rag_indexes.is_empty() {
-            context.build_summary()
+            let mut cs = context.build_summary();
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
         } else {
             String::new()
         };
@@ -1450,7 +1548,7 @@ impl AgentOrchestrator {
         }
 
         // ── Step 0: Build merged text and images from all members ──
-        let budget = input_budget_for_model(&self.generator_model);
+        let budget = self.model_input_budget(&self.generator_model);
         let mut merged_text = String::new();
         let mut all_images: Vec<&crate::parser::ExtractedImage> = Vec::new();
         let chars_per_member = budget / members.len().max(1);
@@ -1485,15 +1583,47 @@ impl AgentOrchestrator {
                     .await;
         }
 
+        // ── Pre-compute cross-file context overhead for budget-aware chunking ──
+        // Exclude group members from cross-file context
+        let member_names: std::collections::HashSet<&str> =
+            members.iter().map(|(name, _, _, _)| name.as_str()).collect();
+        let exclude: std::collections::HashSet<String> = context
+            .file_contents
+            .keys()
+            .filter(|path| {
+                let fname = std::path::Path::new(path.as_str())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                member_names.contains(fname.as_str())
+            })
+            .cloned()
+            .collect();
+
+        let context_summary = if self.rag_indexes.is_empty() {
+            let mut cs = context.build_summary_excluding(&exclude);
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
+        } else {
+            String::new()
+        };
+        let glossary = context.build_glossary();
+        let context_overhead = context_summary.len() + glossary.len();
+
         // ── Chunk-and-merge path for oversized merged groups ──
         let budget_model = if self.mode == PipelineMode::Full {
             if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
         } else {
             &self.generator_model
         };
-        if needs_chunking(&merged_text, budget_model) {
+        let group_budget = self.model_input_budget(budget_model);
+        if needs_chunking(&merged_text, group_budget, context_overhead) {
             let result = self.process_file_chunked(
-                group_name, "Multi-document group", &merged_text, context, status_tx, cancel_token,
+                group_name, "Multi-document group", &merged_text, context, context_overhead, status_tx, cancel_token,
             ).await?;
             self.cache.put_text(crate::cache::NS_LLM, &group_cache_key, &result);
             return Ok(result);
@@ -1528,29 +1658,8 @@ impl AgentOrchestrator {
             group_name
         ));
 
-        // Exclude group members from cross-file context
-        let member_names: std::collections::HashSet<&str> =
-            members.iter().map(|(name, _, _, _)| name.as_str()).collect();
-        let exclude: std::collections::HashSet<String> = context
-            .file_contents
-            .keys()
-            .filter(|path| {
-                let fname = std::path::Path::new(path.as_str())
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                member_names.contains(fname.as_str())
-            })
-            .cloned()
-            .collect();
-
-        let context_summary = if self.rag_indexes.is_empty() {
-            context.build_summary_excluding(&exclude)
-        } else {
-            String::new()
-        };
         let gherkin = self
-            .generate_group(group_name, &summary, &context_summary, &context.build_glossary(), status_tx, cancel_token)
+            .generate_group(group_name, &summary, &context_summary, &glossary, status_tx, cancel_token)
             .await?;
 
         // ── Step 3: Review / refine ──
@@ -2110,6 +2219,31 @@ fn score_line(line: &str) -> u32 {
         }
     }
 
+    // UI dialog / form section markers — critical for field scoping
+    for kw in &["create ", "new ", "dialog", "factbox", "consumer", "fast tab", "fasttab"] {
+        if lower.contains(kw) {
+            score += 6;
+            break;
+        }
+    }
+
+    // Setup vs Runtime boundary markers
+    for kw in &["setup", "configuration", "parameter", "category definition", "code list"] {
+        if lower.contains(kw) {
+            score += 5;
+            break;
+        }
+    }
+
+    // Lifecycle phase markers — essential for correct phase attribution
+    for kw in &["on create", "on insert", "on modify", "on delete", "on validate",
+                "status change", "category change", "lifecycle", "phase"] {
+        if lower.contains(kw) {
+            score += 7;
+            break;
+        }
+    }
+
     // Table-like or structured data (pipes, tabs, separators)
     if line.contains('|') || line.contains('\t') {
         score += 5;
@@ -2148,15 +2282,20 @@ struct LlmChunk {
     text: String,
 }
 
-/// Returns `true` when the document text exceeds the model's character budget.
-fn needs_chunking(text: &str, model: &str) -> bool {
-    text.len() > input_budget_for_model(model)
+/// Returns `true` when the document text exceeds the model's effective
+/// character budget after reserving space for cross-file context overhead.
+fn needs_chunking(text: &str, budget: usize, context_overhead: usize) -> bool {
+    let effective = budget.saturating_sub(context_overhead);
+    // Ensure a minimum workable budget (2 000 chars) even with large context
+    text.len() > effective.max(2_000)
 }
 
-/// Split text into overlapping windows that fit within the model's input budget.
+/// Split text into overlapping windows that fit within the given `budget`
+/// minus the `context_overhead` (cross-file context + glossary injected per call).
 /// Breaks are snapped to line boundaries to avoid cutting mid-sentence.
-fn chunk_for_llm(text: &str, model: &str) -> Vec<LlmChunk> {
-    let budget = input_budget_for_model(model);
+fn chunk_for_llm(text: &str, budget: usize, context_overhead: usize) -> Vec<LlmChunk> {
+    // Reserve space for context injected into every chunk, with a floor
+    let budget = budget.saturating_sub(context_overhead).max(2_000);
     if text.len() <= budget {
         return vec![LlmChunk { index: 0, total: 1, text: text.to_string() }];
     }
@@ -2253,8 +2392,11 @@ where
     let mut accumulated = String::new();
     let mut token_count: usize = 0;
 
-    // Per-chunk timeout: if no data arrives for 60s the stream is considered stalled.
-    let chunk_timeout = std::time::Duration::from_secs(60);
+    // Stall detection: use a longer timeout for the first token (cloud APIs
+    // can take a while to process large prompts before streaming starts),
+    // then a shorter timeout between subsequent tokens.
+    let initial_chunk_timeout = std::time::Duration::from_secs(120);
+    let stream_chunk_timeout = std::time::Duration::from_secs(60);
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -2263,6 +2405,7 @@ where
                 "{stage_name} overall deadline exceeded for {file_name} after {token_count} tokens"
             );
         }
+        let chunk_timeout = if token_count == 0 { initial_chunk_timeout } else { stream_chunk_timeout };
         let wait = chunk_timeout.min(remaining);
 
         tokio::select! {

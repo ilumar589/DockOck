@@ -29,6 +29,40 @@ use crate::context::{FileGroup, ProjectContext};
 use crate::gherkin::GherkinDocument;
 use std::collections::HashSet;
 
+/// Recursively collect files with accepted extensions from `root`.
+///
+/// Skips hidden files (`.` prefix) and Office temp files (`~` prefix).
+fn collect_supported_files(root: &std::path::Path) -> Vec<PathBuf> {
+    let accepted: HashSet<&str> = crate::parser::ACCEPTED_EXTENSIONS.iter().copied().collect();
+    let mut results = Vec::new();
+
+    fn walk(dir: &std::path::Path, accepted: &HashSet<&str>, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            // Skip hidden and temp files
+            if name.starts_with('.') || name.starts_with('~') {
+                continue;
+            }
+            if path.is_dir() {
+                walk(&path, accepted, out);
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if accepted.contains(ext.to_lowercase().as_str()) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+
+    walk(root, &accepted, &mut results);
+    results.sort();
+    results
+}
+
 /// A timestamped log entry.
 #[derive(Debug, Clone)]
 struct LogEntry {
@@ -405,7 +439,7 @@ impl DockOckApp {
         let paths = rfd::FileDialog::new()
             .add_filter(
                 "Supported documents",
-                &["docx", "xlsx", "xls", "xlsm", "xlsb", "ods", "vsdx", "vsd", "vsdm"],
+                crate::parser::ACCEPTED_EXTENSIONS,
             )
             .pick_files();
 
@@ -416,6 +450,29 @@ impl DockOckApp {
                     self.selected_files.push(p);
                 }
             }
+            self.recompute_groups();
+        }
+    }
+
+    /// Open a folder-picker dialog and recursively add all supported files.
+    fn open_folder_dialog(&mut self) {
+        let folder = rfd::FileDialog::new().pick_folder();
+
+        if let Some(folder) = folder {
+            let found = collect_supported_files(&folder);
+            let mut added = 0usize;
+            for p in found {
+                if !self.selected_files.contains(&p) {
+                    self.push_status(format!("Added: {}", p.display()));
+                    self.selected_files.push(p);
+                    added += 1;
+                }
+            }
+            self.push_status(format!(
+                "📁 Added {} file(s) from {}",
+                added,
+                folder.display()
+            ));
             self.recompute_groups();
         }
     }
@@ -618,14 +675,26 @@ impl DockOckApp {
         self.failed_groups.clear();
         self.log_entries.clear();
 
-        // Count work items: each group counts as 1, each ungrouped file counts as 1
+        // Count work items: each group counts as 1 (if it has a primary doc),
+        // each ungrouped primary file counts as 1. Context-only files are excluded.
         let grouped = self.grouped_paths();
         let ungrouped_count = self
             .selected_files
             .iter()
-            .filter(|p| !grouped.contains(*p))
+            .filter(|p| {
+                if grouped.contains(*p) { return false; }
+                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+                crate::parser::FileRole::from_extension(ext) == crate::parser::FileRole::Primary
+            })
             .count();
-        let total_items = self.file_groups.len() + ungrouped_count;
+        // Groups with at least one primary file count toward progress
+        let primary_group_count = self.file_groups.iter().filter(|g| {
+            g.members.iter().any(|m| {
+                let ext = m.extension().and_then(|e| e.to_str()).unwrap_or("");
+                crate::parser::FileRole::from_extension(ext) == crate::parser::FileRole::Primary
+            })
+        }).count();
+        let total_items = primary_group_count + ungrouped_count;
 
         self.progress = (0, total_items);
         self.files_started = 0;
@@ -659,6 +728,7 @@ impl DockOckApp {
         let backend = self.backend.clone();
         let embedding_choice = self.embedding_choice;
         let cancel_token = self.cancel_token.clone();
+        let custom_providers = self.custom_providers.clone();
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
@@ -667,7 +737,7 @@ impl DockOckApp {
                 gen_model, ext_model, rev_model, vis_model,
                 mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
-                cache, force_regenerate, embedding_choice, tx, cancel_token,
+                cache, force_regenerate, embedding_choice, custom_providers, tx, cancel_token,
             ));
         });
     }
@@ -708,7 +778,8 @@ impl DockOckApp {
 
                 let result = match &backend {
                     crate::llm::ProviderBackend::Ollama => {
-                        // Raw HTTP to local Ollama
+                        // Raw HTTP streaming to local Ollama
+                        use futures::StreamExt;
                         let num_ctx = crate::llm::context_window_for_model(&model);
                         let client = reqwest::Client::new();
                         let resp = client
@@ -716,29 +787,79 @@ impl DockOckApp {
                             .json(&serde_json::json!({
                                 "model": model,
                                 "prompt": preamble,
-                                "stream": false,
+                                "stream": true,
                                 "options": { "num_ctx": num_ctx },
                             }))
+                            .timeout(std::time::Duration::from_secs(600))
                             .send()
                             .await;
                         match resp {
-                            Ok(r) => match r.json::<serde_json::Value>().await {
-                                Ok(body) => body["response"].as_str().map(|s| s.to_string()),
-                                Err(_) => None,
-                            },
+                            Ok(r) => {
+                                let mut stream = r.bytes_stream();
+                                let mut accumulated = String::new();
+                                let mut token_count: usize = 0;
+                                let mut buf = Vec::new();
+                                let chunk_timeout = std::time::Duration::from_secs(120);
+                                let mut failed = false;
+
+                                loop {
+                                    match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                                        Ok(Some(Ok(bytes))) => {
+                                            buf.extend_from_slice(&bytes);
+                                            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                                                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                                                let line = String::from_utf8_lossy(&line_bytes);
+                                                let trimmed = line.trim();
+                                                if trimmed.is_empty() { continue; }
+                                                if let Ok(chunk) = serde_json::from_str::<crate::llm::OllamaStreamGenerateChunk>(trimmed) {
+                                                    if !chunk.response.is_empty() {
+                                                        accumulated.push_str(&chunk.response);
+                                                        token_count += 1;
+                                                        if token_count % 20 == 0 {
+                                                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                                                "\u{270f} Refining: {} tokens\u{2026}", token_count
+                                                            )));
+                                                        }
+                                                    }
+                                                    if chunk.done { break; }
+                                                }
+                                            }
+                                        }
+                                        Ok(Some(Err(e))) => {
+                                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                                "\u{26a0} Refinement stream error: {}", e
+                                            )));
+                                            failed = true;
+                                            break;
+                                        }
+                                        Ok(None) => break, // stream ended
+                                        Err(_) => {
+                                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                                "\u{26a0} Refinement stalled after {} tokens", token_count
+                                            )));
+                                            failed = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if failed || accumulated.is_empty() { None } else { Some(accumulated) }
+                            }
                             Err(e) => {
                                 let _ = tx.send(ProcessingEvent::Status(format!(
-                                    "⚠ Refinement failed: {}", e
+                                    "\u{26a0} Refinement failed: {}", e
                                 )));
                                 None
                             }
                         }
                     }
                     crate::llm::ProviderBackend::Custom { base_url, api_key, .. } => {
-                        // OpenAI-compatible API
+                        // OpenAI-compatible API (streaming)
+                        use futures::StreamExt;
                         use rig::client::CompletionClient;
-                        use rig::completion::Prompt;
                         use rig::providers::openai;
+                        use rig::streaming::{StreamedAssistantContent, StreamingPrompt};
+                        use rig::agent::MultiTurnStreamItem;
+                        use rig::agent::Text;
 
                         match openai::CompletionsClient::builder()
                             .api_key(api_key)
@@ -747,19 +868,65 @@ impl DockOckApp {
                         {
                             Ok(client) => {
                                 let agent = client.agent(&model).build();
-                                match agent.prompt(&preamble).await {
-                                    Ok(text) => Some(text),
-                                    Err(e) => {
-                                        let _ = tx.send(ProcessingEvent::Status(format!(
-                                            "⚠ Refinement failed: {}", e
-                                        )));
+                                let timeout = std::time::Duration::from_secs(600);
+                                let stream_result = tokio::time::timeout(
+                                    timeout,
+                                    agent.stream_prompt(&preamble),
+                                ).await;
+                                match stream_result {
+                                    Ok(mut stream) => {
+                                        let mut accumulated = String::new();
+                                        let mut token_count: usize = 0;
+                                        let chunk_timeout = std::time::Duration::from_secs(120);
+                                        let mut failed = false;
+
+                                        loop {
+                                            match tokio::time::timeout(chunk_timeout, stream.next()).await {
+                                                Ok(Some(Ok(item))) => match item {
+                                                    MultiTurnStreamItem::StreamAssistantItem(
+                                                        StreamedAssistantContent::Text(Text { text }),
+                                                    ) => {
+                                                        accumulated.push_str(&text);
+                                                        token_count += 1;
+                                                        if token_count % 20 == 0 {
+                                                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                                                "\u{270f} Refining: {} tokens\u{2026}", token_count
+                                                            )));
+                                                        }
+                                                    }
+                                                    MultiTurnStreamItem::FinalResponse(_) => break,
+                                                    _ => {}
+                                                },
+                                                Ok(Some(Err(e))) => {
+                                                    let _ = tx.send(ProcessingEvent::Status(format!(
+                                                        "\u{26a0} Refinement stream error: {}", e
+                                                    )));
+                                                    failed = true;
+                                                    break;
+                                                }
+                                                Ok(None) => break,
+                                                Err(_) => {
+                                                    let _ = tx.send(ProcessingEvent::Status(format!(
+                                                        "\u{26a0} Refinement stalled after {} tokens", token_count
+                                                    )));
+                                                    failed = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if failed || accumulated.is_empty() { None } else { Some(accumulated) }
+                                    }
+                                    Err(_) => {
+                                        let _ = tx.send(ProcessingEvent::Status(
+                                            "\u{26a0} Refinement timed out".to_string(),
+                                        ));
                                         None
                                     }
                                 }
                             }
                             Err(e) => {
                                 let _ = tx.send(ProcessingEvent::Status(format!(
-                                    "⚠ Failed to create client: {}", e
+                                    "\u{26a0} Failed to create client: {}", e
                                 )));
                                 None
                             }
@@ -1168,7 +1335,13 @@ impl DockOckApp {
                 self.open_file_dialog();
             }
             if ui
-                .add_enabled(!is_processing, egui::Button::new("🗑 Clear"))
+                .add_enabled(!is_processing, egui::Button::new("� Add Folder"))
+                .clicked()
+            {
+                self.open_folder_dialog();
+            }
+            if ui
+                .add_enabled(!is_processing, egui::Button::new("�🗑 Clear"))
                 .clicked()
             {
                 self.clear_all();
@@ -1323,8 +1496,14 @@ impl DockOckApp {
                                 .file_name()
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_default();
+                            let ext = member.extension().and_then(|e| e.to_str()).unwrap_or("");
+                            let icon = if crate::parser::FileRole::from_extension(ext) == crate::parser::FileRole::Primary {
+                                "📄"
+                            } else {
+                                "📎"
+                            };
                             ui.horizontal(|ui| {
-                                ui.label(format!("   {}", name));
+                                ui.label(format!("   {} {}", icon, name));
                                 if !is_processing {
                                     if ui.small_button("✖").on_hover_text("Remove from group").clicked() {
                                         remove_from_group = Some((gi, mi));
@@ -1367,7 +1546,14 @@ impl DockOckApp {
                 if self.selected_files.iter().any(|p| !grouped_paths.contains(p)) {
                     ui.add_space(4.0);
                     ui.separator();
-                    ui.label(egui::RichText::new("Ungrouped").italics());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Ungrouped").italics());
+                        ui.label(
+                            egui::RichText::new("  📄 = Gherkin   📎 = context")
+                                .color(egui::Color32::from_rgb(120, 120, 140))
+                                .small(),
+                        );
+                    });
                 }
 
                 for (i, path) in self.selected_files.iter().enumerate() {
@@ -1379,11 +1565,20 @@ impl DockOckApp {
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_else(|| path.to_string_lossy().to_string());
 
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let file_role = crate::parser::FileRole::from_extension(ext);
+                    let is_context = file_role == crate::parser::FileRole::Context;
+
                     let has_result = self.results.contains_key(path);
                     let has_failed = self.failed_items.contains_key(path);
                     let selected = self.selection == Some(Selection::File(i));
 
-                    let resp = if has_result {
+                    let resp = if is_context {
+                        // Context files — dimmed with 📎 icon
+                        let label = egui::RichText::new(format!("📎 {}", name))
+                            .color(egui::Color32::from_rgb(140, 140, 160));
+                        ui.selectable_label(selected, label)
+                    } else if has_result {
                         let elapsed_text = self.elapsed_times.get(path).map(|dur| {
                             let secs = dur.as_secs_f64();
                             if secs >= 60.0 {
@@ -1417,7 +1612,11 @@ impl DockOckApp {
                     } else {
                         ui.selectable_label(selected, &name)
                     }
-                    .on_hover_text(path.to_string_lossy().as_ref());
+                    .on_hover_text(if is_context {
+                        format!("{} (reference context — no Gherkin output)", path.display())
+                    } else {
+                        path.to_string_lossy().to_string()
+                    });
 
                     if resp.clicked() {
                         self.selection = Some(Selection::File(i));
@@ -1494,6 +1693,62 @@ impl DockOckApp {
     fn render_right_panel(&mut self, ui: &mut egui::Ui) {
         ui.heading("📝 Gherkin Output");
         ui.separator();
+
+        // If a context-only file is selected, show an info panel instead of Gherkin
+        if let Some(Selection::File(idx)) = &self.selection {
+            if let Some(path) = self.selected_files.get(*idx) {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if crate::parser::FileRole::from_extension(ext) == crate::parser::FileRole::Context {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let file_type = match ext.to_lowercase().as_str() {
+                        "xlsx" | "xls" | "xlsm" | "xlsb" | "ods" => "Excel",
+                        "vsdx" | "vsd" | "vsdm" => "Visio",
+                        _ => "Unknown",
+                    };
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!("📎 {}", name))
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!("Type: {}  ·  Role: Reference Context", file_type))
+                            .color(egui::Color32::from_rgb(160, 160, 180)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label("This file provides reference data to Word document processing — no Gherkin scenarios are generated for it.");
+                    ui.add_space(12.0);
+
+                    // Show a preview of the parsed content if available
+                    if let Ok(ctx) = self.context.lock() {
+                        let key = path.to_string_lossy().to_string();
+                        if let Some(fc) = ctx.file_contents.get(&key) {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Preview (first 60 lines)").strong());
+                            ui.add_space(4.0);
+                            let preview: String = fc.raw_text
+                                .lines()
+                                .take(60)
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut preview.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .interactive(false),
+                                );
+                            });
+                        }
+                    }
+                    return;
+                }
+            }
+        }
 
         let content = match &self.selection {
             Some(Selection::File(idx)) => self
@@ -1979,6 +2234,7 @@ async fn process_files(
     cache: crate::cache::DiskCache,
     force_regenerate: bool,
     embedding_choice: crate::rag::EmbeddingChoice,
+    custom_providers: Vec<crate::llm::CustomProviderConfig>,
     tx: Sender<ProcessingEvent>,
     cancel_token: CancellationToken,
 ) {
@@ -2022,7 +2278,9 @@ async fn process_files(
     let _ = tx.send(ProcessingEvent::Status(
         "🔥 Warming up models…".to_string(),
     ));
-    let mut orchestrator = Arc::new(orchestrator);
+    let mut orchestrator_mut = orchestrator;
+    orchestrator_mut.set_custom_configs(custom_providers);
+    let mut orchestrator = Arc::new(orchestrator_mut);
     let warmup_orch = Arc::clone(&orchestrator);
     let warmup_handle = tokio::spawn(async move {
         warmup_orch.warm_up().await;
@@ -2062,7 +2320,7 @@ async fn process_files(
     }
 
     // Collect parsed results into a lookup
-    let mut parsed_map: HashMap<PathBuf, (String, String, Vec<crate::parser::ExtractedImage>)> =
+    let mut parsed_map: HashMap<PathBuf, (String, String, Vec<crate::parser::ExtractedImage>, crate::parser::FileRole)> =
         HashMap::new();
     let mut cache_hits = 0usize;
     for handle in parse_handles {
@@ -2078,19 +2336,28 @@ async fn process_files(
                     "📄 Parsed: {} ({} images found){}", name, img_count, cache_label
                 )));
 
+                let role = result.role;
+
                 // Store in shared context
                 {
                     let content = crate::context::FileContent {
                         path: path.clone(),
                         file_type: result.file_type.clone(),
                         raw_text: result.text.clone(),
+                        role,
                     };
                     if let Ok(mut ctx) = context.lock() {
                         ctx.add_file(content);
                     }
                 }
 
-                parsed_map.insert(path, (result.file_type, result.text, result.images));
+                if role == crate::parser::FileRole::Context {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📎 {} loaded as reference context", name
+                    )));
+                }
+
+                parsed_map.insert(path, (result.file_type, result.text, result.images, role));
             }
             Ok(Err(e)) => {
                 let _ = tx.send(ProcessingEvent::Status(format!("⚠ Parse error: {}", e)));
@@ -2412,12 +2679,16 @@ async fn process_files(
         // Collect parsed data for each member
         let mut members_data: Vec<(String, String, String, Vec<crate::parser::ExtractedImage>)> =
             Vec::new();
+        let mut has_primary = false;
         for member_path in &group.members {
-            if let Some((file_type, text, images)) = parsed_map.get(member_path) {
+            if let Some((file_type, text, images, role)) = parsed_map.get(member_path) {
                 let fname = member_path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
+                if *role == crate::parser::FileRole::Primary {
+                    has_primary = true;
+                }
                 members_data.push((fname, file_type.clone(), text.clone(), images.clone()));
             }
         }
@@ -2425,6 +2696,14 @@ async fn process_files(
         if members_data.is_empty() {
             let _ = tx.send(ProcessingEvent::ItemFailed { name: group.name.clone(), path: None, error: "All group members failed to parse".to_string() });
             let _ = tx.send(ProcessingEvent::Status(format!("⚠ Skipped group {} (all members failed to parse)", group.name)));
+            continue;
+        }
+
+        // Skip groups that contain only context files (Excel/Visio) — no primary documents
+        if !has_primary {
+            let _ = tx.send(ProcessingEvent::Status(format!(
+                "ℹ Group {} contains only reference files — skipped", group.name
+            )));
             continue;
         }
 
@@ -2579,8 +2858,12 @@ async fn process_files(
     )));
 
     // ── Dispatch ungrouped single-file work items ──
-    for (path, (file_type, raw_text, images)) in &parsed_map {
+    for (path, (file_type, raw_text, images, role)) in &parsed_map {
         if grouped_paths.contains(path) {
+            continue;
+        }
+        // Skip context-only files — they don't produce Gherkin
+        if *role == crate::parser::FileRole::Context {
             continue;
         }
         if cancel_token.is_cancelled() {
