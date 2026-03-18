@@ -16,6 +16,7 @@
 mod app;
 mod cache;
 mod context;
+mod depgraph;
 mod gherkin;
 mod llm;
 mod memory;

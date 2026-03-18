@@ -145,6 +145,34 @@ impl PipelineMode {
     pub const ALL: [PipelineMode; 3] = [Self::Fast, Self::Standard, Self::Full];
 }
 
+/// What the pipeline produces — Gherkin features or a dependency graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OutputMode {
+    /// Generate Gherkin .feature files (default).
+    Gherkin,
+    /// Generate dependency graphs with business logic and state transitions.
+    DependencyGraph,
+}
+
+impl Default for OutputMode {
+    fn default() -> Self {
+        Self::Gherkin
+    }
+}
+
+impl std::fmt::Display for OutputMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gherkin => write!(f, "Gherkin (.feature)"),
+            Self::DependencyGraph => write!(f, "Dependency Graph"),
+        }
+    }
+}
+
+impl OutputMode {
+    pub const ALL: [OutputMode; 2] = [Self::Gherkin, Self::DependencyGraph];
+}
+
 /// Ollama instance definitions.
 #[derive(Debug, Clone)]
 pub struct OllamaEndpoint {
@@ -357,6 +385,106 @@ Rules:
 5. Use consistent step wording and naming throughout.
 6. Do not add explanatory prose outside the Gherkin block.
 7. Always end with a blank line after the last Scenario."#;
+
+// ─────────────────────────────────────────────
+// Dependency graph preambles
+// ─────────────────────────────────────────────
+
+/// Generator preamble for dependency graph output mode.
+/// The extractor/analysis preamble is reused as-is (EXTRACTOR_PREAMBLE /
+/// GROUP_EXTRACTOR_PREAMBLE) since the structured summary is output-mode agnostic.
+pub const DEPGRAPH_GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and systems architect.
+Your task is to read a structured document summary and produce a dependency graph
+capturing all business entities, their state lifecycles, business rules, and
+inter-entity dependencies.
+
+Rules:
+1. Output ONLY valid JSON matching this schema (no prose before or after):
+   {
+     "title": "...",
+     "nodes": [
+       {
+         "id": "snake_case_id",
+         "name": "Human Readable Name",
+         "entity_type": "Actor|System|DataObject|Process|Service|ExternalSystem",
+         "description": "...",
+         "states": [{"name": "...", "description": "..."}],
+         "transitions": [{"from_state": "...", "to_state": "...", "trigger": "...", "guards": ["..."]}],
+         "rules": [{"id": "BR-001", "description": "...", "lifecycle_phases": ["Creation"], "category": "Setup|Runtime"}],
+         "source_documents": ["filename.docx"]
+       }
+     ],
+     "edges": [
+       {
+         "from_node": "node_id",
+         "to_node": "node_id",
+         "relationship": "DependsOn|Triggers|Contains|Produces|Consumes|Validates|Extends|References",
+         "label": "optional description"
+       }
+     ]
+   }
+2. Every actor, system, data entity, and process mentioned in the summary MUST appear as a node.
+3. For each entity with a lifecycle, enumerate ALL states and transitions with guards.
+4. Business rules must reference the correct lifecycle phase (Creation, Edit, Category-change,
+   Status-transition, Deletion).
+5. Classify rules as Setup or Runtime — do NOT mix them.
+6. Every dependency between entities MUST be captured as an edge with the correct relationship type.
+7. source_documents tracks which input files contribute to each node (for traceability).
+8. If the input contains "=== Embedded Image Descriptions ===", treat every image description
+   as a first-class source of entities, states, transitions, and dependencies. Do NOT skip
+   image-derived content.
+9. FIELD SCOPING — Creation-phase rules must only reference fields from the Create/New dialog.
+   FactBox and Consumer fields belong to separate nodes or edges.
+10. Use concrete, business-readable names. No generic placeholders."#;
+
+const DEPGRAPH_REVIEWER_PREAMBLE: &str = r#"You are a dependency graph quality reviewer.
+Your task is to review and improve a JSON dependency graph.
+
+Rules:
+1. Fix any JSON syntax errors.
+2. Ensure every node has at least one edge (no orphans unless truly independent).
+3. Verify state transitions form valid, connected state machines (no unreachable states).
+4. Check that business rules are attached to the correct nodes and lifecycle phases.
+5. Remove duplicate nodes (same entity appearing twice with slightly different names).
+6. Ensure edges use the correct relationship type.
+7. Output ONLY the corrected JSON — no explanations.
+8. If the graph is already good, return it unchanged.
+9. SETUP vs RUNTIME CHECK — If a Setup rule is attached to a Runtime node, move it.
+10. LIFECYCLE PHASE CHECK — Verify transitions match documented lifecycle phases."#;
+
+const DEPGRAPH_GROUP_GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and systems architect.
+You will receive a structured summary synthesised from MULTIPLE related documents that
+describe the same system, feature, or process. Generate a single, unified dependency graph
+that covers all entities, state lifecycles, business rules, and inter-entity dependencies
+described across the documents.
+
+Rules:
+1. Output ONLY valid JSON matching the dependency graph schema (same as the single-document
+   generator — nodes array + edges array).
+2. Every actor, system, data entity, and process from ALL source documents MUST appear as a node.
+3. Merge overlapping entities — if the same entity appears in multiple documents, combine their
+   states, transitions, and rules into a single node.
+4. Enumerate ALL states and transitions with guards for each stateful entity.
+5. Business rules must reference the correct lifecycle phase.
+6. Classify rules as Setup or Runtime — do NOT mix them.
+7. Capture every inter-entity dependency as an edge.
+8. source_documents must list ALL contributing files per node.
+9. If the input contains "=== Embedded Image Descriptions ===", treat image content as first-class.
+10. Use concrete, business-readable names. No generic placeholders."#;
+
+const DEPGRAPH_MERGE_REVIEWER_PREAMBLE: &str = r#"You are a dependency graph merge specialist.
+You will receive JSON dependency graph fragments generated from multiple overlapping sections
+of the same document. Your task is to merge them into a single cohesive dependency graph.
+
+Rules:
+1. Output ONLY valid JSON matching the dependency graph schema.
+2. Combine duplicate nodes — same entity appearing in multiple chunks — into one node,
+   merging their states, transitions, rules, and source_documents.
+3. Deduplicate edges — remove exact duplicates.
+4. Ensure all state machines are connected (no orphan states from chunk boundaries).
+5. Preserve all unique business rules and dependencies — do not drop anything.
+6. Use consistent naming throughout.
+7. Do not add explanatory prose outside the JSON."#;
 
 /// Streaming chunk from Ollama's `/api/generate` endpoint.
 #[derive(serde::Deserialize)]
@@ -2090,6 +2218,584 @@ impl AgentOrchestrator {
             anyhow::bail!("Vision returned empty response for {}", label);
         }
         Ok(accumulated)
+    }
+
+    // ─────────────────────────────────────────────
+    // Dependency graph pipeline methods
+    // ─────────────────────────────────────────────
+
+    /// Run the dependency-graph pipeline for one file.
+    /// Mirrors `process_file()` but uses depgraph preambles and JSON output.
+    #[tracing::instrument(
+        name = "llm.process_file_depgraph",
+        skip(self, raw_text, images, context, status_tx, cancel_token),
+        fields(file_name, file_type, pipeline_mode = ?self.mode)
+    )]
+    pub async fn process_file_depgraph(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        raw_text: &str,
+        images: &[crate::parser::ExtractedImage],
+        context: &ProjectContext,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        force_regenerate: bool,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        // Build cache key — identical to process_file but with "depgraph" discriminator
+        let context_summary = if self.rag_indexes.is_empty() {
+            let mut cs = context.build_summary();
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
+        } else {
+            String::new()
+        };
+        let images_hash = {
+            let mut h = sha2::Sha256::new();
+            for img in images {
+                sha2::Digest::update(&mut h, &img.data);
+            }
+            format!("{:x}", h.finalize())
+        };
+        let cache_key = crate::cache::composite_key(&[
+            b"depgraph",
+            file_name.as_bytes(),
+            raw_text.as_bytes(),
+            format!("{:?}", self.mode).as_bytes(),
+            self.generator_model.as_bytes(),
+            self.extractor_model.as_bytes(),
+            self.reviewer_model.as_bytes(),
+            images_hash.as_bytes(),
+            context_summary.as_bytes(),
+        ]);
+
+        if !force_regenerate {
+            if let Some(cached) = self.cache.get_text(crate::cache::NS_DEPGRAPH, &cache_key) {
+                let _ = status_tx.send(format!("📦 [Cache] {} — dep graph loaded from cache", file_name));
+                return Ok(cached);
+            }
+        }
+
+        // ── Step 0: Describe images with vision model ──
+        let enriched_text = if !images.is_empty() {
+            let _ = status_tx.send(format!(
+                "👁 [Vision] Describing {} image(s) from {}…", images.len(), file_name
+            ));
+            self.enrich_text_with_images(raw_text, images, file_name, status_tx, cancel_token).await
+        } else {
+            raw_text.to_string()
+        };
+
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+        let model_budget = self.model_input_budget(budget_model);
+        let glossary = context.build_glossary();
+        let context_overhead = context_summary.len() + glossary.len();
+
+        // ── Chunk-and-merge path for oversized documents ──
+        if needs_chunking(&enriched_text, model_budget, context_overhead) {
+            let result = self.process_file_chunked_depgraph(
+                file_name, file_type, &enriched_text, context, context_overhead, status_tx, cancel_token,
+            ).await?;
+            self.cache.put_text(crate::cache::NS_DEPGRAPH, &cache_key, &result);
+            return Ok(result);
+        }
+
+        // ── Step 1: Extract/preprocess (SAME preamble — output-mode agnostic) ──
+        let budget = self.model_input_budget(&self.generator_model);
+        let summary = if self.mode == PipelineMode::Full {
+            let _ = status_tx.send(format!("🔍 [Extractor] Analysing {}…", file_name));
+            self.extract(file_name, file_type, &enriched_text, status_tx, cancel_token).await
+                .unwrap_or_else(|e| {
+                    warn!("Extraction failed for {}: {} — falling back to preprocessor", file_name, e);
+                    preprocess_text(&enriched_text, file_name, file_type, budget)
+                })
+        } else {
+            let _ = status_tx.send(format!("⚡ [Preprocess] Structuring {}…", file_name));
+            preprocess_text(&enriched_text, file_name, file_type, budget)
+        };
+
+        // ── Step 2: Generate graph JSON ──
+        let _ = status_tx.send(format!("🔗 [Graph-Gen] Building dependency graph for {}…", file_name));
+        let graph_json = self.generate_depgraph(
+            file_name, &summary, &context_summary, &glossary, status_tx, cancel_token,
+        ).await?;
+
+        // ── Step 3: Review / refine (Standard and Full modes only) ──
+        let do_review = self.mode != PipelineMode::Fast
+            && (self.reviewer_client.is_some() || self.openai_client.is_some());
+        let result = if do_review {
+            let _ = status_tx.send(format!("✅ [Graph-Review] Validating graph for {}…", file_name));
+            match self.review_depgraph(file_name, &graph_json, status_tx, cancel_token).await {
+                Ok(refined) => refined,
+                Err(e) => {
+                    warn!("Graph review failed for {}: {} — using unreviewed output", file_name, e);
+                    graph_json
+                }
+            }
+        } else {
+            graph_json
+        };
+
+        self.cache.put_text(crate::cache::NS_DEPGRAPH, &cache_key, &result);
+        Ok(result)
+    }
+
+    /// Run the dependency-graph pipeline for a group of files.
+    #[tracing::instrument(
+        name = "llm.process_group_depgraph",
+        skip(self, members, context, status_tx, cancel_token),
+        fields(group_name, member_count = members.len())
+    )]
+    pub async fn process_group_depgraph(
+        &self,
+        group_name: &str,
+        members: &[(String, String, String, Vec<crate::parser::ExtractedImage>)],
+        context: &ProjectContext,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        force_regenerate: bool,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        // Build cache key from all member content + models + mode + "depgraph"
+        let group_cache_key = {
+            let mut parts: Vec<Vec<u8>> = Vec::new();
+            parts.push(b"depgraph".to_vec());
+            parts.push(group_name.as_bytes().to_vec());
+            for (name, ftype, text, images) in members {
+                parts.push(name.as_bytes().to_vec());
+                parts.push(ftype.as_bytes().to_vec());
+                parts.push(text.as_bytes().to_vec());
+                for img in images {
+                    parts.push(img.data.clone());
+                }
+            }
+            parts.push(format!("{:?}", self.mode).into_bytes());
+            parts.push(self.generator_model.as_bytes().to_vec());
+            parts.push(self.extractor_model.as_bytes().to_vec());
+            parts.push(self.reviewer_model.as_bytes().to_vec());
+            let refs: Vec<&[u8]> = parts.iter().map(|v| v.as_slice()).collect();
+            crate::cache::composite_key(&refs)
+        };
+
+        if !force_regenerate {
+            if let Some(cached) = self.cache.get_text(crate::cache::NS_DEPGRAPH, &group_cache_key) {
+                let _ = status_tx.send(format!("📦 [Cache] group {} — dep graph loaded from cache", group_name));
+                return Ok(cached);
+            }
+        }
+
+        // ── Step 0: Build merged text and images from all members ──
+        let budget = self.model_input_budget(&self.generator_model);
+        let mut merged_text = String::new();
+        let mut all_images: Vec<&crate::parser::ExtractedImage> = Vec::new();
+        let chars_per_member = budget / members.len().max(1);
+
+        for (i, (file_name, file_type, raw_text, images)) in members.iter().enumerate() {
+            merged_text.push_str(&format!(
+                "=== Document {}: {} ({}) ===\n", i + 1, file_name, file_type
+            ));
+            let excerpt: String = raw_text.chars().take(chars_per_member).collect();
+            merged_text.push_str(&excerpt);
+            if raw_text.len() > chars_per_member {
+                merged_text.push_str("\n[… content truncated …]\n");
+            }
+            merged_text.push_str("\n\n");
+            all_images.extend(images.iter());
+        }
+
+        if !all_images.is_empty() {
+            let _ = status_tx.send(format!(
+                "👁 [Vision] Describing {} image(s) from group {}…", all_images.len(), group_name
+            ));
+            let owned_images: Vec<crate::parser::ExtractedImage> =
+                all_images.iter().map(|img| (*img).clone()).collect();
+            merged_text =
+                self.enrich_text_with_images(&merged_text, &owned_images, group_name, status_tx, cancel_token).await;
+        }
+
+        let member_names: std::collections::HashSet<&str> =
+            members.iter().map(|(name, _, _, _)| name.as_str()).collect();
+        let exclude: std::collections::HashSet<String> = context
+            .file_contents
+            .keys()
+            .filter(|path| {
+                let fname = std::path::Path::new(path.as_str())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                member_names.contains(fname.as_str())
+            })
+            .cloned()
+            .collect();
+
+        let context_summary = if self.rag_indexes.is_empty() {
+            let mut cs = context.build_summary_excluding(&exclude);
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
+        } else {
+            String::new()
+        };
+        let glossary = context.build_glossary();
+        let context_overhead = context_summary.len() + glossary.len();
+
+        // ── Chunk-and-merge path for oversized merged groups ──
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+        let group_budget = self.model_input_budget(budget_model);
+        if needs_chunking(&merged_text, group_budget, context_overhead) {
+            let result = self.process_file_chunked_depgraph(
+                group_name, "Multi-document group", &merged_text, context, context_overhead, status_tx, cancel_token,
+            ).await?;
+            self.cache.put_text(crate::cache::NS_DEPGRAPH, &group_cache_key, &result);
+            return Ok(result);
+        }
+
+        // ── Step 1: Extract/preprocess ──
+        let summary = if self.mode == PipelineMode::Full {
+            let _ = status_tx.send(format!("🔍 [Extractor] Analysing group {}…", group_name));
+            self.extract_group(group_name, &merged_text, status_tx, cancel_token)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Group extraction failed for {}: {} — falling back to preprocessor", group_name, e);
+                    preprocess_text(&merged_text, group_name, "Multi-document group", budget)
+                })
+        } else {
+            let _ = status_tx.send(format!("⚡ [Preprocess] Structuring group {}…", group_name));
+            preprocess_text(&merged_text, group_name, "Multi-document group", budget)
+        };
+
+        // ── Step 2: Generate graph JSON ──
+        let _ = status_tx.send(format!("🔗 [Graph-Gen] Building dependency graph for group {}…", group_name));
+        let graph_json = self.generate_group_depgraph(
+            group_name, &summary, &context_summary, &glossary, status_tx, cancel_token,
+        ).await?;
+
+        // ── Step 3: Review / refine ──
+        let do_review = self.mode != PipelineMode::Fast
+            && (self.reviewer_client.is_some() || self.openai_client.is_some());
+        let result = if do_review {
+            let _ = status_tx.send(format!("✅ [Graph-Review] Validating graph for group {}…", group_name));
+            match self.review_depgraph(group_name, &graph_json, status_tx, cancel_token).await {
+                Ok(refined) => refined,
+                Err(e) => {
+                    warn!("Graph review failed for group {}: {} — using unreviewed output", group_name, e);
+                    graph_json
+                }
+            }
+        } else {
+            graph_json
+        };
+
+        self.cache.put_text(crate::cache::NS_DEPGRAPH, &group_cache_key, &result);
+        Ok(result)
+    }
+
+    /// Chunked pipeline for dependency graph mode — oversized documents.
+    async fn process_file_chunked_depgraph(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        enriched_text: &str,
+        context: &ProjectContext,
+        context_overhead: usize,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+        let model_budget = self.model_input_budget(budget_model);
+        let chunks = chunk_for_llm(enriched_text, model_budget, context_overhead);
+        let n = chunks.len();
+
+        let _ = status_tx.send(format!(
+            "📐 [Chunked-Graph] {}: splitting into {} chunks", file_name, n
+        ));
+
+        let budget = self.model_input_budget(&self.generator_model);
+        let mut summaries: Vec<String> = Vec::with_capacity(n);
+
+        for chunk in &chunks {
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("Cancelled during chunked extraction for {file_name}");
+            }
+            let chunk_label = format!("{} [{}/{}]", file_name, chunk.index + 1, chunk.total);
+
+            let summary = if self.mode == PipelineMode::Full {
+                let _ = status_tx.send(format!("🔍 [Extractor] Analysing {}…", chunk_label));
+                self.extract(&chunk_label, file_type, &chunk.text, status_tx, cancel_token)
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!("Extraction failed for {}: {} — falling back to preprocessor", chunk_label, e);
+                        preprocess_text(&chunk.text, &chunk_label, file_type, budget)
+                    })
+            } else {
+                let _ = status_tx.send(format!("⚡ [Preprocess] Structuring {}…", chunk_label));
+                preprocess_text(&chunk.text, &chunk_label, file_type, budget)
+            };
+            summaries.push(summary);
+        }
+
+        let glossary = context.build_glossary();
+        let context_summary = if self.rag_indexes.is_empty() {
+            let mut cs = context.build_summary();
+            let ref_summary = context.build_context_only_summary();
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
+        } else {
+            String::new()
+        };
+        let mut chunk_graphs: Vec<String> = Vec::with_capacity(n);
+
+        for (i, summary) in summaries.iter().enumerate() {
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("Cancelled during chunked graph generation for {file_name}");
+            }
+            let chunk_label = format!("{} [{}/{}]", file_name, i + 1, n);
+            let _ = status_tx.send(format!("🔗 [Graph-Gen] Building graph for {}…", chunk_label));
+
+            let mut other_summaries = String::new();
+            for (j, s) in summaries.iter().enumerate() {
+                if j != i {
+                    other_summaries.push_str(&format!(
+                        "--- Summary from part {}/{} ---\n{}\n\n",
+                        j + 1, n, &s[..s.len().min(500)]
+                    ));
+                }
+            }
+            let chunk_context = if other_summaries.is_empty() {
+                context_summary.clone()
+            } else {
+                format!(
+                    "{}\n\n=== Summaries from other parts of the same document ===\n{}",
+                    context_summary, other_summaries
+                )
+            };
+
+            let graph_json = self.generate_depgraph(
+                &chunk_label, summary, &chunk_context, &glossary, status_tx, cancel_token,
+            ).await?;
+            chunk_graphs.push(graph_json);
+        }
+
+        self.merge_chunk_depgraph(file_name, &chunk_graphs, status_tx, cancel_token).await
+    }
+
+    /// Generate dependency graph JSON using the depgraph-specific preamble.
+    #[tracing::instrument(
+        name = "llm.generate_depgraph",
+        skip(self, summary, context_summary, glossary, status_tx, cancel_token),
+        fields(file_name, context_len = context_summary.len())
+    )]
+    async fn generate_depgraph(
+        &self,
+        file_name: &str,
+        summary: &str,
+        context_summary: &str,
+        glossary: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let mut history: Vec<Message> = Vec::new();
+
+        if !glossary.is_empty() {
+            history.push(Message::user(glossary.to_owned()));
+        }
+
+        if !context_summary.contains("No prior files") && !context_summary.is_empty() {
+            history.push(Message::user(context_summary.to_owned()));
+        }
+
+        let prompt = if !self.rag_indexes.is_empty() {
+            format!(
+                "=== Structured Summary ===\n{summary}\n\n\
+                 Generate the dependency graph JSON for document: {file_name}"
+            )
+        } else {
+            history.push(Message::user(format!(
+                "=== Structured Summary ===\n{summary}"
+            )));
+            format!("Generate the dependency graph JSON for document: {file_name}")
+        };
+
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, DEPGRAPH_GENERATOR_PREAMBLE,
+                &prompt, history, "Graph-Gen", file_name, &self.rag_indexes,
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, DEPGRAPH_GENERATOR_PREAMBLE,
+                &prompt, history, "Graph-Gen", file_name, &self.rag_indexes,
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Generate dependency graph JSON for a group using the group-specific preamble.
+    async fn generate_group_depgraph(
+        &self,
+        group_name: &str,
+        summary: &str,
+        context_summary: &str,
+        glossary: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let mut history: Vec<Message> = Vec::new();
+
+        if !glossary.is_empty() {
+            history.push(Message::user(glossary.to_owned()));
+        }
+
+        if !context_summary.contains("No prior files") && !context_summary.is_empty() {
+            history.push(Message::user(context_summary.to_owned()));
+        }
+
+        let prompt = if !self.rag_indexes.is_empty() {
+            format!(
+                "=== Unified Structured Summary ===\n{summary}\n\n\
+                 Generate a single unified dependency graph JSON for document group: {group_name}"
+            )
+        } else {
+            history.push(Message::user(format!(
+                "=== Unified Structured Summary ===\n{summary}"
+            )));
+            format!("Generate a single unified dependency graph JSON for document group: {group_name}")
+        };
+
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, DEPGRAPH_GROUP_GENERATOR_PREAMBLE,
+                &prompt, history, "Graph-Gen", group_name, &self.rag_indexes,
+                status_tx,
+                std::time::Duration::from_secs(240),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, DEPGRAPH_GROUP_GENERATOR_PREAMBLE,
+                &prompt, history, "Graph-Gen", group_name, &self.rag_indexes,
+                status_tx,
+                std::time::Duration::from_secs(240),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Review and improve a dependency graph JSON.
+    #[tracing::instrument(
+        name = "llm.review_depgraph",
+        skip(self, graph_json, status_tx, cancel_token),
+        fields(file_name)
+    )]
+    async fn review_depgraph(
+        &self,
+        file_name: &str,
+        graph_json: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let model = self.effective_reviewer_model();
+        let history = vec![
+            Message::user(graph_json.to_owned()),
+        ];
+
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, model, DEPGRAPH_REVIEWER_PREAMBLE,
+                "Review and correct the dependency graph JSON above. Output only the corrected JSON:",
+                history, "Graph-Review", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(120),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.ollama_reviewer_client(), model, DEPGRAPH_REVIEWER_PREAMBLE,
+                "Review and correct the dependency graph JSON above. Output only the corrected JSON:",
+                history, "Graph-Review", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(120),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Merge dependency graph JSON chunks from an oversized document.
+    async fn merge_chunk_depgraph(
+        &self,
+        file_name: &str,
+        chunk_graphs: &[String],
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        if chunk_graphs.len() == 1 {
+            return Ok(chunk_graphs[0].clone());
+        }
+
+        let _ = status_tx.send(format!(
+            "🔀 [Graph-Merge] {}: merging {} chunks…", file_name, chunk_graphs.len()
+        ));
+
+        let mut combined = String::new();
+        for (i, g) in chunk_graphs.iter().enumerate() {
+            combined.push_str(&format!(
+                "=== Dependency Graph from Part {}/{} ===\n{}\n\n",
+                i + 1, chunk_graphs.len(), g
+            ));
+        }
+
+        let history = vec![Message::user(combined)];
+        let prompt = format!(
+            "Merge the {} dependency graph JSON chunks above into a single cohesive graph for '{}'.",
+            chunk_graphs.len(), file_name
+        );
+
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, DEPGRAPH_MERGE_REVIEWER_PREAMBLE,
+                &prompt, history, "Graph-Merge", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, DEPGRAPH_MERGE_REVIEWER_PREAMBLE,
+                &prompt, history, "Graph-Merge", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        }
     }
 }
 

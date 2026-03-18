@@ -189,6 +189,18 @@ pub enum ProcessingEvent {
     },
     /// OpenSpec export phase finished
     OpenSpecDone(Result<usize, String>),
+    /// A single file has been fully processed — dependency graph mode
+    DepGraphResult {
+        path: PathBuf,
+        graph: crate::depgraph::DependencyGraph,
+        elapsed: std::time::Duration,
+    },
+    /// A group of files has been fully processed — dependency graph mode
+    GroupDepGraphResult {
+        group_name: String,
+        graph: crate::depgraph::DependencyGraph,
+        elapsed: std::time::Duration,
+    },
 }
 
 // ─────────────────────────────────────────────
@@ -211,6 +223,8 @@ enum Selection {
     File(usize),
     /// A file group by name
     Group(String),
+    /// The merged/combined dependency graph
+    MergedDepGraph,
 }
 
 /// Main application state owned by the egui event loop.
@@ -305,6 +319,20 @@ pub struct DockOckApp {
     failed_items: HashMap<PathBuf, String>,
     /// Group names that failed processing, with error details
     failed_groups: HashMap<String, String>,
+    /// Output mode: Gherkin or DependencyGraph
+    output_mode: crate::llm::OutputMode,
+    /// Generated dependency graphs keyed by file path
+    depgraph_results: HashMap<PathBuf, crate::depgraph::DependencyGraph>,
+    /// Generated dependency graphs for file groups, keyed by group name
+    group_depgraph_results: HashMap<String, crate::depgraph::DependencyGraph>,
+    /// Previous depgraph results for diffing
+    previous_depgraph_results: HashMap<PathBuf, crate::depgraph::DependencyGraph>,
+    /// Previous group depgraph results for diffing
+    previous_group_depgraph_results: HashMap<String, crate::depgraph::DependencyGraph>,
+    /// Merged/combined dependency graph built from all individual results
+    merged_depgraph: Option<crate::depgraph::DependencyGraph>,
+    /// Previous merged depgraph for diffing
+    previous_merged_depgraph: Option<crate::depgraph::DependencyGraph>,
 }
 
 impl DockOckApp {
@@ -373,6 +401,13 @@ impl DockOckApp {
             cancel_token: CancellationToken::new(),
             failed_items: HashMap::new(),
             failed_groups: HashMap::new(),
+            output_mode: crate::llm::OutputMode::default(),
+            depgraph_results: HashMap::new(),
+            group_depgraph_results: HashMap::new(),
+            previous_depgraph_results: HashMap::new(),
+            previous_group_depgraph_results: HashMap::new(),
+            merged_depgraph: None,
+            previous_merged_depgraph: None,
         }
     }
 
@@ -568,6 +603,67 @@ impl DockOckApp {
         }
     }
 
+    /// Save the currently selected dependency graph to the output directory.
+    fn save_selected_depgraph(&mut self) {
+        let dir = match &self.output_dir {
+            Some(d) => d.clone(),
+            None => {
+                self.log(LogLevel::Warning, "No output directory selected. Please choose one first.");
+                return;
+            }
+        };
+        if let Some(graph) = self.merged_depgraph.clone() {
+            self.write_depgraph_files(&dir, "combined_depgraph", &graph);
+        }
+    }
+
+    /// Save all dependency graph results to the output directory.
+    fn save_all_depgraph_files(&mut self) {
+        // Only the merged graph is saved — per-file graphs are internal only.
+        self.save_selected_depgraph();
+    }
+
+    /// Write .depgraph.json, .depgraph.md (Mermaid), and .depgraph.dot for one graph.
+    fn write_depgraph_files(&mut self, dir: &PathBuf, stem: &str, graph: &crate::depgraph::DependencyGraph) {
+        let json_path = dir.join(format!("{}.depgraph.json", stem));
+        let md_path = dir.join(format!("{}.depgraph.md", stem));
+        let dot_path = dir.join(format!("{}.depgraph.dot", stem));
+        let html_path = dir.join(format!("{}.depgraph.html", stem));
+
+        let mut ok = true;
+        if let Err(e) = std::fs::write(&json_path, graph.to_json()) {
+            self.log(LogLevel::Error, format!("Failed to save {}: {}", json_path.display(), e));
+            ok = false;
+        }
+        let mermaid_md = format!("# Dependency Graph: {}\n\n```mermaid\n{}\n```\n\n## Summary\n\n{}", stem, graph.to_mermaid(), graph.to_summary_string());
+        if let Err(e) = std::fs::write(&md_path, mermaid_md) {
+            self.log(LogLevel::Error, format!("Failed to save {}: {}", md_path.display(), e));
+            ok = false;
+        }
+        if let Err(e) = std::fs::write(&dot_path, graph.to_dot()) {
+            self.log(LogLevel::Error, format!("Failed to save {}: {}", dot_path.display(), e));
+            ok = false;
+        }
+        if let Err(e) = std::fs::write(&html_path, graph.to_visual_html()) {
+            self.log(LogLevel::Error, format!("Failed to save {}: {}", html_path.display(), e));
+            ok = false;
+        }
+        // Try Graphviz SVG if `dot` is available
+        match graph.render_dot_to_svg() {
+            Ok(svg) => {
+                let svg_path = dir.join(format!("{}.depgraph.svg", stem));
+                if let Err(e) = std::fs::write(&svg_path, svg) {
+                    self.log(LogLevel::Error, format!("Failed to save {}: {}", svg_path.display(), e));
+                }
+            }
+            Err(_) => {} // Graphviz not installed — skip silently
+        }
+        if ok {
+            self.log(LogLevel::Success, format!("Saved depgraph: {}", stem));
+            self.toast = Some((format!("Saved {}.depgraph.*", stem), 3.0));
+        }
+    }
+
     /// Build a `SessionData` snapshot of the current state.
     fn build_session_data(&self) -> crate::session::SessionData {
         // Convert PathBuf-keyed results to String-keyed for serialization
@@ -580,6 +676,16 @@ impl DockOckApp {
             .previous_results
             .iter()
             .map(|(p, d)| (p.to_string_lossy().to_string(), d.clone()))
+            .collect();
+        let depgraph_results: HashMap<String, crate::depgraph::DependencyGraph> = self
+            .depgraph_results
+            .iter()
+            .map(|(p, g)| (p.to_string_lossy().to_string(), g.clone()))
+            .collect();
+        let previous_depgraph_results: HashMap<String, crate::depgraph::DependencyGraph> = self
+            .previous_depgraph_results
+            .iter()
+            .map(|(p, g)| (p.to_string_lossy().to_string(), g.clone()))
             .collect();
         crate::session::SessionData {
             files: self.selected_files.clone(),
@@ -596,6 +702,13 @@ impl DockOckApp {
             output_dir: self.output_dir.clone(),
             previous_results: previous,
             previous_group_results: self.previous_group_results.clone(),
+            output_mode: self.output_mode,
+            depgraph_results,
+            group_depgraph_results: self.group_depgraph_results.clone(),
+            previous_depgraph_results,
+            previous_group_depgraph_results: self.previous_group_depgraph_results.clone(),
+            merged_depgraph: self.merged_depgraph.clone(),
+            previous_merged_depgraph: self.previous_merged_depgraph.clone(),
         }
     }
 
@@ -632,11 +745,30 @@ impl DockOckApp {
             .map(|(k, v)| (PathBuf::from(k), v))
             .collect();
         self.previous_group_results = data.previous_group_results;
-        if !self.results.is_empty() || !self.group_results.is_empty() {
+        self.output_mode = data.output_mode;
+        self.depgraph_results = data
+            .depgraph_results
+            .into_iter()
+            .map(|(k, v)| (PathBuf::from(k), v))
+            .collect();
+        self.group_depgraph_results = data.group_depgraph_results;
+        self.previous_depgraph_results = data
+            .previous_depgraph_results
+            .into_iter()
+            .map(|(k, v)| (PathBuf::from(k), v))
+            .collect();
+        self.previous_group_depgraph_results = data.previous_group_depgraph_results;
+        self.merged_depgraph = data.merged_depgraph;
+        self.previous_merged_depgraph = data.previous_merged_depgraph;
+        if !self.results.is_empty() || !self.group_results.is_empty()
+            || !self.depgraph_results.is_empty() || !self.group_depgraph_results.is_empty()
+            || self.merged_depgraph.is_some()
+        {
             self.state = AppState::Done;
         }
         let file_count = self.selected_files.len();
-        let result_count = self.results.len() + self.group_results.len();
+        let result_count = self.results.len() + self.group_results.len()
+            + self.depgraph_results.len() + self.group_depgraph_results.len();
         self.log(
             LogLevel::Success,
             format!("Session restored: {} files, {} results", file_count, result_count),
@@ -652,6 +784,7 @@ impl DockOckApp {
                 .get(*idx)
                 .map(|p| p.to_string_lossy().to_string()),
             Some(Selection::Group(name)) => Some(name.clone()),
+            Some(Selection::MergedDepGraph) => Some("__merged_depgraph__".to_string()),
             None => None,
         }
     }
@@ -667,8 +800,14 @@ impl DockOckApp {
         // Snapshot current results for diffing after regeneration
         self.previous_results = self.results.clone();
         self.previous_group_results = self.group_results.clone();
+        self.previous_depgraph_results = self.depgraph_results.clone();
+        self.previous_group_depgraph_results = self.group_depgraph_results.clone();
+        self.previous_merged_depgraph = self.merged_depgraph.clone();
         self.results.clear();
         self.group_results.clear();
+        self.depgraph_results.clear();
+        self.group_depgraph_results.clear();
+        self.merged_depgraph = None;
         self.elapsed_times.clear();
         self.group_elapsed_times.clear();
         self.failed_items.clear();
@@ -729,13 +868,14 @@ impl DockOckApp {
         let embedding_choice = self.embedding_choice;
         let cancel_token = self.cancel_token.clone();
         let custom_providers = self.custom_providers.clone();
+        let output_mode = self.output_mode;
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
             handle.block_on(process_files(
                 files, groups, context, backend,
                 gen_model, ext_model, rev_model, vis_model,
-                mode,
+                mode, output_mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
                 cache, force_regenerate, embedding_choice, custom_providers, tx, cancel_token,
             ));
@@ -958,7 +1098,7 @@ impl DockOckApp {
                                 elapsed: std::time::Duration::ZERO,
                             });
                         }
-                        None => {}
+                        _ => {}
                     }
                 } else if result.is_none() {
                     let _ = tx.send(ProcessingEvent::Status(
@@ -1037,6 +1177,44 @@ impl DockOckApp {
                     self.group_elapsed_times.insert(group_name.clone(), elapsed);
                     self.group_results.insert(group_name, gherkin);
                 }
+                ProcessingEvent::DepGraphResult { path, graph, elapsed } => {
+                    self.progress.0 += 1;
+                    let secs = elapsed.as_secs_f64();
+                    let elapsed_str = if secs >= 60.0 {
+                        format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                    } else {
+                        format!("{:.1}s", secs)
+                    };
+                    self.log(LogLevel::Success, format!(
+                        "✓ Generated dependency graph for: {} ({}/{}) in {}",
+                        path.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        self.progress.0,
+                        self.progress.1,
+                        elapsed_str,
+                    ));
+                    self.elapsed_times.insert(path.clone(), elapsed);
+                    self.depgraph_results.insert(path, graph);
+                }
+                ProcessingEvent::GroupDepGraphResult { group_name, graph, elapsed } => {
+                    self.progress.0 += 1;
+                    let secs = elapsed.as_secs_f64();
+                    let elapsed_str = if secs >= 60.0 {
+                        format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                    } else {
+                        format!("{:.1}s", secs)
+                    };
+                    self.log(LogLevel::Success, format!(
+                        "✓ Generated dependency graph for group: {} ({}/{}) in {}",
+                        group_name,
+                        self.progress.0,
+                        self.progress.1,
+                        elapsed_str,
+                    ));
+                    self.group_elapsed_times.insert(group_name.clone(), elapsed);
+                    self.group_depgraph_results.insert(group_name, graph);
+                }
                 ProcessingEvent::Done(result) => {
                     match result {
                         Ok(()) => {
@@ -1052,6 +1230,22 @@ impl DockOckApp {
                                     self.progress.1
                                 ));
                             }
+                            // Build merged dependency graph when in depgraph mode
+                            if self.output_mode == crate::llm::OutputMode::DependencyGraph {
+                                let all_graphs: Vec<&crate::depgraph::DependencyGraph> = self
+                                    .depgraph_results.values()
+                                    .chain(self.group_depgraph_results.values())
+                                    .collect();
+                                if !all_graphs.is_empty() {
+                                    let merged = crate::depgraph::merge_graphs(&all_graphs);
+                                    self.log(LogLevel::Success, format!(
+                                        "📊 Combined graph: {} entities, {} dependencies across {} sources",
+                                        merged.nodes.len(), merged.edges.len(), all_graphs.len(),
+                                    ));
+                                    self.merged_depgraph = Some(merged);
+                                    self.selection = Some(Selection::MergedDepGraph);
+                                }
+                            }
                             self.auto_save_session();
                         }
                         Err(e) => {
@@ -1064,13 +1258,13 @@ impl DockOckApp {
                 ProcessingEvent::ItemFailed { name, path, error } => {
                     self.progress.0 += 1;
                     if let Some(p) = path {
-                        self.failed_items.insert(p, error);
+                        self.failed_items.insert(p, error.clone());
                     } else {
-                        self.failed_groups.insert(name.clone(), error);
+                        self.failed_groups.insert(name.clone(), error.clone());
                     }
                     self.log(LogLevel::Error, format!(
-                        "❌ Failed: {} ({}/{})",
-                        name, self.progress.0, self.progress.1,
+                        "❌ Failed: {} ({}/{}) — {}",
+                        name, self.progress.0, self.progress.1, error,
                     ));
                 }
                 ProcessingEvent::OpenSpecStarted => {
@@ -1304,6 +1498,15 @@ impl DockOckApp {
                         ui.selectable_value(&mut self.pipeline_mode, mode, mode.to_string());
                     }
                 });
+            ui.separator();
+            ui.label("Output:");
+            egui::ComboBox::from_id_salt("output_mode")
+                .selected_text(self.output_mode.to_string())
+                .show_ui(ui, |ui| {
+                    for mode in crate::llm::OutputMode::ALL {
+                        ui.selectable_value(&mut self.output_mode, mode, mode.to_string());
+                    }
+                });
             ui.label("∥");
             ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0).max_decimals(0).update_while_editing(false))
                 .on_hover_text("Max concurrent LLM tasks");
@@ -1419,7 +1622,8 @@ impl DockOckApp {
                 // ── Render groups ──
                 for (gi, group) in self.file_groups.iter().enumerate() {
                     let group_selected = self.selection == Some(Selection::Group(group.name.clone()));
-                    let has_group_result = self.group_results.contains_key(&group.name);
+                    let has_group_result = self.group_results.contains_key(&group.name)
+                        || self.group_depgraph_results.contains_key(&group.name);
                     let has_group_failed = self.failed_groups.contains_key(&group.name);
 
                     let header_label = if has_group_result {
@@ -1542,6 +1746,19 @@ impl DockOckApp {
                     });
                 }
 
+                // ── Merged Dependency Graph entry ──
+                if self.merged_depgraph.is_some() {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    let selected = self.selection == Some(Selection::MergedDepGraph);
+                    let label = egui::RichText::new("📊 Full Dependency Graph")
+                        .strong()
+                        .color(egui::Color32::from_rgb(100, 200, 255));
+                    if ui.selectable_label(selected, label).clicked() {
+                        self.selection = Some(Selection::MergedDepGraph);
+                    }
+                }
+
                 // ── Render ungrouped files ──
                 if self.selected_files.iter().any(|p| !grouped_paths.contains(p)) {
                     ui.add_space(4.0);
@@ -1569,7 +1786,8 @@ impl DockOckApp {
                     let file_role = crate::parser::FileRole::from_extension(ext);
                     let is_context = file_role == crate::parser::FileRole::Context;
 
-                    let has_result = self.results.contains_key(path);
+                    let has_result = self.results.contains_key(path)
+                        || self.depgraph_results.contains_key(path);
                     let has_failed = self.failed_items.contains_key(path);
                     let selected = self.selection == Some(Selection::File(i));
 
@@ -1691,6 +1909,11 @@ impl DockOckApp {
     }
 
     fn render_right_panel(&mut self, ui: &mut egui::Ui) {
+        if self.output_mode == crate::llm::OutputMode::DependencyGraph {
+            self.render_right_panel_depgraph(ui);
+            return;
+        }
+
         ui.heading("📝 Gherkin Output");
         ui.separator();
 
@@ -1760,7 +1983,7 @@ impl DockOckApp {
                 .group_results
                 .get(name)
                 .map(|doc| doc.to_feature_string()),
-            None => None,
+            _ => None,
         };
 
         // Check for previous result (for diff view)
@@ -1774,7 +1997,7 @@ impl DockOckApp {
                 .previous_group_results
                 .get(name)
                 .map(|doc| doc.to_feature_string()),
-            None => None,
+            _ => None,
         };
 
         let has_diff = prev_content.is_some() && content.is_some();
@@ -1807,7 +2030,7 @@ impl DockOckApp {
                                     self.save_group_feature_file(&name, &doc);
                                 }
                             }
-                            None => {}
+                            _ => {}
                         }
                     }
                     if ui
@@ -1917,7 +2140,7 @@ impl DockOckApp {
                                 .and_then(|p| p.file_stem())
                                 .map(|s| s.to_string_lossy().to_string()),
                             Some(Selection::Group(name)) => Some(name.clone()),
-                            None => None,
+                            _ => None,
                         };
                         if let Some(key) = openspec_key {
                             if let Some(export) = self.openspec_results.get(&key) {
@@ -1984,7 +2207,7 @@ impl DockOckApp {
                         .failed_groups
                         .get(name)
                         .cloned(),
-                    None => None,
+                    _ => None,
                 };
 
                 if let Some(error_msg) = failure_error {
@@ -1996,7 +2219,7 @@ impl DockOckApp {
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default(),
                         Some(Selection::Group(name)) => name.clone(),
-                        None => String::new(),
+                        _ => String::new(),
                     };
 
                     ui.add_space(20.0);
@@ -2048,16 +2271,187 @@ impl DockOckApp {
         }
     }
 
+    fn render_right_panel_depgraph(&mut self, ui: &mut egui::Ui) {
+        ui.heading("📊 Dependency Graph");
+        ui.separator();
+
+        // Only the merged graph is displayed; per-file results are kept in memory
+        // and merged into one combined graph when processing completes.
+        let graph = self.merged_depgraph.clone();
+        let prev_graph = self.previous_merged_depgraph.clone();
+
+        match graph {
+            Some(graph) => {
+                // ── Button bar ──
+                ui.horizontal(|ui| {
+                    if ui.button("📋 Copy JSON").clicked() {
+                        ui.ctx().copy_text(graph.to_json());
+                        self.toast = Some(("Copied JSON to clipboard".to_string(), 2.0));
+                    }
+                    if ui.button("📋 Copy Mermaid").clicked() {
+                        ui.ctx().copy_text(graph.to_mermaid());
+                        self.toast = Some(("Copied Mermaid to clipboard".to_string(), 2.0));
+                    }
+                    if ui.button("📋 Copy DOT").clicked() {
+                        ui.ctx().copy_text(graph.to_dot());
+                        self.toast = Some(("Copied DOT to clipboard".to_string(), 2.0));
+                    }
+                    ui.separator();
+                    if ui.button("🖼 Open Visual").on_hover_text("Open interactive graph in browser").clicked() {
+                        let html = graph.to_visual_html();
+                        let tmp = std::env::temp_dir().join("dockock_depgraph.html");
+                        match std::fs::write(&tmp, html) {
+                            Ok(_) => {
+                                if let Err(e) = open::that(&tmp) {
+                                    self.log(LogLevel::Error, format!("Failed to open browser: {}", e));
+                                }
+                            }
+                            Err(e) => {
+                                self.log(LogLevel::Error, format!("Failed to write temp HTML: {}", e));
+                            }
+                        }
+                    }
+                    let can_save = self.output_dir.is_some();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("💾 Save"))
+                        .on_hover_text(if can_save { "Save depgraph files" } else { "Set output directory first" })
+                        .clicked()
+                    {
+                        self.save_selected_depgraph();
+                    }
+                    // Save All removed — there is only a single merged graph
+
+                    // ── Diff toggle ──
+                    if prev_graph.is_some() {
+                        ui.separator();
+                        let diff_label = if self.show_diff { "📊 Hide Diff" } else { "📊 Show Diff" };
+                        if ui.button(diff_label).on_hover_text("Compare with previous generation").clicked() {
+                            self.show_diff = !self.show_diff;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+
+                // ── Main content area ──
+                egui::ScrollArea::vertical()
+                    .id_salt("depgraph_scroll")
+                    .show(ui, |ui| {
+                        // Show diff if toggled
+                        if self.show_diff {
+                            if let Some(ref prev) = prev_graph {
+                                let diff_entries = crate::depgraph::diff_depgraph(prev, &graph);
+                                if diff_entries.is_empty() {
+                                    ui.label("No changes detected.");
+                                } else {
+                                    ui.label(egui::RichText::new("Changes from previous run:").strong());
+                                    ui.add_space(4.0);
+                                    for entry in &diff_entries {
+                                        let (color, text) = match entry {
+                                            crate::depgraph::GraphDiffEntry::NodeAdded(id) => (
+                                                egui::Color32::from_rgb(80, 200, 80),
+                                                format!("+ Node: {}", id),
+                                            ),
+                                            crate::depgraph::GraphDiffEntry::NodeRemoved(id) => (
+                                                egui::Color32::from_rgb(220, 80, 80),
+                                                format!("- Node: {}", id),
+                                            ),
+                                            crate::depgraph::GraphDiffEntry::NodeModified { id, detail } => (
+                                                egui::Color32::from_rgb(200, 200, 80),
+                                                format!("~ Node: {} ({})", id, detail),
+                                            ),
+                                            crate::depgraph::GraphDiffEntry::EdgeAdded { from, to, rel } => (
+                                                egui::Color32::from_rgb(80, 200, 80),
+                                                format!("+ Edge: {} → {} [{}]", from, to, rel),
+                                            ),
+                                            crate::depgraph::GraphDiffEntry::EdgeRemoved { from, to, rel } => (
+                                                egui::Color32::from_rgb(220, 80, 80),
+                                                format!("- Edge: {} → {} [{}]", from, to, rel),
+                                            ),
+                                        };
+                                        ui.colored_label(color, egui::RichText::new(text).monospace());
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                }
+                            }
+                        }
+
+                        // Summary
+                        let summary = graph.to_summary_string();
+                        ui.add(
+                            egui::TextEdit::multiline(&mut summary.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+
+                        // Mermaid source
+                        ui.add_space(8.0);
+                        egui::CollapsingHeader::new(egui::RichText::new("🔀 Mermaid Source").strong())
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let mermaid = graph.to_mermaid();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut mermaid.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+
+                        // DOT source
+                        egui::CollapsingHeader::new(egui::RichText::new("🔗 DOT Source").strong())
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let dot = graph.to_dot();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut dot.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+
+                        // Raw JSON
+                        egui::CollapsingHeader::new(egui::RichText::new("📋 Raw JSON").strong())
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                let json = graph.to_json();
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut json.as_str())
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY),
+                                );
+                            });
+                    });
+            }
+            None => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    if self.selected_files.is_empty() {
+                        ui.label("Add files using the ➕ button and click Generate.");
+                    } else if self.state == AppState::Processing {
+                        ui.label("⏳ Processing files…");
+                        ui.spinner();
+                    } else {
+                        ui.label("The combined dependency graph will appear here after processing completes.");
+                    }
+                });
+            }
+        }
+    }
+
     fn render_bottom_bar(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.horizontal(|ui| {
             let is_processing = self.state == AppState::Processing;
             let has_files = !self.selected_files.is_empty();
 
+            let generate_label = match self.output_mode {
+                crate::llm::OutputMode::Gherkin => "⚙ Generate Gherkin",
+                crate::llm::OutputMode::DependencyGraph => "⚙ Generate Dep Graph",
+            };
             if ui
                 .add_enabled(
                     !is_processing && has_files,
-                    egui::Button::new("⚙ Generate Gherkin"),
+                    egui::Button::new(generate_label),
                 )
                 .clicked()
             {
@@ -2227,6 +2621,7 @@ async fn process_files(
     reviewer_model: String,
     vision_model: String,
     mode: crate::llm::PipelineMode,
+    output_mode: crate::llm::OutputMode,
     max_concurrent: usize,
     openspec_enabled: bool,
     openspec_url: String,
@@ -2424,11 +2819,15 @@ async fn process_files(
             String::new()
         };
         if !glossary.is_empty() {
+            let preamble = match output_mode {
+                crate::llm::OutputMode::Gherkin => crate::llm::GENERATOR_PREAMBLE,
+                crate::llm::OutputMode::DependencyGraph => crate::llm::DEPGRAPH_GENERATOR_PREAMBLE,
+            };
             let _ = tx.send(ProcessingEvent::Status(
                 "⚡ Priming generator KV-cache prefix…".to_string(),
             ));
             let _ = orchestrator
-                .prime_generator_prefix(crate::llm::GENERATOR_PREAMBLE, &glossary)
+                .prime_generator_prefix(preamble, &glossary)
                 .await;
             let _ = tx.send(ProcessingEvent::Status(
                 "⚡ Generator prefix cache ready.".to_string(),
@@ -2718,6 +3117,7 @@ async fn process_files(
             let gdocs = Arc::clone(&gherkin_docs);
             let force_regen = force_regenerate;
             let child_token = cancel_token.child_token();
+            let out_mode = output_mode;
 
             tracker.spawn(async move {
                 // Cancel-aware semaphore wait
@@ -2740,39 +3140,70 @@ async fn process_files(
                     }
                 });
 
-                let result = orch
-                    .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
-                    .await;
+                match out_mode {
+                    crate::llm::OutputMode::Gherkin => {
+                        let result = orch
+                            .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
+                            .await;
 
-                drop(status_tx);
-                let _ = fwd.join();
+                        drop(status_tx);
+                        let _ = fwd.join();
 
-                let elapsed = file_start.elapsed();
-                match result {
-                    Ok(raw_gherkin) => {
-                        let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
-                            &raw_gherkin,
-                            &file_name,
-                        );
-                        let feature_text = doc.to_feature_string();
-                        if let Ok(mut docs) = gdocs.lock() {
-                            let stem = member_path.file_stem()
-                                .map(|s| s.to_string_lossy().to_string())
-                                .unwrap_or_else(|| file_name.clone());
-                            docs.push((stem, feature_text));
+                        let elapsed = file_start.elapsed();
+                        match result {
+                            Ok(raw_gherkin) => {
+                                let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                                    &raw_gherkin,
+                                    &file_name,
+                                );
+                                let feature_text = doc.to_feature_string();
+                                if let Ok(mut docs) = gdocs.lock() {
+                                    let stem = member_path.file_stem()
+                                        .map(|s| s.to_string_lossy().to_string())
+                                        .unwrap_or_else(|| file_name.clone());
+                                    docs.push((stem, feature_text));
+                                }
+                                let _ = tx.send(ProcessingEvent::FileResult {
+                                    path: member_path,
+                                    gherkin: doc,
+                                    elapsed,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ProcessingEvent::Status(format!(
+                                    "⚠ Pipeline error for {}: {}",
+                                    file_name, e
+                                )));
+                                let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(member_path.clone()), error: format!("{e}") });
+                            }
                         }
-                        let _ = tx.send(ProcessingEvent::FileResult {
-                            path: member_path,
-                            gherkin: doc,
-                            elapsed,
-                        });
                     }
-                    Err(e) => {
-                        let _ = tx.send(ProcessingEvent::Status(format!(
-                            "⚠ Pipeline error for {}: {}",
-                            file_name, e
-                        )));
-                        let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(member_path.clone()), error: format!("{e}") });
+                    crate::llm::OutputMode::DependencyGraph => {
+                        let result = orch
+                            .process_file_depgraph(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
+                            .await;
+
+                        drop(status_tx);
+                        let _ = fwd.join();
+
+                        let elapsed = file_start.elapsed();
+                        match result {
+                            Ok(raw_json) => {
+                                let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&file_name]);
+                                let _ = tx.send(ProcessingEvent::DepGraphResult {
+                                    path: member_path,
+                                    graph,
+                                    elapsed,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ProcessingEvent::Status(format!(
+                                    "⚠ Pipeline error for {}: {}",
+                                    file_name, e
+                                )));
+                                let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(member_path.clone()), error: format!("{e}") });
+                            }
+                        }
                     }
                 }
             });
@@ -2788,6 +3219,7 @@ async fn process_files(
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
         let child_token = cancel_token.child_token();
+        let out_mode = output_mode;
 
         tracker.spawn(async move {
             // Cancel-aware semaphore wait
@@ -2817,36 +3249,67 @@ async fn process_files(
             let members_ref: Vec<(String, String, String, Vec<crate::parser::ExtractedImage>)> =
                 members_data;
 
-            let result = orch
-                .process_group(&group_name, &members_ref, &ctx, &status_tx, force_regen, &child_token)
-                .await;
+            match out_mode {
+                crate::llm::OutputMode::Gherkin => {
+                    let result = orch
+                        .process_group(&group_name, &members_ref, &ctx, &status_tx, force_regen, &child_token)
+                        .await;
 
-            drop(status_tx);
-            let _ = fwd.join();
+                    drop(status_tx);
+                    let _ = fwd.join();
 
-            let elapsed = group_start.elapsed();
-            match result {
-                Ok(raw_gherkin) => {
-                    let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
-                        &raw_gherkin,
-                        &group_name,
-                    );
-                    let feature_text = doc.to_feature_string();
-                    if let Ok(mut docs) = gdocs.lock() {
-                        docs.push((group_name.clone(), feature_text));
+                    let elapsed = group_start.elapsed();
+                    match result {
+                        Ok(raw_gherkin) => {
+                            let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                                &raw_gherkin,
+                                &group_name,
+                            );
+                            let feature_text = doc.to_feature_string();
+                            if let Ok(mut docs) = gdocs.lock() {
+                                docs.push((group_name.clone(), feature_text));
+                            }
+                            let _ = tx.send(ProcessingEvent::GroupResult {
+                                group_name,
+                                gherkin: doc,
+                                elapsed,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Pipeline error for group {}: {}",
+                                group_name, e
+                            )));
+                            let _ = tx.send(ProcessingEvent::ItemFailed { name: group_name.clone(), path: None, error: format!("{e}") });
+                        }
                     }
-                    let _ = tx.send(ProcessingEvent::GroupResult {
-                        group_name,
-                        gherkin: doc,
-                        elapsed,
-                    });
                 }
-                Err(e) => {
-                    let _ = tx.send(ProcessingEvent::Status(format!(
-                        "⚠ Pipeline error for group {}: {}",
-                        group_name, e
-                    )));
-                    let _ = tx.send(ProcessingEvent::ItemFailed { name: group_name.clone(), path: None, error: format!("{e}") });
+                crate::llm::OutputMode::DependencyGraph => {
+                    let result = orch
+                        .process_group_depgraph(&group_name, &members_ref, &ctx, &status_tx, force_regen, &child_token)
+                        .await;
+
+                    drop(status_tx);
+                    let _ = fwd.join();
+
+                    let elapsed = group_start.elapsed();
+                    match result {
+                        Ok(raw_json) => {
+                            let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&group_name]);
+                            let _ = tx.send(ProcessingEvent::GroupDepGraphResult {
+                                group_name,
+                                graph,
+                                elapsed,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Pipeline error for group {}: {}",
+                                group_name, e
+                            )));
+                            let _ = tx.send(ProcessingEvent::ItemFailed { name: group_name.clone(), path: None, error: format!("{e}") });
+                        }
+                    }
                 }
             }
         });
@@ -2862,7 +3325,7 @@ async fn process_files(
         if grouped_paths.contains(path) {
             continue;
         }
-        // Skip context-only files — they don't produce Gherkin
+        // Skip context-only files — they don't produce output
         if *role == crate::parser::FileRole::Context {
             continue;
         }
@@ -2884,6 +3347,7 @@ async fn process_files(
         let gdocs = Arc::clone(&gherkin_docs);
         let force_regen = force_regenerate;
         let child_token = cancel_token.child_token();
+        let out_mode = output_mode;
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -2913,39 +3377,70 @@ async fn process_files(
                 }
             });
 
-            let result = orch
-                .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
-                .await;
+            match out_mode {
+                crate::llm::OutputMode::Gherkin => {
+                    let result = orch
+                        .process_file(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
+                        .await;
 
-            drop(status_tx);
-            let _ = fwd.join();
+                    drop(status_tx);
+                    let _ = fwd.join();
 
-            let file_elapsed = file_start.elapsed();
-            match result {
-                Ok(raw_gherkin) => {
-                    let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
-                        &raw_gherkin,
-                        &file_name,
-                    );
-                    let feature_text = doc.to_feature_string();
-                    if let Ok(mut docs) = gdocs.lock() {
-                        let stem = path.file_stem()
-                            .map(|s| s.to_string_lossy().to_string())
-                            .unwrap_or_else(|| file_name.clone());
-                        docs.push((stem, feature_text));
+                    let file_elapsed = file_start.elapsed();
+                    match result {
+                        Ok(raw_gherkin) => {
+                            let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                                &raw_gherkin,
+                                &file_name,
+                            );
+                            let feature_text = doc.to_feature_string();
+                            if let Ok(mut docs) = gdocs.lock() {
+                                let stem = path.file_stem()
+                                    .map(|s| s.to_string_lossy().to_string())
+                                    .unwrap_or_else(|| file_name.clone());
+                                docs.push((stem, feature_text));
+                            }
+                            let _ = tx.send(ProcessingEvent::FileResult {
+                                path: path.clone(),
+                                gherkin: doc,
+                                elapsed: file_elapsed,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Pipeline error for {}: {}",
+                                file_name, e
+                            )));
+                            let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(path.clone()), error: format!("{e}") });
+                        }
                     }
-                    let _ = tx.send(ProcessingEvent::FileResult {
-                        path: path.clone(),
-                        gherkin: doc,
-                        elapsed: file_elapsed,
-                    });
                 }
-                Err(e) => {
-                    let _ = tx.send(ProcessingEvent::Status(format!(
-                        "⚠ Pipeline error for {}: {}",
-                        file_name, e
-                    )));
-                    let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(path.clone()), error: format!("{e}") });
+                crate::llm::OutputMode::DependencyGraph => {
+                    let result = orch
+                        .process_file_depgraph(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
+                        .await;
+
+                    drop(status_tx);
+                    let _ = fwd.join();
+
+                    let file_elapsed = file_start.elapsed();
+                    match result {
+                        Ok(raw_json) => {
+                            let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&file_name]);
+                            let _ = tx.send(ProcessingEvent::DepGraphResult {
+                                path: path.clone(),
+                                graph,
+                                elapsed: file_elapsed,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Pipeline error for {}: {}",
+                                file_name, e
+                            )));
+                            let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(path.clone()), error: format!("{e}") });
+                        }
+                    }
                 }
             }
         });
