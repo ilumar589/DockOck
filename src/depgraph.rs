@@ -201,19 +201,21 @@ impl DependencyGraph {
 
         // Nodes with shape based on entity type
         for node in &self.nodes {
+            let id = mermaid_id(&node.id);
+            let label = mermaid_escape(&node.name);
             let shape = match node.entity_type {
-                EntityType::Actor => format!("  {}([{}])", node.id, mermaid_escape(&node.name)),
+                EntityType::Actor => format!("  {}([{}])", id, label),
                 EntityType::Process => {
-                    format!("  {}{{{{{}}}}}", node.id, mermaid_escape(&node.name))
+                    format!("  {}{{{{{}}}}}", id, label)
                 }
                 EntityType::System | EntityType::Service => {
-                    format!("  {}[[{}]]", node.id, mermaid_escape(&node.name))
+                    format!("  {}[[{}]]", id, label)
                 }
                 EntityType::ExternalSystem => {
-                    format!("  {}[({})]", node.id, mermaid_escape(&node.name))
+                    format!("  {}[({})]", id, label)
                 }
                 EntityType::DataObject => {
-                    format!("  {}[{}]", node.id, mermaid_escape(&node.name))
+                    format!("  {}[{}]", id, label)
                 }
             };
             out.push_str(&shape);
@@ -224,6 +226,8 @@ impl DependencyGraph {
 
         // Edges
         for edge in &self.edges {
+            let from = mermaid_id(&edge.from_node);
+            let to = mermaid_id(&edge.to_node);
             let arrow = match edge.relationship {
                 EdgeRelationship::DependsOn => "-->",
                 EdgeRelationship::Triggers => "-.->",
@@ -233,66 +237,17 @@ impl DependencyGraph {
             if edge.label.is_empty() {
                 out.push_str(&format!(
                     "  {} {} {}\n",
-                    edge.from_node, arrow, edge.to_node
+                    from, arrow, to
                 ));
             } else {
                 out.push_str(&format!(
                     "  {} {}|{}| {}\n",
-                    edge.from_node,
+                    from,
                     arrow,
                     mermaid_escape(&edge.label),
-                    edge.to_node
+                    to
                 ));
             }
-        }
-
-        // State transition subgraphs for stateful entities
-        for node in &self.nodes {
-            if node.states.is_empty() {
-                continue;
-            }
-            out.push_str(&format!(
-                "\n  subgraph {}_lifecycle[{} Lifecycle]\n",
-                node.id,
-                mermaid_escape(&node.name)
-            ));
-            out.push_str("    direction LR\n");
-            for state in &node.states {
-                let state_id = format!(
-                    "{}_{}",
-                    node.id,
-                    state.name.to_lowercase().replace(' ', "_")
-                );
-                out.push_str(&format!(
-                    "    {}[{}]\n",
-                    state_id,
-                    mermaid_escape(&state.name)
-                ));
-            }
-            for tr in &node.transitions {
-                let from_id = format!(
-                    "{}_{}",
-                    node.id,
-                    tr.from_state.to_lowercase().replace(' ', "_")
-                );
-                let to_id = format!(
-                    "{}_{}",
-                    node.id,
-                    tr.to_state.to_lowercase().replace(' ', "_")
-                );
-                let label = if tr.guards.is_empty() {
-                    tr.trigger.clone()
-                } else {
-                    format!("{} [{}]", tr.trigger, tr.guards.join(", "))
-                };
-                out.push_str(&format!(
-                    "    {} -->|{}| {}\n",
-                    from_id,
-                    mermaid_escape(&label),
-                    to_id
-                ));
-            }
-            out.push_str("  end\n");
         }
 
         out
@@ -347,6 +302,162 @@ impl DependencyGraph {
     /// Render as formatted JSON.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).unwrap_or_default()
+    }
+
+    /// Generate a self-contained HTML page that renders the Mermaid diagram
+    /// in a browser. Uses the Mermaid CDN — no local tools required.
+    pub fn to_visual_html(&self) -> String {
+        let mermaid_src = self.to_mermaid()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let summary = self.to_summary_string()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\n', "<br>\n");
+        format!(
+r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; background: #1e1e2e; color: #cdd6f4; overflow: hidden; height: 100vh; display: flex; flex-direction: column; }}
+  .toolbar {{ background: #181825; border-bottom: 1px solid #45475a; padding: 8px 16px; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
+  .toolbar h1 {{ color: #89b4fa; font-size: 16px; margin-right: auto; }}
+  .toolbar button {{ background: #45475a; color: #cdd6f4; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }}
+  .toolbar button:hover {{ background: #585b70; }}
+  .toolbar .zoom-info {{ font-size: 12px; color: #a6adc8; min-width: 50px; text-align: center; }}
+  .graph-viewport {{ flex: 1; overflow: hidden; position: relative; cursor: grab; background: #1e1e2e; }}
+  .graph-viewport:active {{ cursor: grabbing; }}
+  .graph-inner {{ transform-origin: 0 0; position: absolute; top: 0; left: 0; }}
+  .graph-inner svg {{ display: block; }}
+  .summary-overlay {{ display: none; position: fixed; top: 50px; right: 16px; width: 500px; max-height: calc(100vh - 70px); overflow: auto; background: #181825; border: 1px solid #45475a; border-radius: 8px; padding: 16px; font-size: 13px; line-height: 1.6; white-space: pre-wrap; z-index: 100; box-shadow: 0 8px 32px rgba(0,0,0,.5); }}
+  .summary-overlay.visible {{ display: block; }}
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <h1>📊 {title}</h1>
+  <button onclick="zoomTo(1)">Fit</button>
+  <button onclick="zoomBy(1.3)">➕</button>
+  <button onclick="zoomBy(0.7)">➖</button>
+  <span class="zoom-info" id="zoomInfo">100%</span>
+  <button onclick="downloadSvg()">⬇ SVG</button>
+  <button onclick="toggleSummary()">📄 Summary</button>
+</div>
+<div class="graph-viewport" id="viewport">
+  <div class="graph-inner" id="graphInner">
+    <pre class="mermaid">
+{mermaid}
+    </pre>
+  </div>
+</div>
+<div class="summary-overlay" id="summary">{summary}</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({{ startOnLoad: true, theme: 'dark', securityLevel: 'loose', maxTextSize: 500000,
+    flowchart: {{ nodeSpacing: 30, rankSpacing: 60, padding: 15, useMaxWidth: false }} }});
+
+  const vp = document.getElementById('viewport');
+  const inner = document.getElementById('graphInner');
+  let scale = 1, tx = 0, ty = 0, dragging = false, sx = 0, sy = 0;
+
+  function applyTransform() {{
+    inner.style.transform = `translate(${{tx}}px,${{ty}}px) scale(${{scale}})`;
+    document.getElementById('zoomInfo').textContent = Math.round(scale * 100) + '%';
+  }}
+
+  /* Fit the SVG into the viewport */
+  function zoomTo(mode) {{
+    const svg = inner.querySelector('svg');
+    if (!svg) return;
+    const vw = vp.clientWidth, vh = vp.clientHeight;
+    const sw = svg.scrollWidth || svg.clientWidth, sh = svg.scrollHeight || svg.clientHeight;
+    if (mode === 1) {{
+      scale = Math.min(vw / sw, vh / sh, 1) * 0.95;
+      tx = (vw - sw * scale) / 2;
+      ty = (vh - sh * scale) / 2;
+    }}
+    applyTransform();
+  }}
+  function zoomBy(f) {{
+    const vw = vp.clientWidth / 2, vh = vp.clientHeight / 2;
+    tx = vw - f * (vw - tx);
+    ty = vh - f * (vh - ty);
+    scale *= f;
+    applyTransform();
+  }}
+
+  /* Mouse wheel zoom */
+  vp.addEventListener('wheel', (e) => {{
+    e.preventDefault();
+    const f = e.deltaY < 0 ? 1.1 : 0.9;
+    const rect = vp.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    tx = mx - f * (mx - tx);
+    ty = my - f * (my - ty);
+    scale *= f;
+    applyTransform();
+  }}, {{ passive: false }});
+
+  /* Pan with mouse drag */
+  vp.addEventListener('mousedown', (e) => {{ dragging = true; sx = e.clientX - tx; sy = e.clientY - ty; }});
+  window.addEventListener('mousemove', (e) => {{ if (!dragging) return; tx = e.clientX - sx; ty = e.clientY - sy; applyTransform(); }});
+  window.addEventListener('mouseup', () => {{ dragging = false; }});
+
+  function toggleSummary() {{ document.getElementById('summary').classList.toggle('visible'); }}
+  function downloadSvg() {{
+    const svg = inner.querySelector('svg');
+    if (!svg) {{ alert('Graph not rendered yet'); return; }}
+    const blob = new Blob([svg.outerHTML], {{ type: 'image/svg+xml' }});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = '{title}.svg';
+    a.click();
+  }}
+
+  /* Auto-fit once Mermaid finishes rendering */
+  const observer = new MutationObserver(() => {{
+    if (inner.querySelector('svg')) {{ observer.disconnect(); setTimeout(() => zoomTo(1), 100); }}
+  }});
+  observer.observe(inner, {{ childList: true, subtree: true }});
+</script>
+</body>
+</html>"#,
+            title = self.title.replace('"', "&quot;"),
+            mermaid = mermaid_src,
+            summary = summary,
+        )
+    }
+
+    /// Try to render the DOT source to SVG using an external Graphviz `dot` binary.
+    /// Returns `Ok(svg_string)` on success, or `Err` if `dot` is not installed.
+    pub fn render_dot_to_svg(&self) -> Result<String, String> {
+        use std::process::Command;
+        let dot_src = self.to_dot();
+        let child = Command::new("dot")
+            .args(["-Tsvg"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Graphviz 'dot' not found ({}). Install from https://graphviz.org", e))?;
+
+        use std::io::Write;
+        let mut child = child;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(dot_src.as_bytes()).map_err(|e| format!("Failed to write to dot stdin: {e}"))?;
+        }
+        let output = child.wait_with_output().map_err(|e| format!("dot process failed: {e}"))?;
+        if output.status.success() {
+            String::from_utf8(output.stdout).map_err(|e| format!("dot output not valid UTF-8: {e}"))
+        } else {
+            Err(format!("dot returned error: {}", String::from_utf8_lossy(&output.stderr)))
+        }
     }
 
     /// Render the full graph as a human-readable summary string (for UI display).
@@ -439,8 +550,30 @@ fn strip_json_fences(raw: &str) -> String {
 }
 
 /// Escape characters that break Mermaid syntax.
+/// Uses Mermaid's quoted label syntax to safely wrap any text.
 fn mermaid_escape(s: &str) -> String {
-    s.replace('"', "'").replace('[', "(").replace(']', ")")
+    // Inside quoted strings ("..."), we need to escape:
+    //  - " (would close the label)
+    //  - | (breaks edge-label delimiters)
+    //  - # (starts Mermaid HTML-entity refs like #amp;)
+    //  - newlines (break line-based parsing)
+    let cleaned = s
+        .replace('"', "'")
+        .replace('|', "/")
+        .replace('#', "Nr.")
+        .replace('\n', " ")
+        .replace('\r', "");
+    format!("\"{}\"" , cleaned)
+}
+
+/// Sanitize a raw identifier for use as a Mermaid node ID.
+/// Prefixed with `n` so IDs never start with reserved words like `end`.
+fn mermaid_id(s: &str) -> String {
+    let sanitized: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    format!("n{}", sanitized)
 }
 
 /// Escape characters for DOT label strings.

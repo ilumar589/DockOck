@@ -628,6 +628,7 @@ impl DockOckApp {
         let json_path = dir.join(format!("{}.depgraph.json", stem));
         let md_path = dir.join(format!("{}.depgraph.md", stem));
         let dot_path = dir.join(format!("{}.depgraph.dot", stem));
+        let html_path = dir.join(format!("{}.depgraph.html", stem));
 
         let mut ok = true;
         if let Err(e) = std::fs::write(&json_path, graph.to_json()) {
@@ -642,6 +643,20 @@ impl DockOckApp {
         if let Err(e) = std::fs::write(&dot_path, graph.to_dot()) {
             self.log(LogLevel::Error, format!("Failed to save {}: {}", dot_path.display(), e));
             ok = false;
+        }
+        if let Err(e) = std::fs::write(&html_path, graph.to_visual_html()) {
+            self.log(LogLevel::Error, format!("Failed to save {}: {}", html_path.display(), e));
+            ok = false;
+        }
+        // Try Graphviz SVG if `dot` is available
+        match graph.render_dot_to_svg() {
+            Ok(svg) => {
+                let svg_path = dir.join(format!("{}.depgraph.svg", stem));
+                if let Err(e) = std::fs::write(&svg_path, svg) {
+                    self.log(LogLevel::Error, format!("Failed to save {}: {}", svg_path.display(), e));
+                }
+            }
+            Err(_) => {} // Graphviz not installed — skip silently
         }
         if ok {
             self.log(LogLevel::Success, format!("Saved depgraph: {}", stem));
@@ -2280,6 +2295,21 @@ impl DockOckApp {
                     if ui.button("📋 Copy DOT").clicked() {
                         ui.ctx().copy_text(graph.to_dot());
                         self.toast = Some(("Copied DOT to clipboard".to_string(), 2.0));
+                    }
+                    ui.separator();
+                    if ui.button("🖼 Open Visual").on_hover_text("Open interactive graph in browser").clicked() {
+                        let html = graph.to_visual_html();
+                        let tmp = std::env::temp_dir().join("dockock_depgraph.html");
+                        match std::fs::write(&tmp, html) {
+                            Ok(_) => {
+                                if let Err(e) = open::that(&tmp) {
+                                    self.log(LogLevel::Error, format!("Failed to open browser: {}", e));
+                                }
+                            }
+                            Err(e) => {
+                                self.log(LogLevel::Error, format!("Failed to write temp HTML: {}", e));
+                            }
+                        }
                     }
                     let can_save = self.output_dir.is_some();
                     if ui
