@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::context::FileGroup;
+use crate::depgraph::DependencyGraph;
 use crate::gherkin::GherkinDocument;
 
 const SESSION_FILE: &str = ".dockock_session.json";
@@ -39,6 +40,27 @@ pub struct SessionData {
     /// Previous results kept for diffing on regeneration.
     pub previous_results: HashMap<String, GherkinDocument>,
     pub previous_group_results: HashMap<String, GherkinDocument>,
+    /// Which output mode was last used.
+    #[serde(default)]
+    pub output_mode: crate::llm::OutputMode,
+    /// Dependency graph results (file-keyed, serialized as string paths).
+    #[serde(default)]
+    pub depgraph_results: HashMap<String, DependencyGraph>,
+    /// Dependency graph results for groups.
+    #[serde(default)]
+    pub group_depgraph_results: HashMap<String, DependencyGraph>,
+    /// Previous depgraph results for diffing.
+    #[serde(default)]
+    pub previous_depgraph_results: HashMap<String, DependencyGraph>,
+    /// Previous group depgraph results for diffing.
+    #[serde(default)]
+    pub previous_group_depgraph_results: HashMap<String, DependencyGraph>,
+    /// Merged (combined) dependency graph.
+    #[serde(default)]
+    pub merged_depgraph: Option<DependencyGraph>,
+    /// Previous merged dependency graph for diffing.
+    #[serde(default)]
+    pub previous_merged_depgraph: Option<DependencyGraph>,
 }
 
 /// Build the session file path from the output directory.
