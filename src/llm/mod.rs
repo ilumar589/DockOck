@@ -217,8 +217,9 @@ Rules:
 2. List preconditions and postconditions for each process.
 3. Capture business rules and validation logic.
 4. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES,
-   FIELD_SCOPING, LIFECYCLE_PHASES, SETUP_VS_RUNTIME, IMAGE_CONTENT.
-5. Be concise — no more than 600 words.
+   FIELD_SCOPING, LIFECYCLE_PHASES, SETUP_VS_RUNTIME, OPTIONALITY, CARDINALITY,
+   CONDITIONAL_LOGIC, IMMUTABLE_AFTER, IMAGE_CONTENT.
+5. Be concise — no more than 800 words.
 6. Do not add conversational prose.
 7. If the input contains an "=== Embedded Image Descriptions ===" section, you MUST include a
    dedicated IMAGE_CONTENT section in your summary that preserves:
@@ -231,8 +232,10 @@ Rules:
    mentioned in that dialog section. Separately list fields that appear in FactBoxes, Consumers,
    or downstream documents. Never merge these two sets — they serve different purposes.
 9. LIFECYCLE_PHASES: For every validation rule or business rule, tag it with the exact lifecycle
-   phase it applies to (Creation, Edit, Category-change, Status-transition, Deletion). Only tag
-   a rule as applying at Creation if the document explicitly states it applies during creation.
+   phase it applies to (Creation, Edit, Category-change, Status-transition, Deletion). You MUST
+   have explicit source-text evidence for the phase tag you assign. If a rule's lifecycle phase
+   is ambiguous or unstated, do NOT assume Creation — leave it untagged rather than guess.
+   Only tag a rule as applying at Creation when the document text explicitly states so.
 10. SETUP_VS_RUNTIME: Classify each entity or rule as either Setup/Configuration (e.g., category
     definitions, parameter tables, code lists) or Runtime/Business-object (e.g., premises,
     inspections, meters). Rules defined on a Setup entity must NOT be attributed to the
@@ -241,7 +244,26 @@ Rules:
     Tracked changes, deleted text, and revision markup have already been stripped. If you see
     any residual revision artefacts (e.g., conflicting duplicate sentences, strikethrough
     markers, or inserted/deleted annotations), ignore them — treat only the final text as
-    authoritative. Do not generate scenarios for obsolete or deleted requirements."#;
+    authoritative. Do not generate scenarios for obsolete or deleted requirements.
+12. OPTIONALITY: For every field on every dialog, form, or data structure, record whether the
+    document explicitly marks it as Mandatory (M) or Optional (O). If the document does not
+    state that a field is required, classify it as Optional (O). List fields with their
+    classification, e.g.: "Start Date (M), Drawing Type (O), Comment (O)". Fields in FactBoxes
+    or Consumer sections must be listed separately with their own classification.
+13. CARDINALITY: For every repeating element, collection, or relationship endpoint, capture the
+    exact multiplicity stated in the document (e.g., 0..n, 1..∞, exactly N, 0..1). Reproduce
+    the document's own notation verbatim — do NOT normalise, reinterpret, or change it. If the
+    document says 0..n, record 0..n, never 1..∞.
+14. CONDITIONAL_LOGIC: For every business rule that has a condition, guard, or trigger, capture
+    the EXACT condition verbatim. Do NOT simplify, generalise, or paraphrase conditions. If the
+    document says "deletion is blocked only when child assets have other parent relations",
+    record that exact condition — do NOT simplify to "deletion is blocked when the entity has
+    child relations". Preserve every qualifier (only, when, unless, if, except).
+15. IMMUTABILITY: For every field or attribute, note if the document states it becomes read-only
+    or immutable after a specific event (e.g., "Case Category is read-only after creation").
+    Record the trigger event that locks the field. List these in a dedicated IMMUTABLE_AFTER
+    subsection, e.g.: "Case Category — read-only after creation", "Status — locked after
+    final approval"."#;
 
 pub const GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 Your task is to read a structured document summary and produce well-structured Gherkin
@@ -268,12 +290,38 @@ Rules:
    definition), do NOT apply it to the Runtime entity (like the business record that uses the
    category). Only assert runtime editability rules when the document ties them to a specific
    parameter or runtime condition.
-10. LIFECYCLE PHASE ACCURACY — Each validation or business rule must be placed in a scenario that
-    matches the exact lifecycle phase stated in the document (Creation, Edit, Category-change,
-    Status-transition). Do NOT promote a validation to a creation scenario unless the document
-    explicitly states it applies at creation time. Tag scenarios with the phase, e.g.:
+10. LIFECYCLE PHASE ACCURACY — Each validation or business rule MUST be placed in a scenario that
+    matches the exact lifecycle phase stated in the document. If no lifecycle phase is explicitly
+    stated for a rule at Creation, do NOT place it in a Creation scenario — this is a hard
+    prohibition, not a guideline. A rule documented only for Category-change or Edit must never
+    appear in a [Creation] scenario under any circumstances. Tag scenarios with the phase, e.g.:
     Scenario: [Creation] Manually create a new premises
-    Scenario: [Category-change] Validate premises category change"#;
+    Scenario: [Category-change] Validate premises category change
+11. DOCUMENT FIDELITY — Only generate steps that are directly grounded in the source document.
+    Never assume, infer, or invent fields, buttons, UI page names, navigation targets, or
+    business rules that are not explicitly stated. Do not infer navigation targets or redirect
+    behavior unless the document explicitly names the destination page or entity. Do not generalise
+    a validation rule that the document scopes to a specific action or trigger (e.g., 'applies
+    only when toggling X checkbox') into a universal assertion.
+12. OPTIONALITY — A field the document marks as optional must never appear in a step that asserts
+    it is required or mandatory. If the OPTIONALITY section of the summary lists a field as
+    Optional (O), do not assert it as a required input in any scenario step. Do not mix optional
+    and mandatory fields in the same mandatory-fields assertion.
+13. CARDINALITY FIDELITY — Reproduce document cardinality exactly. Do NOT change 0..n to 1..∞.
+    Do NOT hardcode a specific count (e.g., "3 are created", "2 are ignored") when the document
+    describes partial processing with a warning — in that case, assert the warning message and
+    the all-items-attempted behaviour instead. Use the document's own cardinality notation
+    verbatim in any step that references a quantity or multiplicity.
+14. CONDITIONAL PRECISION — When a business rule has a condition, guard, or trigger, reproduce
+    the EXACT condition in the scenario step. Do NOT simplify "deletion is blocked only when
+    child assets have other parent relations" into "deletion is blocked when the entity has
+    child relations". Preserve every qualifier (only, when, unless, if, except). If the
+    document says a validation applies "only when toggling the In-use checkbox", the scenario
+    must scope the When step to that specific action, not to any update or edit.
+15. READ-ONLY AWARENESS — If the summary's IMMUTABLE_AFTER section (or lifecycle context)
+    indicates a field becomes read-only after a specific event, NEVER generate a scenario that
+    modifies that field after that event. For example, if Case Category is read-only after
+    creation, do not generate a "change the case category" scenario."#;
 
 const REVIEWER_PREAMBLE: &str = r#"You are a Gherkin quality reviewer.
 Your task is to review and improve a Gherkin Feature document.
@@ -294,7 +342,33 @@ Rules:
    scenario or rewrite it to reference the documented parameter that controls runtime behaviour.
 9. LIFECYCLE PHASE CHECK — If a validation rule is asserted during creation but the context
    indicates it applies to a different phase (e.g., category change, status transition), move
-   it to the correct lifecycle-phase scenario."#;
+   it to the correct lifecycle-phase scenario. The most common error is a change/edit rule
+   placed in a [Creation] scenario — always move or remove it. Never assert that a field which
+   is read-only after creation can be changed, and never assert a category-change validation
+   at creation time.
+10. DOCUMENT FIDELITY CHECK — If a step references a field, UI page, navigation target, or
+    business rule that cannot be traced to the source document context, remove or rewrite it.
+    Do not allow invented page names, redirect targets, or entities not present in the source.
+11. OPTIONALITY CHECK — If a creation or validation step asserts a field as mandatory when
+    the document classifies it as optional, rewrite the step to reflect the correct optionality
+    or remove it. Do not allow optional fields to appear in mandatory-fields assertions.
+12. CARDINALITY CHECK — If a step changes document-stated cardinality (e.g., 0..n to 1..∞)
+    or hardcodes a specific numeric count not stated in the document, correct it to match the
+    documented cardinality verbatim. If the document describes partial processing with a warning,
+    the step must assert the warning and all-items-attempted behaviour, not a truncated count.
+13. SCOPE GENERALIZATION CHECK — If a step asserts a validation universally but the source
+    document scopes it to a specific trigger or condition (e.g., 'only when toggling checkbox X'),
+    narrow the step to match the documented scope. If a navigation step references a page or
+    entity for which no navigation target is documented, remove or rewrite it.
+14. CONDITIONAL PRECISION CHECK — If a step simplifies a complex condition (e.g., drops
+    qualifiers like 'only when', 'unless', 'except', or reduces a multi-part guard to a
+    simpler check), rewrite the step to reproduce the document's exact condition verbatim.
+    Common error: "deletion is blocked when entity has child relations" should be "deletion
+    is blocked only when child assets have other parent relations" per the source.
+15. READ-ONLY CHECK — If a scenario modifies a field that should be immutable after a certain
+    event (e.g., Case Category after creation), remove or rewrite the scenario. A field that
+    is read-only after creation must never appear as the target of a When/And edit step in a
+    post-creation scenario."#;
 
 const GROUP_EXTRACTOR_PREAMBLE: &str = r#"You are an expert document analyst.
 You will receive content extracted from MULTIPLE related documents that describe the same
@@ -307,8 +381,9 @@ Rules:
 3. Capture business rules and validation logic from every document.
 4. Merge overlapping information — do not repeat the same fact from different documents.
 5. Output in a structured format with sections: ACTORS, PROCESSES, BUSINESS_RULES, DATA_ENTITIES,
-   FIELD_SCOPING, LIFECYCLE_PHASES, SETUP_VS_RUNTIME, IMAGE_CONTENT.
-6. Be concise — no more than 900 words.
+   FIELD_SCOPING, LIFECYCLE_PHASES, SETUP_VS_RUNTIME, OPTIONALITY, CARDINALITY,
+   CONDITIONAL_LOGIC, IMMUTABLE_AFTER, IMAGE_CONTENT.
+6. Be concise — no more than 1100 words.
 7. Do not add conversational prose.
 8. If the input contains "=== Embedded Image Descriptions ===" sections, you MUST include a
    dedicated IMAGE_CONTENT section that preserves XML/data structure hierarchies, diagram flows,
@@ -318,12 +393,29 @@ Rules:
    downstream documents. Never merge these two sets.
 10. LIFECYCLE_PHASES: Tag every validation/business rule with its exact lifecycle phase
     (Creation, Edit, Category-change, Status-transition, Deletion) as stated in the source docs.
+    You MUST have explicit source-text evidence for the phase tag you assign. If a rule's
+    lifecycle phase is ambiguous or unstated, do NOT assume Creation — leave it untagged rather
+    than guess. Only tag a rule as applying at Creation when the document text explicitly states so.
 11. SETUP_VS_RUNTIME: Classify each entity or rule as Setup/Configuration or Runtime/Business-object.
     Rules from Setup entities must NOT be attributed to Runtime entities unless explicitly stated.
 12. DOCUMENT VERSION: The input represents the FINAL accepted version of the documents.
     Tracked changes and revision markup have been stripped. If residual revision artefacts
     remain (duplicate sentences, strikethrough markers, inserted/deleted annotations), ignore
-    them and treat only the final text as authoritative."#;
+    them and treat only the final text as authoritative.
+13. OPTIONALITY: For every field on every dialog, form, or data structure across all documents,
+    record whether the document explicitly marks it as Mandatory (M) or Optional (O). If the
+    document does not state that a field is required, classify it as Optional (O). List fields
+    with their classification, e.g.: "Start Date (M), Drawing Type (O), Comment (O)". Fields in
+    FactBoxes or Consumer sections must be listed separately with their own classification.
+14. CARDINALITY: For every repeating element, collection, or relationship endpoint across all
+    documents, capture the exact multiplicity stated (e.g., 0..n, 1..∞, exactly N, 0..1).
+    Reproduce the document's own notation verbatim — do NOT normalise, reinterpret, or change it.
+    If the document says 0..n, record 0..n, never 1..∞.
+15. CONDITIONAL_LOGIC: For every business rule with a condition, guard, or trigger, capture
+    the EXACT condition verbatim from whichever source document states it. Do NOT simplify,
+    generalise, or paraphrase. Preserve every qualifier (only, when, unless, if, except).
+16. IMMUTABILITY: For every field, note if any document states it becomes read-only or immutable
+    after a specific event. Record the trigger. List in a dedicated IMMUTABLE_AFTER subsection."#;
 
 const GROUP_GENERATOR_PREAMBLE: &str = r#"You are an expert business analyst and technical writer.
 You will receive a structured summary synthesised from MULTIPLE related documents that
@@ -347,8 +439,32 @@ Rules:
    dialog section. FactBox, Consumer, and downstream fields belong in separate viewing scenarios.
 10. SETUP vs RUNTIME — Do not apply Setup/Configuration rules to Runtime business objects.
     Runtime editability must reference the documented parameter that controls it.
-11. LIFECYCLE PHASE ACCURACY — Place each validation in the correct lifecycle-phase scenario.
-    Tag scenarios with the phase, e.g.: Scenario: [Creation] ..., Scenario: [Category-change] ..."#;
+11. LIFECYCLE PHASE ACCURACY — Each validation or business rule MUST be placed in a scenario that
+    matches the exact lifecycle phase stated in the document. If no lifecycle phase is explicitly
+    stated for a rule at Creation, do NOT place it in a Creation scenario — this is a hard
+    prohibition, not a guideline. A rule documented only for Category-change or Edit must never
+    appear in a [Creation] scenario under any circumstances. Tag scenarios with the phase, e.g.:
+    Scenario: [Creation] ..., Scenario: [Category-change] ...
+12. DOCUMENT FIDELITY — Only generate steps that are directly grounded in the source documents.
+    Never assume, infer, or invent fields, buttons, UI page names, navigation targets, or
+    business rules not explicitly stated. Do not infer navigation targets or redirect behavior
+    unless the document explicitly names the destination. Do not generalise a validation rule
+    that the document scopes to a specific action or trigger into a universal assertion.
+13. OPTIONALITY — A field the document marks as optional must never appear in a step that asserts
+    it is required or mandatory. If the OPTIONALITY section lists a field as Optional (O), do not
+    assert it as a required input in any scenario step. Do not mix optional and mandatory fields
+    in the same mandatory-fields assertion.
+14. CARDINALITY FIDELITY — Reproduce document cardinality exactly. Do NOT change 0..n to 1..∞.
+    Do NOT hardcode a specific count when the document describes partial processing with a warning
+    — assert the warning message and all-items-attempted behaviour instead. Use the document's
+    own cardinality notation verbatim in any step that references a quantity or multiplicity.
+15. CONDITIONAL PRECISION — When a business rule has a condition, guard, or trigger, reproduce
+    the EXACT condition in the scenario step. Do NOT simplify conditions or drop qualifiers
+    (only, when, unless, if, except). If the document says a validation applies "only when
+    toggling the In-use checkbox", scope the When step to that specific action.
+16. READ-ONLY AWARENESS — If IMMUTABLE_AFTER or lifecycle context indicates a field becomes
+    read-only after a specific event, NEVER generate a scenario that modifies it after that
+    event."#;
 
 const VISION_DESCRIBE_PROMPT: &str = "\
 IMPORTANT: Every image in this document carries business-critical information that MUST be \
@@ -384,7 +500,17 @@ Rules:
 4. Preserve all unique business logic — do not drop scenarios.
 5. Use consistent step wording and naming throughout.
 6. Do not add explanatory prose outside the Gherkin block.
-7. Always end with a blank line after the last Scenario."#;
+7. Always end with a blank line after the last Scenario.
+8. QUALITY PRESERVATION — While merging, apply these checks to every scenario:
+   a) FIELD SCOPING: creation scenarios must only assert fields from the Create/New dialog.
+   b) OPTIONALITY: do not merge optional fields into mandatory-field assertions.
+   c) CARDINALITY: do not alter the cardinality stated in steps (e.g., 0..n must stay 0..n).
+   d) LIFECYCLE PHASE: do not move a scenario to a different lifecycle phase during merge.
+   e) CONDITIONAL PRECISION: preserve exact conditions/qualifiers — do not simplify guards.
+   f) READ-ONLY: if a field is marked as immutable after an event, do not generate edit steps.
+   g) DOCUMENT FIDELITY: do not introduce invented fields, pages, or navigation targets.
+   If a conflict between chunks exists for any of the above, prefer the more restrictive
+   (more faithful to the source document) version."#;
 
 // ─────────────────────────────────────────────
 // Dependency graph preambles
@@ -1063,6 +1189,43 @@ impl AgentOrchestrator {
         }
     }
 
+    /// Build budget-aware context summary, glossary, and compute their combined
+    /// overhead in characters.  Every file in the project context is represented
+    /// proportionally within the model's context cap so no data is silently
+    /// dropped.  Returns `(context_summary, glossary, overhead_chars)`.
+    fn build_bounded_context(
+        &self,
+        context: &ProjectContext,
+        exclude: &std::collections::HashSet<String>,
+    ) -> (String, String, usize) {
+        let gen_budget = self.model_input_budget(&self.generator_model);
+        let (_, context_cap, glossary_cap) = prompt_section_caps(gen_budget);
+
+        let context_summary = if self.rag_indexes.is_empty() {
+            // Split context budget: 2/3 for cross-file summaries, 1/3 for reference data
+            let cross_budget = context_cap * 2 / 3;
+            let ref_budget = context_cap / 3;
+            let mut cs = context.build_summary_excluding(exclude, cross_budget);
+            let ref_summary = context.build_context_only_summary_with_budget(ref_budget);
+            if !ref_summary.is_empty() {
+                cs.push_str("\n\n");
+                cs.push_str(&ref_summary);
+            }
+            cs
+        } else {
+            String::new()
+        };
+
+        let glossary = truncate_for_prompt(
+            &context.build_glossary(),
+            glossary_cap,
+            "[… glossary truncated …]",
+        );
+
+        let overhead = context_summary.len() + glossary.len();
+        (context_summary, glossary, overhead)
+    }
+
     /// Run the pipeline for one file. Stages depend on `self.mode`.
     /// Results are cached by content hash when `force_regenerate` is false.
     /// When RAG dynamic_context indexes are configured, cross-file context is
@@ -1084,21 +1247,9 @@ impl AgentOrchestrator {
         force_regenerate: bool,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
-        // Build LLM cache key from all inputs that affect the output.
-        // When RAG indexes are active, dynamic context is retrieved per-call
-        // and we leave context_summary empty (cache key changes only when
-        // the document itself changes).
-        let context_summary = if self.rag_indexes.is_empty() {
-            let mut cs = context.build_summary();
-            let ref_summary = context.build_context_only_summary();
-            if !ref_summary.is_empty() {
-                cs.push_str("\n\n");
-                cs.push_str(&ref_summary);
-            }
-            cs
-        } else {
-            String::new()
-        };
+        // Budget-aware context: every file gets proportional representation
+        let (context_summary, glossary, context_overhead) =
+            self.build_bounded_context(context, &std::collections::HashSet::new());
         let images_hash = {
             let mut h = sha2::Sha256::new();
             for img in images {
@@ -1144,10 +1295,6 @@ impl AgentOrchestrator {
             &self.generator_model
         };
         let model_budget = self.model_input_budget(budget_model);
-
-        // Pre-compute cross-file context overhead so chunking accounts for it
-        let glossary = context.build_glossary();
-        let context_overhead = context_summary.len() + glossary.len();
 
         // ── Chunk-and-merge path for oversized documents ──
         if needs_chunking(&enriched_text, model_budget, context_overhead) {
@@ -1271,18 +1418,8 @@ impl AgentOrchestrator {
         }
 
         // Phase 2: Generate Gherkin for each chunk, with prior summaries as context hints
-        let glossary = context.build_glossary();
-        let context_summary = if self.rag_indexes.is_empty() {
-            let mut cs = context.build_summary();
-            let ref_summary = context.build_context_only_summary();
-            if !ref_summary.is_empty() {
-                cs.push_str("\n\n");
-                cs.push_str(&ref_summary);
-            }
-            cs
-        } else {
-            String::new()
-        };
+        let (context_summary, glossary, _) =
+            self.build_bounded_context(context, &std::collections::HashSet::new());
         let mut chunk_gherkins: Vec<String> = Vec::with_capacity(n);
 
         for (i, summary) in summaries.iter().enumerate() {
@@ -1343,13 +1480,22 @@ impl AgentOrchestrator {
         ));
 
         let mut combined = String::new();
+        let merge_budget = self.model_input_budget(&self.generator_model);
+        // Give each chunk a proportional share of the merge budget
+        let per_chunk = merge_budget / chunk_gherkins.len().max(1);
         for (i, g) in chunk_gherkins.iter().enumerate() {
-            combined.push_str(&format!(
-                "=== Gherkin from Part {}/{} ===\n{}\n\n",
+            let header = format!(
+                "=== Gherkin from Part {}/{} ===\n",
                 i + 1,
                 chunk_gherkins.len(),
-                g
-            ));
+            );
+            let excerpt: String = g.chars().take(per_chunk.saturating_sub(header.len() + 2)).collect();
+            combined.push_str(&header);
+            combined.push_str(&excerpt);
+            if g.len() > per_chunk {
+                combined.push_str("\n[… truncated …]");
+            }
+            combined.push_str("\n\n");
         }
 
         // Use the generator model for the merge (it's the most capable)
@@ -1440,6 +1586,24 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
+        let model_budget = self.model_input_budget(&self.generator_model);
+        let (summary_cap, context_cap, glossary_cap) = prompt_section_caps(model_budget);
+        let bounded_summary = truncate_for_prompt(
+            summary,
+            summary_cap,
+            "[… structured summary truncated to fit model input budget …]",
+        );
+        let bounded_context_summary = truncate_for_prompt(
+            context_summary,
+            context_cap,
+            "[… cross-file context truncated to fit model input budget …]",
+        );
+        let bounded_glossary = truncate_for_prompt(
+            glossary,
+            glossary_cap,
+            "[… glossary truncated to fit model input budget …]",
+        );
+
         // Try prefix-cached path first (Ollama only — skips recomputing shared prefix attention).
         // When RAG dynamic_context is active, skip prefix cache because it
         // bypasses agent construction and cannot inject retrieved chunks.
@@ -1447,15 +1611,15 @@ impl AgentOrchestrator {
             if let Some(ref cache_mutex) = self.generator_prefix_cache {
                 let num_ctx = context_window_for_model(&self.generator_model);
                 let cache = cache_mutex.lock().await;
-                if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
+                if cache.is_primed_for(GENERATOR_PREAMBLE, &bounded_glossary) {
                     // Build per-file suffix only (glossary is in the cached prefix)
                     let mut suffix = String::new();
-                    if !context_summary.contains("No prior files") && !context_summary.is_empty() {
-                        suffix.push_str(context_summary);
+                    if !bounded_context_summary.contains("No prior files") && !bounded_context_summary.is_empty() {
+                        suffix.push_str(&bounded_context_summary);
                         suffix.push('\n');
                     }
                     suffix.push_str(&format!(
-                        "=== Structured Summary ===\n{summary}\n\n\
+                        "=== Structured Summary ===\n{bounded_summary}\n\n\
                          Generate the Gherkin Feature for document: {file_name}"
                     ));
 
@@ -1474,12 +1638,12 @@ impl AgentOrchestrator {
         // Fallback: multi-turn chat via appropriate backend
         let mut history: Vec<Message> = Vec::new();
 
-        if !glossary.is_empty() {
-            history.push(Message::user(glossary.to_owned()));
+        if !bounded_glossary.is_empty() {
+            history.push(Message::user(bounded_glossary.clone()));
         }
 
-        if !context_summary.contains("No prior files") && !context_summary.is_empty() {
-            history.push(Message::user(context_summary.to_owned()));
+        if !bounded_context_summary.contains("No prior files") && !bounded_context_summary.is_empty() {
+            history.push(Message::user(bounded_context_summary.clone()));
         }
 
         // When RAG indexes are active, fold the structured summary INTO the
@@ -1488,12 +1652,12 @@ impl AgentOrchestrator {
         // RAG the summary stays in a preceding chat-history message.
         let prompt = if !self.rag_indexes.is_empty() {
             format!(
-                "=== Structured Summary ===\n{summary}\n\n\
+                "=== Structured Summary ===\n{bounded_summary}\n\n\
                  Generate the Gherkin Feature for document: {file_name}"
             )
         } else {
             history.push(Message::user(format!(
-                "=== Structured Summary ===\n{summary}"
+                "=== Structured Summary ===\n{bounded_summary}"
             )));
             format!("Generate the Gherkin Feature for document: {file_name}")
         };
@@ -1728,19 +1892,8 @@ impl AgentOrchestrator {
             .cloned()
             .collect();
 
-        let context_summary = if self.rag_indexes.is_empty() {
-            let mut cs = context.build_summary_excluding(&exclude);
-            let ref_summary = context.build_context_only_summary();
-            if !ref_summary.is_empty() {
-                cs.push_str("\n\n");
-                cs.push_str(&ref_summary);
-            }
-            cs
-        } else {
-            String::new()
-        };
-        let glossary = context.build_glossary();
-        let context_overhead = context_summary.len() + glossary.len();
+        let (context_summary, glossary, context_overhead) =
+            self.build_bounded_context(context, &exclude);
 
         // ── Chunk-and-merge path for oversized merged groups ──
         let budget_model = if self.mode == PipelineMode::Full {
@@ -1875,6 +2028,24 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
+        let model_budget = self.model_input_budget(&self.generator_model);
+        let (summary_cap, context_cap, glossary_cap) = prompt_section_caps(model_budget);
+        let bounded_summary = truncate_for_prompt(
+            summary,
+            summary_cap,
+            "[… unified structured summary truncated to fit model input budget …]",
+        );
+        let bounded_context_summary = truncate_for_prompt(
+            context_summary,
+            context_cap,
+            "[… cross-file context truncated to fit model input budget …]",
+        );
+        let bounded_glossary = truncate_for_prompt(
+            glossary,
+            glossary_cap,
+            "[… glossary truncated to fit model input budget …]",
+        );
+
         // Try prefix-cached path first (Ollama only).
         // Skip when RAG dynamic_context is active — same reasoning as generate().
         if self.rag_indexes.is_empty() {
@@ -1889,15 +2060,15 @@ impl AgentOrchestrator {
                 // matching preamble — which means groups fall through to the
                 // rig-core path.  A future optimisation could prime a separate
                 // cache for the group preamble.
-                if cache.is_primed_for(GENERATOR_PREAMBLE, glossary) {
+                if cache.is_primed_for(GENERATOR_PREAMBLE, &bounded_glossary) {
                     // Build suffix with group-specific framing
                     let mut suffix = String::new();
-                    if !context_summary.contains("No prior files") && !context_summary.is_empty() {
-                        suffix.push_str(context_summary);
+                    if !bounded_context_summary.contains("No prior files") && !bounded_context_summary.is_empty() {
+                        suffix.push_str(&bounded_context_summary);
                         suffix.push('\n');
                     }
                     suffix.push_str(&format!(
-                        "=== Unified Structured Summary ===\n{summary}\n\n\
+                        "=== Unified Structured Summary ===\n{bounded_summary}\n\n\
                          Generate a single cohesive Gherkin Feature for document group: {group_name}"
                     ));
 
@@ -1916,23 +2087,23 @@ impl AgentOrchestrator {
         // Fallback: multi-turn chat via appropriate backend
         let mut history: Vec<Message> = Vec::new();
 
-        if !glossary.is_empty() {
-            history.push(Message::user(glossary.to_owned()));
+        if !bounded_glossary.is_empty() {
+            history.push(Message::user(bounded_glossary.clone()));
         }
 
-        if !context_summary.contains("No prior files") && !context_summary.is_empty() {
-            history.push(Message::user(context_summary.to_owned()));
+        if !bounded_context_summary.contains("No prior files") && !bounded_context_summary.is_empty() {
+            history.push(Message::user(bounded_context_summary.clone()));
         }
 
         // Fold summary into prompt when RAG active (same pattern as generate()).
         let prompt = if !self.rag_indexes.is_empty() {
             format!(
-                "=== Unified Structured Summary ===\n{summary}\n\n\
+                "=== Unified Structured Summary ===\n{bounded_summary}\n\n\
                  Generate a single cohesive Gherkin Feature for document group: {group_name}"
             )
         } else {
             history.push(Message::user(format!(
-                "=== Unified Structured Summary ===\n{summary}"
+                "=== Unified Structured Summary ===\n{bounded_summary}"
             )));
             format!("Generate a single cohesive Gherkin Feature for document group: {group_name}")
         };
@@ -2242,18 +2413,9 @@ impl AgentOrchestrator {
         force_regenerate: bool,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
-        // Build cache key — identical to process_file but with "depgraph" discriminator
-        let context_summary = if self.rag_indexes.is_empty() {
-            let mut cs = context.build_summary();
-            let ref_summary = context.build_context_only_summary();
-            if !ref_summary.is_empty() {
-                cs.push_str("\n\n");
-                cs.push_str(&ref_summary);
-            }
-            cs
-        } else {
-            String::new()
-        };
+        // Budget-aware context: every file gets proportional representation
+        let (context_summary, glossary, context_overhead) =
+            self.build_bounded_context(context, &std::collections::HashSet::new());
         let images_hash = {
             let mut h = sha2::Sha256::new();
             for img in images {
@@ -2296,8 +2458,6 @@ impl AgentOrchestrator {
             &self.generator_model
         };
         let model_budget = self.model_input_budget(budget_model);
-        let glossary = context.build_glossary();
-        let context_overhead = context_summary.len() + glossary.len();
 
         // ── Chunk-and-merge path for oversized documents ──
         if needs_chunking(&enriched_text, model_budget, context_overhead) {
@@ -2435,19 +2595,8 @@ impl AgentOrchestrator {
             .cloned()
             .collect();
 
-        let context_summary = if self.rag_indexes.is_empty() {
-            let mut cs = context.build_summary_excluding(&exclude);
-            let ref_summary = context.build_context_only_summary();
-            if !ref_summary.is_empty() {
-                cs.push_str("\n\n");
-                cs.push_str(&ref_summary);
-            }
-            cs
-        } else {
-            String::new()
-        };
-        let glossary = context.build_glossary();
-        let context_overhead = context_summary.len() + glossary.len();
+        let (context_summary, glossary, context_overhead) =
+            self.build_bounded_context(context, &exclude);
 
         // ── Chunk-and-merge path for oversized merged groups ──
         let budget_model = if self.mode == PipelineMode::Full {
@@ -2552,18 +2701,8 @@ impl AgentOrchestrator {
             summaries.push(summary);
         }
 
-        let glossary = context.build_glossary();
-        let context_summary = if self.rag_indexes.is_empty() {
-            let mut cs = context.build_summary();
-            let ref_summary = context.build_context_only_summary();
-            if !ref_summary.is_empty() {
-                cs.push_str("\n\n");
-                cs.push_str(&ref_summary);
-            }
-            cs
-        } else {
-            String::new()
-        };
+        let (context_summary, glossary, _) =
+            self.build_bounded_context(context, &std::collections::HashSet::new());
         let mut chunk_graphs: Vec<String> = Vec::with_capacity(n);
 
         for (i, summary) in summaries.iter().enumerate() {
@@ -2615,24 +2754,42 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
+        let model_budget = self.model_input_budget(&self.generator_model);
+        let (summary_cap, context_cap, glossary_cap) = prompt_section_caps(model_budget);
+        let bounded_summary = truncate_for_prompt(
+            summary,
+            summary_cap,
+            "[… structured summary truncated to fit model input budget …]",
+        );
+        let bounded_context_summary = truncate_for_prompt(
+            context_summary,
+            context_cap,
+            "[… cross-file context truncated to fit model input budget …]",
+        );
+        let bounded_glossary = truncate_for_prompt(
+            glossary,
+            glossary_cap,
+            "[… glossary truncated to fit model input budget …]",
+        );
+
         let mut history: Vec<Message> = Vec::new();
 
-        if !glossary.is_empty() {
-            history.push(Message::user(glossary.to_owned()));
+        if !bounded_glossary.is_empty() {
+            history.push(Message::user(bounded_glossary));
         }
 
-        if !context_summary.contains("No prior files") && !context_summary.is_empty() {
-            history.push(Message::user(context_summary.to_owned()));
+        if !bounded_context_summary.contains("No prior files") && !bounded_context_summary.is_empty() {
+            history.push(Message::user(bounded_context_summary));
         }
 
         let prompt = if !self.rag_indexes.is_empty() {
             format!(
-                "=== Structured Summary ===\n{summary}\n\n\
+                "=== Structured Summary ===\n{bounded_summary}\n\n\
                  Generate the dependency graph JSON for document: {file_name}"
             )
         } else {
             history.push(Message::user(format!(
-                "=== Structured Summary ===\n{summary}"
+                "=== Structured Summary ===\n{bounded_summary}"
             )));
             format!("Generate the dependency graph JSON for document: {file_name}")
         };
@@ -2667,24 +2824,42 @@ impl AgentOrchestrator {
         status_tx: &std::sync::mpsc::Sender<String>,
         cancel_token: &CancellationToken,
     ) -> Result<String> {
+        let model_budget = self.model_input_budget(&self.generator_model);
+        let (summary_cap, context_cap, glossary_cap) = prompt_section_caps(model_budget);
+        let bounded_summary = truncate_for_prompt(
+            summary,
+            summary_cap,
+            "[… unified structured summary truncated to fit model input budget …]",
+        );
+        let bounded_context_summary = truncate_for_prompt(
+            context_summary,
+            context_cap,
+            "[… cross-file context truncated to fit model input budget …]",
+        );
+        let bounded_glossary = truncate_for_prompt(
+            glossary,
+            glossary_cap,
+            "[… glossary truncated to fit model input budget …]",
+        );
+
         let mut history: Vec<Message> = Vec::new();
 
-        if !glossary.is_empty() {
-            history.push(Message::user(glossary.to_owned()));
+        if !bounded_glossary.is_empty() {
+            history.push(Message::user(bounded_glossary));
         }
 
-        if !context_summary.contains("No prior files") && !context_summary.is_empty() {
-            history.push(Message::user(context_summary.to_owned()));
+        if !bounded_context_summary.contains("No prior files") && !bounded_context_summary.is_empty() {
+            history.push(Message::user(bounded_context_summary));
         }
 
         let prompt = if !self.rag_indexes.is_empty() {
             format!(
-                "=== Unified Structured Summary ===\n{summary}\n\n\
+                "=== Unified Structured Summary ===\n{bounded_summary}\n\n\
                  Generate a single unified dependency graph JSON for document group: {group_name}"
             )
         } else {
             history.push(Message::user(format!(
-                "=== Unified Structured Summary ===\n{summary}"
+                "=== Unified Structured Summary ===\n{bounded_summary}"
             )));
             format!("Generate a single unified dependency graph JSON for document group: {group_name}")
         };
@@ -2765,11 +2940,20 @@ impl AgentOrchestrator {
         ));
 
         let mut combined = String::new();
+        let merge_budget = self.model_input_budget(&self.generator_model);
+        let per_chunk = merge_budget / chunk_graphs.len().max(1);
         for (i, g) in chunk_graphs.iter().enumerate() {
-            combined.push_str(&format!(
-                "=== Dependency Graph from Part {}/{} ===\n{}\n\n",
-                i + 1, chunk_graphs.len(), g
-            ));
+            let header = format!(
+                "=== Dependency Graph from Part {}/{} ===\n",
+                i + 1, chunk_graphs.len(),
+            );
+            let excerpt: String = g.chars().take(per_chunk.saturating_sub(header.len() + 2)).collect();
+            combined.push_str(&header);
+            combined.push_str(&excerpt);
+            if g.len() > per_chunk {
+                combined.push_str("\n[… truncated …]");
+            }
+            combined.push_str("\n\n");
         }
 
         let history = vec![Message::user(combined)];
@@ -3052,6 +3236,27 @@ fn snap_to_line_boundary_llm(text: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Truncate text to at most `max_chars` and append a marker when truncated.
+fn truncate_for_prompt(text: &str, max_chars: usize, marker: &str) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(marker.len() + 1);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push('\n');
+    out.push_str(marker);
+    out
+}
+
+/// Compute per-section caps for summary/context/glossary from model budget.
+fn prompt_section_caps(model_budget: usize) -> (usize, usize, usize) {
+    let summary_cap = (model_budget / 2).max(8_000).min(60_000);
+    let context_cap = (model_budget / 3).max(6_000).min(40_000);
+    let glossary_cap = (model_budget / 6).max(2_000).min(16_000);
+    (summary_cap, context_cap, glossary_cap)
 }
 
 // ─────────────────────────────────────────────

@@ -64,16 +64,27 @@ impl ProjectContext {
     ///
     /// The summary lists every file that has already been processed along with a
     /// short excerpt of its raw text so that the model has cross-file awareness.
+    /// Budget-aware: distributes `budget` chars proportionally across files so
+    /// that ALL files are represented even when there are many.  Pass `0` to
+    /// fall back to the unbounded (legacy) behaviour.
     pub fn build_summary(&self) -> String {
-        self.build_summary_excluding(&HashSet::new())
+        self.build_summary_excluding(&HashSet::new(), 0)
+    }
+
+    /// Convenience wrapper with a character budget.
+    pub fn build_summary_with_budget(&self, budget: usize) -> String {
+        self.build_summary_excluding(&HashSet::new(), budget)
     }
 
     /// Build a compact summary, excluding files whose path string is in `exclude`.
     ///
     /// Used by group processing to avoid injecting the group's own members as
     /// cross-file context (they are already in the merged prompt).
-    pub fn build_summary_excluding(&self, exclude: &HashSet<String>) -> String {
-        let included: HashMap<&String, &FileContent> = self
+    /// When `budget > 0`, each file receives a proportional share so all files
+    /// are represented.  When `budget == 0`, the full raw text is included
+    /// (legacy behaviour kept for cache-key hashing and backwards compat).
+    pub fn build_summary_excluding(&self, exclude: &HashSet<String>, budget: usize) -> String {
+        let included: Vec<(&String, &FileContent)> = self
             .file_contents
             .iter()
             .filter(|(path, _)| !exclude.contains(path.as_str()))
@@ -83,19 +94,52 @@ impl ProjectContext {
             return "No prior files have been processed yet.".to_string();
         }
 
-        let mut summary = String::from("=== Cross-file project context ===\n\n");
+        let header = "=== Cross-file project context ===\n\n";
+
+        // Entity block overhead
+        let entity_block: String = if self.entities.is_empty() {
+            String::new()
+        } else {
+            let mut eb = String::from("Known entities / actors / systems across all files:\n");
+            for e in &self.entities {
+                eb.push_str(&format!("  - {}\n", e));
+            }
+            eb
+        };
+
+        // Budget-aware path: give each file a proportional share
+        if budget > 0 {
+            let overhead = header.len() + entity_block.len();
+            let available = budget.saturating_sub(overhead);
+            // Per-file header: "File: <path>\nType: <type>\nContent:\n" ≈ 40 + path + type
+            let per_file_header_est = 40_usize;
+            let per_file = (available / included.len().max(1)).saturating_sub(per_file_header_est);
+
+            let mut summary = String::from(header);
+            for (path, content) in &included {
+                summary.push_str(&format!("File: {}\nType: {}\n", path, content.file_type));
+                let chars: usize = content.raw_text.chars().count();
+                if per_file == 0 {
+                    // At least mention the file exists
+                    summary.push_str("[content omitted — budget exhausted]\n\n");
+                } else if chars <= per_file {
+                    summary.push_str(&format!("Content:\n{}\n\n", content.raw_text));
+                } else {
+                    let excerpt: String = content.raw_text.chars().take(per_file).collect();
+                    summary.push_str(&format!("Content:\n{}\n[… truncated …]\n\n", excerpt));
+                }
+            }
+            summary.push_str(&entity_block);
+            return summary;
+        }
+
+        // Unbounded path (budget == 0): include full raw text
+        let mut summary = String::from(header);
         for (path, content) in &included {
             summary.push_str(&format!("File: {}\nType: {}\n", path, content.file_type));
             summary.push_str(&format!("Content:\n{}\n\n", content.raw_text));
         }
-
-        if !self.entities.is_empty() {
-            summary.push_str("Known entities / actors / systems across all files:\n");
-            for e in &self.entities {
-                summary.push_str(&format!("  - {}\n", e));
-            }
-        }
-
+        summary.push_str(&entity_block);
         summary
     }
 
@@ -103,7 +147,13 @@ impl ProjectContext {
     ///
     /// Injected into every primary-file prompt so the LLM sees reference data
     /// without attempting to generate Gherkin for it.
+    /// When `budget > 0`, each file receives a proportional share.
     pub fn build_context_only_summary(&self) -> String {
+        self.build_context_only_summary_with_budget(0)
+    }
+
+    /// Budget-aware version of `build_context_only_summary`.
+    pub fn build_context_only_summary_with_budget(&self, budget: usize) -> String {
         let ctx_files: Vec<&FileContent> = self
             .file_contents
             .values()
@@ -112,9 +162,44 @@ impl ProjectContext {
         if ctx_files.is_empty() {
             return String::new();
         }
-        let mut summary = String::from(
-            "=== REFERENCE DATA (Excel / Visio — do NOT generate scenarios for these) ===\n\n",
-        );
+        let header =
+            "=== REFERENCE DATA (Excel / Visio — do NOT generate scenarios for these) ===\n\n";
+
+        if budget > 0 {
+            let available = budget.saturating_sub(header.len());
+            let per_file_header_est = 40_usize;
+            let per_file = (available / ctx_files.len().max(1)).saturating_sub(per_file_header_est);
+
+            let mut summary = String::from(header);
+            for fc in &ctx_files {
+                let name = fc
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if per_file == 0 {
+                    summary.push_str(&format!(
+                        "--- Reference: {} ({}) ---\n[content omitted — budget exhausted]\n\n",
+                        name, fc.file_type
+                    ));
+                } else if fc.raw_text.chars().count() <= per_file {
+                    summary.push_str(&format!(
+                        "--- Reference: {} ({}) ---\n{}\n\n",
+                        name, fc.file_type, fc.raw_text
+                    ));
+                } else {
+                    let excerpt: String = fc.raw_text.chars().take(per_file).collect();
+                    summary.push_str(&format!(
+                        "--- Reference: {} ({}) ---\n{}\n[… truncated …]\n\n",
+                        name, fc.file_type, excerpt
+                    ));
+                }
+            }
+            return summary;
+        }
+
+        // Unbounded path: full raw text
+        let mut summary = String::from(header);
         for fc in &ctx_files {
             let name = fc
                 .path
