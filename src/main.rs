@@ -19,11 +19,13 @@ mod context;
 mod depgraph;
 mod gherkin;
 mod llm;
+mod markdown;
 mod memory;
 mod openspec;
 mod parser;
 mod rag;
 mod session;
+mod tech_stack;
 
 /// Initialise structured tracing with `EnvFilter` and optional OTEL export.
 ///

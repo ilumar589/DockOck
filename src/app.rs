@@ -201,6 +201,18 @@ pub enum ProcessingEvent {
         graph: crate::depgraph::DependencyGraph,
         elapsed: std::time::Duration,
     },
+    /// A single file has been fully processed — markdown knowledge-base mode
+    MarkdownResult {
+        path: PathBuf,
+        markdown: String,
+        elapsed: std::time::Duration,
+    },
+    /// A group of files has been fully processed — markdown knowledge-base mode
+    GroupMarkdownResult {
+        group_name: String,
+        markdown: String,
+        elapsed: std::time::Duration,
+    },
 }
 
 // ─────────────────────────────────────────────
@@ -225,6 +237,8 @@ enum Selection {
     Group(String),
     /// The merged/combined dependency graph
     MergedDepGraph,
+    /// The auto-generated Markdown project index
+    ProjectIndex,
 }
 
 /// Main application state owned by the egui event loop.
@@ -333,6 +347,20 @@ pub struct DockOckApp {
     merged_depgraph: Option<crate::depgraph::DependencyGraph>,
     /// Previous merged depgraph for diffing
     previous_merged_depgraph: Option<crate::depgraph::DependencyGraph>,
+    /// Generated markdown knowledge-base documents keyed by file path
+    markdown_results: HashMap<PathBuf, String>,
+    /// Generated markdown knowledge-base documents for file groups, keyed by group name
+    group_markdown_results: HashMap<String, String>,
+    /// Previous markdown results for diffing
+    previous_markdown_results: HashMap<PathBuf, String>,
+    /// Previous group markdown results for diffing
+    previous_group_markdown_results: HashMap<String, String>,
+    /// Loaded tech stack configurations from tech_stacks.json
+    tech_stack_config: crate::tech_stack::TechStackConfig,
+    /// Currently selected tech stack key (for Markdown mode)
+    selected_tech_stack: Option<String>,
+    /// Auto-generated project-wide knowledge-base index (Markdown mode)
+    markdown_project_index: Option<String>,
 }
 
 impl DockOckApp {
@@ -408,6 +436,24 @@ impl DockOckApp {
             previous_group_depgraph_results: HashMap::new(),
             merged_depgraph: None,
             previous_merged_depgraph: None,
+            markdown_results: HashMap::new(),
+            group_markdown_results: HashMap::new(),
+            previous_markdown_results: HashMap::new(),
+            previous_group_markdown_results: HashMap::new(),
+            tech_stack_config: {
+                let exe_dir = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let dirs: Vec<std::path::PathBuf> =
+                    exe_dir.into_iter().chain(std::iter::once(cwd)).collect();
+                dirs.iter()
+                    .map(|d| crate::tech_stack::TechStackConfig::load(d))
+                    .find(|c| !c.stacks.is_empty())
+                    .unwrap_or_else(|| crate::tech_stack::TechStackConfig { stacks: std::collections::HashMap::new() })
+            },
+            selected_tech_stack: None,
+            markdown_project_index: None,
         }
     }
 
@@ -530,6 +576,11 @@ impl DockOckApp {
         self.cancel_token = CancellationToken::new();
         self.file_groups.clear();
         self.openspec_results.clear();
+        self.markdown_results.clear();
+        self.group_markdown_results.clear();
+        self.previous_markdown_results.clear();
+        self.previous_group_markdown_results.clear();
+        self.markdown_project_index = None;
         if let Ok(mut ctx) = self.context.lock() {
             ctx.clear();
         }
@@ -709,6 +760,16 @@ impl DockOckApp {
             previous_group_depgraph_results: self.previous_group_depgraph_results.clone(),
             merged_depgraph: self.merged_depgraph.clone(),
             previous_merged_depgraph: self.previous_merged_depgraph.clone(),
+            markdown_results: self.markdown_results.iter()
+                .map(|(p, md)| (p.to_string_lossy().to_string(), md.clone()))
+                .collect(),
+            group_markdown_results: self.group_markdown_results.clone(),
+            previous_markdown_results: self.previous_markdown_results.iter()
+                .map(|(p, md)| (p.to_string_lossy().to_string(), md.clone()))
+                .collect(),
+            previous_group_markdown_results: self.previous_group_markdown_results.clone(),
+            selected_tech_stack: self.selected_tech_stack.clone(),
+            markdown_project_index: self.markdown_project_index.clone(),
         }
     }
 
@@ -760,15 +821,27 @@ impl DockOckApp {
         self.previous_group_depgraph_results = data.previous_group_depgraph_results;
         self.merged_depgraph = data.merged_depgraph;
         self.previous_merged_depgraph = data.previous_merged_depgraph;
+        self.markdown_results = data.markdown_results.into_iter()
+            .map(|(k, v)| (PathBuf::from(k), v))
+            .collect();
+        self.group_markdown_results = data.group_markdown_results;
+        self.previous_markdown_results = data.previous_markdown_results.into_iter()
+            .map(|(k, v)| (PathBuf::from(k), v))
+            .collect();
+        self.previous_group_markdown_results = data.previous_group_markdown_results;
+        self.selected_tech_stack = data.selected_tech_stack;
+        self.markdown_project_index = data.markdown_project_index;
         if !self.results.is_empty() || !self.group_results.is_empty()
             || !self.depgraph_results.is_empty() || !self.group_depgraph_results.is_empty()
             || self.merged_depgraph.is_some()
+            || !self.markdown_results.is_empty() || !self.group_markdown_results.is_empty()
         {
             self.state = AppState::Done;
         }
         let file_count = self.selected_files.len();
         let result_count = self.results.len() + self.group_results.len()
-            + self.depgraph_results.len() + self.group_depgraph_results.len();
+            + self.depgraph_results.len() + self.group_depgraph_results.len()
+            + self.markdown_results.len() + self.group_markdown_results.len();
         self.log(
             LogLevel::Success,
             format!("Session restored: {} files, {} results", file_count, result_count),
@@ -785,6 +858,7 @@ impl DockOckApp {
                 .map(|p| p.to_string_lossy().to_string()),
             Some(Selection::Group(name)) => Some(name.clone()),
             Some(Selection::MergedDepGraph) => Some("__merged_depgraph__".to_string()),
+            Some(Selection::ProjectIndex) => Some("__project_index__".to_string()),
             None => None,
         }
     }
@@ -803,11 +877,15 @@ impl DockOckApp {
         self.previous_depgraph_results = self.depgraph_results.clone();
         self.previous_group_depgraph_results = self.group_depgraph_results.clone();
         self.previous_merged_depgraph = self.merged_depgraph.clone();
+        self.previous_markdown_results = self.markdown_results.clone();
+        self.previous_group_markdown_results = self.group_markdown_results.clone();
         self.results.clear();
         self.group_results.clear();
         self.depgraph_results.clear();
         self.group_depgraph_results.clear();
         self.merged_depgraph = None;
+        self.markdown_results.clear();
+        self.group_markdown_results.clear();
         self.elapsed_times.clear();
         self.group_elapsed_times.clear();
         self.failed_items.clear();
@@ -869,6 +947,11 @@ impl DockOckApp {
         let cancel_token = self.cancel_token.clone();
         let custom_providers = self.custom_providers.clone();
         let output_mode = self.output_mode;
+        let tech_stack_prompt = self
+            .selected_tech_stack
+            .as_ref()
+            .and_then(|key| self.tech_stack_config.stacks.get(key))
+            .map(|stack| stack.to_prompt_block());
 
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
@@ -877,7 +960,9 @@ impl DockOckApp {
                 gen_model, ext_model, rev_model, vis_model,
                 mode, output_mode,
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
-                cache, force_regenerate, embedding_choice, custom_providers, tx, cancel_token,
+                cache, force_regenerate, embedding_choice, custom_providers,
+                tech_stack_prompt,
+                tx, cancel_token,
             ));
         });
     }
@@ -1215,6 +1300,42 @@ impl DockOckApp {
                     self.group_elapsed_times.insert(group_name.clone(), elapsed);
                     self.group_depgraph_results.insert(group_name, graph);
                 }
+                ProcessingEvent::MarkdownResult { path, markdown, elapsed } => {
+                    self.progress.0 += 1;
+                    let secs = elapsed.as_secs_f64();
+                    let elapsed_str = if secs >= 60.0 {
+                        format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                    } else {
+                        format!("{:.1}s", secs)
+                    };
+                    self.log(LogLevel::Success, format!(
+                        "✓ Generated markdown for: {} ({}/{}) in {}",
+                        path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+                        self.progress.0,
+                        self.progress.1,
+                        elapsed_str,
+                    ));
+                    self.elapsed_times.insert(path.clone(), elapsed);
+                    self.markdown_results.insert(path, markdown);
+                }
+                ProcessingEvent::GroupMarkdownResult { group_name, markdown, elapsed } => {
+                    self.progress.0 += 1;
+                    let secs = elapsed.as_secs_f64();
+                    let elapsed_str = if secs >= 60.0 {
+                        format!("{:.0}m {:.0}s", (secs / 60.0).floor(), secs % 60.0)
+                    } else {
+                        format!("{:.1}s", secs)
+                    };
+                    self.log(LogLevel::Success, format!(
+                        "✓ Generated markdown for group: {} ({}/{}) in {}",
+                        group_name,
+                        self.progress.0,
+                        self.progress.1,
+                        elapsed_str,
+                    ));
+                    self.group_elapsed_times.insert(group_name.clone(), elapsed);
+                    self.group_markdown_results.insert(group_name, markdown);
+                }
                 ProcessingEvent::Done(result) => {
                     match result {
                         Ok(()) => {
@@ -1244,6 +1365,29 @@ impl DockOckApp {
                                     ));
                                     self.merged_depgraph = Some(merged);
                                     self.selection = Some(Selection::MergedDepGraph);
+                                }
+                            }
+                            // Build project index when in markdown mode
+                            if self.output_mode == crate::llm::OutputMode::Markdown {
+                                let mut docs = std::collections::HashMap::new();
+                                for (p, md) in &self.markdown_results {
+                                    let name = p.file_name()
+                                        .map(|n| n.to_string_lossy().to_string())
+                                        .unwrap_or_default();
+                                    docs.insert(name.clone(), crate::markdown::MarkdownDocument::parse_from_llm_output(md, &name));
+                                }
+                                for (name, md) in &self.group_markdown_results {
+                                    docs.insert(name.clone(), crate::markdown::MarkdownDocument::parse_from_llm_output(md, name));
+                                }
+                                if !docs.is_empty() {
+                                    let index = crate::markdown::generate_project_index(&docs);
+                                    let index_md = index.to_markdown_string();
+                                    self.log(LogLevel::Success, format!(
+                                        "📑 Project index: {} documents catalogued",
+                                        docs.len(),
+                                    ));
+                                    self.markdown_project_index = Some(index_md);
+                                    self.selection = Some(Selection::ProjectIndex);
                                 }
                             }
                             self.auto_save_session();
@@ -1507,6 +1651,27 @@ impl DockOckApp {
                         ui.selectable_value(&mut self.output_mode, mode, mode.to_string());
                     }
                 });
+            // Tech stack selector — only visible in Markdown mode
+            if self.output_mode == crate::llm::OutputMode::Markdown && !self.tech_stack_config.stacks.is_empty() {
+                ui.label("Stack:");
+                let current_label = self.selected_tech_stack.as_ref()
+                    .map(|k| self.tech_stack_config.display_name(k))
+                    .unwrap_or_else(|| "None (generic)".to_string());
+                egui::ComboBox::from_id_salt("tech_stack_combo")
+                    .selected_text(&current_label)
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(self.selected_tech_stack.is_none(), "None (generic)").clicked() {
+                            self.selected_tech_stack = None;
+                        }
+                        for key in self.tech_stack_config.stack_keys() {
+                            let name = self.tech_stack_config.display_name(&key);
+                            let selected = self.selected_tech_stack.as_deref() == Some(&key);
+                            if ui.selectable_label(selected, &name).clicked() {
+                                self.selected_tech_stack = Some(key.clone());
+                            }
+                        }
+                    });
+            }
             ui.label("∥");
             ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0).max_decimals(0).update_while_editing(false))
                 .on_hover_text("Max concurrent LLM tasks");
@@ -1623,7 +1788,8 @@ impl DockOckApp {
                 for (gi, group) in self.file_groups.iter().enumerate() {
                     let group_selected = self.selection == Some(Selection::Group(group.name.clone()));
                     let has_group_result = self.group_results.contains_key(&group.name)
-                        || self.group_depgraph_results.contains_key(&group.name);
+                        || self.group_depgraph_results.contains_key(&group.name)
+                        || self.group_markdown_results.contains_key(&group.name);
                     let has_group_failed = self.failed_groups.contains_key(&group.name);
 
                     let header_label = if has_group_result {
@@ -1759,6 +1925,19 @@ impl DockOckApp {
                     }
                 }
 
+                // ── Markdown Project Index entry ──
+                if self.markdown_project_index.is_some() {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    let selected = self.selection == Some(Selection::ProjectIndex);
+                    let label = egui::RichText::new("📑 Project Index")
+                        .strong()
+                        .color(egui::Color32::from_rgb(100, 200, 255));
+                    if ui.selectable_label(selected, label).clicked() {
+                        self.selection = Some(Selection::ProjectIndex);
+                    }
+                }
+
                 // ── Render ungrouped files ──
                 if self.selected_files.iter().any(|p| !grouped_paths.contains(p)) {
                     ui.add_space(4.0);
@@ -1787,7 +1966,8 @@ impl DockOckApp {
                     let is_context = file_role == crate::parser::FileRole::Context;
 
                     let has_result = self.results.contains_key(path)
-                        || self.depgraph_results.contains_key(path);
+                        || self.depgraph_results.contains_key(path)
+                        || self.markdown_results.contains_key(path);
                     let has_failed = self.failed_items.contains_key(path);
                     let selected = self.selection == Some(Selection::File(i));
 
@@ -1911,6 +2091,10 @@ impl DockOckApp {
     fn render_right_panel(&mut self, ui: &mut egui::Ui) {
         if self.output_mode == crate::llm::OutputMode::DependencyGraph {
             self.render_right_panel_depgraph(ui);
+            return;
+        }
+        if self.output_mode == crate::llm::OutputMode::Markdown {
+            self.render_right_panel_markdown(ui);
             return;
         }
 
@@ -2438,6 +2622,231 @@ impl DockOckApp {
         }
     }
 
+    fn render_right_panel_markdown(&mut self, ui: &mut egui::Ui) {
+        ui.heading("📝 Markdown Knowledge Base");
+        ui.separator();
+
+        // Determine which markdown to show based on current selection
+        let (markdown_text, prev_text, label) = match &self.selection {
+            Some(Selection::ProjectIndex) => {
+                (self.markdown_project_index.clone(), None, "Project Index".to_string())
+            }
+            Some(Selection::File(idx)) => {
+                let path = self.selected_files.get(*idx).cloned();
+                if let Some(ref p) = path {
+                    let md = self.markdown_results.get(p).cloned();
+                    let prev = self.previous_markdown_results.get(p).cloned();
+                    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    (md, prev, name)
+                } else {
+                    (None, None, String::new())
+                }
+            }
+            Some(Selection::Group(name)) => {
+                let md = self.group_markdown_results.get(name).cloned();
+                let prev = self.previous_group_markdown_results.get(name).cloned();
+                (md, prev, name.clone())
+            }
+            _ => {
+                // No specific selection — pick first available result
+                if let Some((p, md)) = self.markdown_results.iter().next() {
+                    let prev = self.previous_markdown_results.get(p).cloned();
+                    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    (Some(md.clone()), prev, name)
+                } else if let Some((name, md)) = self.group_markdown_results.iter().next() {
+                    let prev = self.previous_group_markdown_results.get(name).cloned();
+                    (Some(md.clone()), prev, name.clone())
+                } else {
+                    (None, None, String::new())
+                }
+            }
+        };
+
+        match markdown_text {
+            Some(md) => {
+                // ── Button bar ──
+                ui.horizontal(|ui| {
+                    if ui.button("📋 Copy").clicked() {
+                        ui.ctx().copy_text(md.clone());
+                        self.toast = Some(("Copied Markdown to clipboard".to_string(), 2.0));
+                    }
+                    let can_save = self.output_dir.is_some();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("💾 Save"))
+                        .on_hover_text(if can_save { "Save markdown file" } else { "Set output directory first" })
+                        .clicked()
+                    {
+                        self.save_selected_markdown();
+                    }
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("💾 Save All"))
+                        .on_hover_text(if can_save { "Save all markdown files" } else { "Set output directory first" })
+                        .clicked()
+                    {
+                        self.save_all_markdown_files();
+                    }
+                    // ── Diff toggle ──
+                    if prev_text.is_some() {
+                        ui.separator();
+                        let diff_label = if self.show_diff { "📊 Hide Diff" } else { "📊 Show Diff" };
+                        if ui.button(diff_label).on_hover_text("Compare with previous generation").clicked() {
+                            self.show_diff = !self.show_diff;
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+                if !label.is_empty() {
+                    ui.label(egui::RichText::new(&label).strong().size(14.0));
+                    ui.add_space(4.0);
+                }
+
+                egui::ScrollArea::vertical()
+                    .id_salt("markdown_scroll")
+                    .show(ui, |ui| {
+                        // Show diff if toggled
+                        if self.show_diff {
+                            if let Some(ref prev) = prev_text {
+                                let diff = crate::session::diff_gherkin(prev, &md);
+                                if diff.is_empty() {
+                                    ui.label("No changes detected.");
+                                } else {
+                                    ui.label(egui::RichText::new("Changes from previous run:").strong());
+                                    ui.add_space(4.0);
+                                    for line in &diff {
+                                        match line {
+                                            crate::session::DiffLine::Unchanged(s) => {
+                                                ui.monospace(s);
+                                            }
+                                            crate::session::DiffLine::Added(s) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(80, 200, 80),
+                                                    egui::RichText::new(format!("+ {}", s)).monospace(),
+                                                );
+                                            }
+                                            crate::session::DiffLine::Removed(s) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 80, 80),
+                                                    egui::RichText::new(format!("- {}", s)).monospace(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                }
+                            }
+                        }
+
+                        ui.add(
+                            egui::TextEdit::multiline(&mut md.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY),
+                        );
+                    });
+            }
+            None => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    if self.selected_files.is_empty() {
+                        ui.label("Add files using the ➕ button and click Generate.");
+                    } else if self.state == AppState::Processing {
+                        ui.label("⏳ Processing files…");
+                        ui.spinner();
+                    } else {
+                        ui.label("Generated Markdown will appear here. Select a file and click Generate.");
+                    }
+                });
+            }
+        }
+    }
+
+    /// Save the currently selected markdown document to the output directory.
+    fn save_selected_markdown(&mut self) {
+        let dir = match &self.output_dir {
+            Some(d) => d.clone(),
+            None => {
+                self.log(LogLevel::Warning, "No output directory selected. Please choose one first.");
+                return;
+            }
+        };
+        // Clone selection data upfront to avoid borrow conflicts
+        let save_info: Option<(String, String)> = match &self.selection {
+            Some(Selection::File(idx)) => {
+                self.selected_files.get(*idx).cloned().and_then(|path| {
+                    self.markdown_results.get(&path).map(|md| {
+                        let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "output".to_string());
+                        (stem, md.clone())
+                    })
+                })
+            }
+            Some(Selection::Group(name)) => {
+                self.group_markdown_results.get(name).map(|md| (name.clone(), md.clone()))
+            }
+            _ => None,
+        };
+        if let Some((stem, md)) = save_info {
+            let out_path = dir.join(format!("{}.md", stem));
+            match std::fs::write(&out_path, md) {
+                Ok(()) => {
+                    self.log(LogLevel::Success, format!("Saved: {}", out_path.display()));
+                    self.toast = Some((format!("Saved {}.md", stem), 3.0));
+                }
+                Err(e) => self.log(LogLevel::Error, format!("Failed to save {}: {}", out_path.display(), e)),
+            }
+        }
+    }
+
+    /// Save all generated markdown files to the output directory.
+    fn save_all_markdown_files(&mut self) {
+        let dir = match &self.output_dir {
+            Some(d) => d.clone(),
+            None => {
+                self.log(LogLevel::Warning, "No output directory selected. Please choose one first.");
+                return;
+            }
+        };
+        if self.markdown_results.is_empty() && self.group_markdown_results.is_empty() {
+            self.log(LogLevel::Warning, "No generated Markdown to save.");
+            return;
+        }
+        let mut count = 0usize;
+        let file_pairs: Vec<_> = self.markdown_results.iter().map(|(p, md)| (p.clone(), md.clone())).collect();
+        let group_pairs: Vec<_> = self.group_markdown_results.iter().map(|(n, md)| (n.clone(), md.clone())).collect();
+        for (path, md) in &file_pairs {
+            let stem = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "output".to_string());
+            let out_path = dir.join(format!("{}.md", stem));
+            match std::fs::write(&out_path, md) {
+                Ok(()) => {
+                    self.log(LogLevel::Success, format!("Saved: {}", out_path.display()));
+                    count += 1;
+                }
+                Err(e) => self.log(LogLevel::Error, format!("Failed to save {}: {}", out_path.display(), e)),
+            }
+        }
+        for (name, md) in &group_pairs {
+            let out_path = dir.join(format!("{}.md", name));
+            match std::fs::write(&out_path, md) {
+                Ok(()) => {
+                    self.log(LogLevel::Success, format!("Saved: {}", out_path.display()));
+                    count += 1;
+                }
+                Err(e) => self.log(LogLevel::Error, format!("Failed to save {}: {}", out_path.display(), e)),
+            }
+        }
+        // Save the project index
+        if let Some(ref index_md) = self.markdown_project_index {
+            let out_path = dir.join("_INDEX.md");
+            match std::fs::write(&out_path, index_md) {
+                Ok(()) => {
+                    self.log(LogLevel::Success, format!("Saved: {}", out_path.display()));
+                    count += 1;
+                }
+                Err(e) => self.log(LogLevel::Error, format!("Failed to save {}: {}", out_path.display(), e)),
+            }
+        }
+        self.toast = Some((format!("Saved {} markdown files", count), 3.0));
+    }
+
     fn render_bottom_bar(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.horizontal(|ui| {
@@ -2447,6 +2856,7 @@ impl DockOckApp {
             let generate_label = match self.output_mode {
                 crate::llm::OutputMode::Gherkin => "⚙ Generate Gherkin",
                 crate::llm::OutputMode::DependencyGraph => "⚙ Generate Dep Graph",
+                crate::llm::OutputMode::Markdown => "⚙ Generate Markdown",
             };
             if ui
                 .add_enabled(
@@ -2630,6 +3040,7 @@ async fn process_files(
     force_regenerate: bool,
     embedding_choice: crate::rag::EmbeddingChoice,
     custom_providers: Vec<crate::llm::CustomProviderConfig>,
+    tech_stack_prompt: Option<String>,
     tx: Sender<ProcessingEvent>,
     cancel_token: CancellationToken,
 ) {
@@ -2675,6 +3086,7 @@ async fn process_files(
     ));
     let mut orchestrator_mut = orchestrator;
     orchestrator_mut.set_custom_configs(custom_providers);
+    orchestrator_mut.tech_stack_prompt = tech_stack_prompt;
     let mut orchestrator = Arc::new(orchestrator_mut);
     let warmup_orch = Arc::clone(&orchestrator);
     let warmup_handle = tokio::spawn(async move {
@@ -2822,6 +3234,7 @@ async fn process_files(
             let preamble = match output_mode {
                 crate::llm::OutputMode::Gherkin => crate::llm::GENERATOR_PREAMBLE,
                 crate::llm::OutputMode::DependencyGraph => crate::llm::DEPGRAPH_GENERATOR_PREAMBLE,
+                crate::llm::OutputMode::Markdown => crate::llm::MARKDOWN_GENERATOR_PREAMBLE,
             };
             let _ = tx.send(ProcessingEvent::Status(
                 "⚡ Priming generator KV-cache prefix…".to_string(),
@@ -3205,6 +3618,32 @@ async fn process_files(
                             }
                         }
                     }
+                    crate::llm::OutputMode::Markdown => {
+                        let result = orch
+                            .process_file_markdown(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
+                            .await;
+
+                        drop(status_tx);
+                        let _ = fwd.join();
+
+                        let elapsed = file_start.elapsed();
+                        match result {
+                            Ok(raw_md) => {
+                                let _ = tx.send(ProcessingEvent::MarkdownResult {
+                                    path: member_path,
+                                    markdown: raw_md,
+                                    elapsed,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ProcessingEvent::Status(format!(
+                                    "⚠ Pipeline error for {}: {}",
+                                    file_name, e
+                                )));
+                                let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(member_path.clone()), error: format!("{e}") });
+                            }
+                        }
+                    }
                 }
             });
             continue;
@@ -3284,7 +3723,7 @@ async fn process_files(
                         }
                     }
                 }
-                crate::llm::OutputMode::DependencyGraph => {
+                    crate::llm::OutputMode::DependencyGraph => {
                     let result = orch
                         .process_group_depgraph(&group_name, &members_ref, &ctx, &status_tx, force_regen, &child_token)
                         .await;
@@ -3299,6 +3738,32 @@ async fn process_files(
                             let _ = tx.send(ProcessingEvent::GroupDepGraphResult {
                                 group_name,
                                 graph,
+                                elapsed,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Pipeline error for group {}: {}",
+                                group_name, e
+                            )));
+                            let _ = tx.send(ProcessingEvent::ItemFailed { name: group_name.clone(), path: None, error: format!("{e}") });
+                        }
+                    }
+                }
+                crate::llm::OutputMode::Markdown => {
+                    let result = orch
+                        .process_group_markdown(&group_name, &members_ref, &ctx, &status_tx, force_regen, &child_token)
+                        .await;
+
+                    drop(status_tx);
+                    let _ = fwd.join();
+
+                    let elapsed = group_start.elapsed();
+                    match result {
+                        Ok(raw_md) => {
+                            let _ = tx.send(ProcessingEvent::GroupMarkdownResult {
+                                group_name,
+                                markdown: raw_md,
                                 elapsed,
                             });
                         }
@@ -3430,6 +3895,32 @@ async fn process_files(
                             let _ = tx.send(ProcessingEvent::DepGraphResult {
                                 path: path.clone(),
                                 graph,
+                                elapsed: file_elapsed,
+                            });
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Pipeline error for {}: {}",
+                                file_name, e
+                            )));
+                            let _ = tx.send(ProcessingEvent::ItemFailed { name: file_name.clone(), path: Some(path.clone()), error: format!("{e}") });
+                        }
+                    }
+                }
+                crate::llm::OutputMode::Markdown => {
+                    let result = orch
+                        .process_file_markdown(&file_name, &file_type, &raw_text, &images, &ctx, &status_tx, force_regen, &child_token)
+                        .await;
+
+                    drop(status_tx);
+                    let _ = fwd.join();
+
+                    let file_elapsed = file_start.elapsed();
+                    match result {
+                        Ok(raw_md) => {
+                            let _ = tx.send(ProcessingEvent::MarkdownResult {
+                                path: path.clone(),
+                                markdown: raw_md,
                                 elapsed: file_elapsed,
                             });
                         }

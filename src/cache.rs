@@ -184,3 +184,4 @@ pub const NS_LLM: &str = "llm";
 pub const NS_OPENSPEC: &str = "openspec";
 pub const NS_EMBEDDING: &str = "embedding";
 pub const NS_DEPGRAPH: &str = "depgraph";
+pub const NS_MARKDOWN: &str = "markdown";

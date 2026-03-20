@@ -1,0 +1,50 @@
+{
+  "stacks": {
+    "dotnet-react-pg": {
+      "name": "AdComms Standard",
+      "description": "Enterprise .NET + React + PostgreSQL stack",
+      "layers": {
+        "backend_api": {
+          "technology": ".NET",
+          "version": "10",
+          "language": "C#",
+          "framework": "ASP.NET Core Minimal API",
+          "orm": "Entity Framework Core",
+          "patterns": ["Clean Architecture", "CQRS", "MediatR", "Repository Pattern"]
+        },
+        "frontend_spa": {
+          "technology": "React",
+          "version": "18/19",
+          "bundler": "Vite 6.x",
+          "styling": "Tailwind CSS v4",
+          "component_library": "shadcn/ui",
+          "state_management": "TanStack Query + Zustand",
+          "language": "TypeScript"
+        },
+        "database": {
+          "technology": "PostgreSQL",
+          "version": "16",
+          "migration_tool": "EF Core Migrations",
+          "sql_dialect": "PostgreSQL"
+        },
+        "cache": {
+          "technology": "Redis",
+          "version": "7.x / 8.x",
+          "usage": ["Session store", "Distributed cache", "Rate limiting"]
+        },
+        "identity": {
+          "technology": "Keycloak",
+          "version": "26.x",
+          "protocol": "OpenID Connect / OAuth 2.0",
+          "integration": "Microsoft.AspNetCore.Authentication.JwtBearer"
+        },
+        "containers": {
+          "technology": "Docker + Docker Compose",
+          "version": "v2",
+          "orchestration": "docker-compose.yml",
+          "registry": "Container Registry (configurable)"
+        }
+      }
+    }
+  }
+}
