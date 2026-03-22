@@ -3811,23 +3811,6 @@ async fn process_files(
                     )));
                 }
 
-                // In IndexOnly mode, report per-file progress as files are parsed
-                if output_mode == crate::llm::OutputMode::IndexOnly
-                    && role == crate::parser::FileRole::Primary
-                {
-                    let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
-                    let _ = tx.send(ProcessingEvent::FileResult {
-                        path: path.clone(),
-                        gherkin: GherkinDocument {
-                            feature_title: String::new(),
-                            description: String::new(),
-                            scenarios: Vec::new(),
-                            source_file: String::new(),
-                        },
-                        elapsed: std::time::Duration::ZERO,
-                    });
-                }
-
                 parsed_map.insert(path, (result.file_type, result.text, result.images, role));
             }
             Ok(Err(e)) => {
@@ -3865,6 +3848,146 @@ async fn process_files(
                 let _ = tx.send(ProcessingEvent::ItemFailed { name: name.clone(), path: Some(path.clone()), error: "File failed to parse".to_string() });
                 let _ = tx.send(ProcessingEvent::Status(format!("⚠ Skipped {} (parse failure)", name)));
             }
+        }
+    }
+
+    // ── Phase 1.15: Vision enrichment — describe extracted images ──
+    // Run the vision model on all extracted images and fold descriptions into
+    // the file's raw_text so that RAG chunks include image content.
+    // Files are processed concurrently for speed; progress sent per-file.
+    {
+        let files_with_images: Vec<PathBuf> = parsed_map
+            .iter()
+            .filter(|(_, (_, _, images, _))| !images.is_empty())
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        let files_without_images: Vec<PathBuf> = if output_mode == crate::llm::OutputMode::IndexOnly {
+            parsed_map
+                .iter()
+                .filter(|(_, (_, _, images, role))| images.is_empty() && *role == crate::parser::FileRole::Primary)
+                .map(|(path, _)| path.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // In IndexOnly mode, report progress for files without images immediately
+        // (they're fully processed after parsing — no vision needed)
+        for path in &files_without_images {
+            let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
+            let _ = tx.send(ProcessingEvent::FileResult {
+                path: path.clone(),
+                gherkin: GherkinDocument {
+                    feature_title: String::new(),
+                    description: String::new(),
+                    scenarios: Vec::new(),
+                    source_file: String::new(),
+                },
+                elapsed: std::time::Duration::ZERO,
+            });
+        }
+
+        if !files_with_images.is_empty() {
+            let total_images: usize = files_with_images
+                .iter()
+                .filter_map(|p| parsed_map.get(p))
+                .map(|(_, _, imgs, _)| imgs.len())
+                .sum();
+
+            let _ = tx.send(ProcessingEvent::Status(format!(
+                "👁 Describing {} image(s) across {} file(s) with vision model…",
+                total_images,
+                files_with_images.len(),
+            )));
+
+            // Collect work items: (path, raw_text, images, file_name, is_primary)
+            let work_items: Vec<_> = files_with_images
+                .iter()
+                .filter_map(|path| {
+                    parsed_map.get(path).map(|(_, raw_text, images, role)| {
+                        let file_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        (path.clone(), raw_text.clone(), images.clone(), file_name, *role == crate::parser::FileRole::Primary)
+                    })
+                })
+                .collect();
+
+            // Process files concurrently with a semaphore to limit load on vision model
+            let sem = Arc::new(tokio::sync::Semaphore::new(3));
+            let orch = Arc::clone(&orchestrator);
+            let cancel = cancel_token.clone();
+
+            let handles: Vec<_> = work_items
+                .into_iter()
+                .map(|(path, raw_text, images, file_name, is_primary)| {
+                    let sem = Arc::clone(&sem);
+                    let orch = Arc::clone(&orch);
+                    let cancel = cancel.clone();
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _permit = sem.acquire().await;
+                        if cancel.is_cancelled() {
+                            return (path, raw_text, is_primary); // return unchanged
+                        }
+                        // Create a per-task status bridge
+                        let (vis_tx, vis_rx) = std::sync::mpsc::channel::<String>();
+                        let tx_fwd = tx.clone();
+                        let fwd = std::thread::spawn(move || {
+                            while let Ok(msg) = vis_rx.recv() {
+                                let _ = tx_fwd.send(ProcessingEvent::Status(msg));
+                            }
+                        });
+
+                        let enriched = orch
+                            .enrich_text_with_images(&raw_text, &images, &file_name, &vis_tx, &cancel)
+                            .await;
+
+                        drop(vis_tx);
+                        let _ = fwd.join();
+
+                        // Send per-file progress in IndexOnly mode
+                        if is_primary && output_mode == crate::llm::OutputMode::IndexOnly {
+                            let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
+                            let _ = tx.send(ProcessingEvent::FileResult {
+                                path: path.clone(),
+                                gherkin: GherkinDocument {
+                                    feature_title: String::new(),
+                                    description: String::new(),
+                                    scenarios: Vec::new(),
+                                    source_file: String::new(),
+                                },
+                                elapsed: std::time::Duration::ZERO,
+                            });
+                        }
+
+                        (path, enriched, is_primary)
+                    })
+                })
+                .collect();
+
+            // Collect results and update parsed_map + context
+            for handle in handles {
+                if let Ok((path, enriched, _)) = handle.await {
+                    if let Some(entry) = parsed_map.get_mut(&path) {
+                        entry.1 = enriched.clone();
+                        entry.2.clear();
+                    }
+                    if let Ok(mut ctx) = context.lock() {
+                        let key = path.to_string_lossy().to_string();
+                        if let Some(fc) = ctx.file_contents.get_mut(&key) {
+                            fc.raw_text = enriched;
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(ProcessingEvent::Status(format!(
+                "✅ Vision enrichment complete — {} image(s) described",
+                total_images,
+            )));
         }
     }
 
