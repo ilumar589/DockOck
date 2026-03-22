@@ -153,6 +153,16 @@ fn custom_model_combo(ui: &mut egui::Ui, id: &str, model: &mut String, models: &
         });
 }
 
+/// Shorten a model name for display in the toolbar button (e.g. "qwen2.5-coder:32b" → "qwen2.5-coder:32b").
+/// Truncates very long names and adds an ellipsis.
+fn short_model_name(name: &str) -> &str {
+    if name.len() <= 22 {
+        name
+    } else {
+        &name[..22]
+    }
+}
+
 // ─────────────────────────────────────────────
 // Events sent from background thread → UI
 // ─────────────────────────────────────────────
@@ -213,6 +223,18 @@ pub enum ProcessingEvent {
         markdown: String,
         elapsed: std::time::Duration,
     },
+}
+
+/// Events from background chat queries.
+#[derive(Debug)]
+enum ChatEvent {
+    /// Chat query completed successfully
+    Done {
+        answer: String,
+        sources: Vec<crate::chat::SourceReference>,
+    },
+    /// Chat query failed
+    Error(String),
 }
 
 // ─────────────────────────────────────────────
@@ -361,6 +383,29 @@ pub struct DockOckApp {
     selected_tech_stack: Option<String>,
     /// Auto-generated project-wide knowledge-base index (Markdown mode)
     markdown_project_index: Option<String>,
+    // ── Chat & MCP fields ──
+    /// Chat engine with conversation history
+    chat_engine: crate::chat::ChatEngine,
+    /// Current chat input text
+    chat_input: String,
+    /// Whether a chat query is in-flight
+    chat_loading: bool,
+    /// Streaming response buffer (updated from background task)
+    chat_streaming_text: std::sync::Arc<std::sync::Mutex<String>>,
+    /// Receiver for completed chat responses
+    chat_result_rx: Option<std::sync::mpsc::Receiver<ChatEvent>>,
+    /// Whether the chat panel is shown (as a side panel)
+    show_chat_panel: bool,
+    /// Whether the MCP server is enabled
+    mcp_enabled: bool,
+    /// MCP server port
+    mcp_port: u16,
+    /// MCP server running state
+    mcp_running: bool,
+    /// MCP shutdown token
+    mcp_shutdown: Option<CancellationToken>,
+    /// Cached MongoDB client (set after first successful RAG indexing)
+    mongo_client: Option<mongodb::Client>,
 }
 
 impl DockOckApp {
@@ -454,6 +499,18 @@ impl DockOckApp {
             },
             selected_tech_stack: None,
             markdown_project_index: None,
+            // Chat & MCP
+            chat_engine: crate::chat::ChatEngine::new(),
+            chat_input: String::new(),
+            chat_loading: false,
+            chat_streaming_text: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
+            chat_result_rx: None,
+            show_chat_panel: false,
+            mcp_enabled: false,
+            mcp_port: crate::mcp::DEFAULT_MCP_PORT,
+            mcp_running: false,
+            mcp_shutdown: None,
+            mongo_client: None,
         }
     }
 
@@ -1232,15 +1289,29 @@ impl DockOckApp {
                     } else {
                         format!("{:.1}s", secs)
                     };
-                    self.log(LogLevel::Success, format!(
-                        "✓ Generated Gherkin for: {} ({}/{}) in {}",
-                        actual_path.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default(),
-                        self.progress.0,
-                        self.progress.1,
-                        elapsed_str,
-                    ));
+                    let action = match self.output_mode {
+                        crate::llm::OutputMode::IndexOnly => "Indexed:",
+                        crate::llm::OutputMode::DependencyGraph => "Generated dep graph for:",
+                        crate::llm::OutputMode::Markdown => "Generated markdown for:",
+                        _ => "Generated Gherkin for:",
+                    };
+                    let file_name = actual_path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if elapsed.is_zero() {
+                        self.log(LogLevel::Success, format!(
+                            "✓ {} {} ({}/{})",
+                            action, file_name,
+                            self.progress.0, self.progress.1,
+                        ));
+                    } else {
+                        self.log(LogLevel::Success, format!(
+                            "✓ {} {} ({}/{}) in {}",
+                            action, file_name,
+                            self.progress.0, self.progress.1,
+                            elapsed_str,
+                        ));
+                    }
                     self.elapsed_times.insert(actual_path.clone(), elapsed);
                     self.results.insert(actual_path, gherkin);
                 }
@@ -1443,6 +1514,226 @@ impl DockOckApp {
         }
     }
 
+    /// Poll chat events from background query tasks.
+    fn poll_chat_events(&mut self) {
+        // Check streaming text updates
+        if self.chat_loading {
+            if let Ok(text) = self.chat_streaming_text.lock() {
+                if !text.is_empty() {
+                    // Update is reflected in the UI via the streaming text Arc
+                }
+            }
+        }
+
+        let events: Vec<ChatEvent> = if let Some(rx) = &self.chat_result_rx {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        } else {
+            return;
+        };
+
+        for event in events {
+            match event {
+                ChatEvent::Done { answer, sources } => {
+                    self.chat_engine.add_assistant_message(answer, sources);
+                    self.chat_loading = false;
+                    if let Ok(mut text) = self.chat_streaming_text.lock() {
+                        text.clear();
+                    }
+                    self.chat_result_rx = None;
+                }
+                ChatEvent::Error(e) => {
+                    self.chat_engine.add_assistant_message(
+                        format!("⚠ Error: {e}"),
+                        Vec::new(),
+                    );
+                    self.chat_loading = false;
+                    if let Ok(mut text) = self.chat_streaming_text.lock() {
+                        text.clear();
+                    }
+                    self.chat_result_rx = None;
+                    self.log(LogLevel::Error, format!("Chat error: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Send a chat query to the background.
+    fn send_chat_query(&mut self) {
+        if self.state == AppState::Processing {
+            return;
+        }
+        let query = self.chat_input.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+
+        self.chat_engine.add_user_message(query.clone());
+        self.chat_input.clear();
+        self.chat_loading = true;
+
+        if let Ok(mut text) = self.chat_streaming_text.lock() {
+            text.clear();
+        }
+
+        let (tx, rx) = mpsc::channel::<ChatEvent>();
+        self.chat_result_rx = Some(rx);
+
+        let history = self.chat_engine.history.clone();
+        let embedding_choice = self.embedding_choice;
+        let backend = self.backend.clone();
+        let generator_model = self.generator_model.clone();
+        let cancel_token = self.cancel_token.clone();
+        let streaming_text = self.chat_streaming_text.clone();
+        let mongo_client = self.mongo_client.clone();
+
+        self.runtime.spawn(async move {
+            // Connect to MongoDB
+            let mongo = match &mongo_client {
+                Some(c) => c.clone(),
+                None => {
+                    match crate::rag::connect_mongo("mongodb://localhost:27017/?directConnection=true").await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = tx.send(ChatEvent::Error(format!("MongoDB connection failed: {e}")));
+                            return;
+                        }
+                    }
+                }
+            };
+
+            // Resolve embedding provider
+            let provider = resolve_embedding_provider(embedding_choice, &backend).await;
+            let provider = match provider {
+                Some(p) => p,
+                None => {
+                    let _ = tx.send(ChatEvent::Error("No embedding provider available".to_string()));
+                    return;
+                }
+            };
+
+            // Build RAG indexes
+            let rag_indexes = crate::rag::create_dynamic_indexes(&provider, &mongo).await;
+
+            // Resolve LLM clients
+            let (ollama_client, openai_client) = resolve_llm_clients(&backend);
+
+            let on_token = {
+                let streaming_text = streaming_text.clone();
+                move |token: &str| {
+                    if let Ok(mut text) = streaming_text.lock() {
+                        text.push_str(token);
+                    }
+                }
+            };
+
+            match crate::chat::chat_query(
+                &query,
+                &history,
+                &provider,
+                &mongo,
+                &rag_indexes,
+                &generator_model,
+                ollama_client.as_ref(),
+                openai_client.as_ref(),
+                &cancel_token,
+                on_token,
+            )
+            .await
+            {
+                Ok((answer, sources)) => {
+                    let _ = tx.send(ChatEvent::Done { answer, sources });
+                }
+                Err(e) => {
+                    let _ = tx.send(ChatEvent::Error(format!("{e}")));
+                }
+            }
+        });
+    }
+
+    /// Toggle the MCP server on/off.
+    fn toggle_mcp_server(&mut self) {
+        if self.state == AppState::Processing {
+            return;
+        }
+        if self.mcp_running {
+            // Shut down
+            if let Some(token) = self.mcp_shutdown.take() {
+                token.cancel();
+            }
+            self.mcp_running = false;
+            self.log(LogLevel::Info, "MCP server stopped");
+        } else {
+            // Start
+            let embedding_choice = self.embedding_choice;
+            let backend = self.backend.clone();
+            let generator_model = self.generator_model.clone();
+            let port = self.mcp_port;
+            let mongo_client = self.mongo_client.clone();
+
+            let (status_tx, status_rx) = mpsc::channel::<Result<CancellationToken, String>>();
+
+            self.runtime.spawn(async move {
+                // Connect to MongoDB
+                let mongo = match &mongo_client {
+                    Some(c) => c.clone(),
+                    None => {
+                        match crate::rag::connect_mongo("mongodb://localhost:27017/?directConnection=true").await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                let _ = status_tx.send(Err(format!("MongoDB connection failed: {e}")));
+                                return;
+                            }
+                        }
+                    }
+                };
+
+                let provider = resolve_embedding_provider(embedding_choice, &backend).await;
+                let provider = match provider {
+                    Some(p) => p,
+                    None => {
+                        let _ = status_tx.send(Err("No embedding provider available".to_string()));
+                        return;
+                    }
+                };
+
+                let rag_indexes = crate::rag::create_dynamic_indexes(&provider, &mongo).await;
+                let (ollama_client, openai_client) = resolve_llm_clients(&backend);
+                let (sse_tx, _) = tokio::sync::broadcast::channel(256);
+
+                let state = std::sync::Arc::new(crate::mcp::McpState {
+                    embedding_provider: provider,
+                    mongo_client: mongo,
+                    rag_indexes,
+                    generator_model,
+                    ollama_client,
+                    openai_client,
+                    cancel_token: CancellationToken::new(),
+                    sse_tx,
+                });
+
+                let shutdown = crate::mcp::start_server(state, port).await;
+                let _ = status_tx.send(Ok(shutdown));
+            });
+
+            // Poll for startup result (non-blocking, short wait)
+            match status_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Ok(shutdown_token)) => {
+                    self.mcp_shutdown = Some(shutdown_token);
+                    self.mcp_running = true;
+                    self.log(LogLevel::Success, format!("MCP server started on port {}", self.mcp_port));
+                }
+                Ok(Err(e)) => {
+                    self.log(LogLevel::Error, format!("MCP server failed to start: {e}"));
+                }
+                Err(_) => {
+                    // Timeout — assume it started (the binding is async)
+                    self.mcp_running = true;
+                    self.log(LogLevel::Info, format!("MCP server starting on port {}…", self.mcp_port));
+                }
+            }
+        }
+    }
+
     /// Check Ollama availability in the background and update `self.ollama_ok`.
     fn check_ollama(&mut self, ctx: &egui::Context) {
         let repaint = ctx.clone();
@@ -1470,11 +1761,11 @@ impl DockOckApp {
     // ── UI rendering ─────────────────────────────────────────────────────
 
     fn render_top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        // ── Row 1: Title, Ollama status, Output directory ──
+        // Single-row toolbar with grouped popups
         ui.horizontal(|ui| {
+            // ── App title & connection ──
             ui.heading("🦆 DockOck");
             ui.separator();
-            ui.label("Ollama:");
             match self.ollama_ok {
                 None => {
                     if ui.button("Check connection").clicked() {
@@ -1482,17 +1773,20 @@ impl DockOckApp {
                     }
                 }
                 Some(true) => {
-                    ui.colored_label(egui::Color32::GREEN, "● Connected");
+                    ui.colored_label(egui::Color32::GREEN, "●");
                 }
                 Some(false) => {
-                    ui.colored_label(egui::Color32::RED, "● Unreachable");
-                    if ui.button("Retry").clicked() {
+                    ui.colored_label(egui::Color32::RED, "●");
+                    if ui.small_button("Retry").clicked() {
                         self.ollama_ok = None;
                         self.check_ollama(ctx);
                     }
                 }
             }
+
             ui.separator();
+
+            // ── Output directory ──
             ui.label("📁 Output:");
             if let Some(dir) = &self.output_dir {
                 let dir_display = dir.to_string_lossy();
@@ -1512,7 +1806,10 @@ impl DockOckApp {
                     }
                 }
             }
+
             ui.separator();
+
+            // ── Quick toggles ──
             ui.checkbox(&mut self.force_regenerate, "🔄 Force")
                 .on_hover_text("Force re-generation, bypassing cache");
             ui.checkbox(&mut self.openspec_enabled, "📦 OpenSpec");
@@ -1523,28 +1820,23 @@ impl DockOckApp {
                     None => { ui.colored_label(egui::Color32::GRAY, "○"); }
                 }
             }
-        });
 
-        ui.add_space(2.0);
+            ui.separator();
 
-        // ── Row 2: Provider, Models, Pipeline, Concurrency ──
-        ui.horizontal(|ui| {
-            // Provider selector
+            // ── Provider (inline — used frequently) ──
             ui.label("Provider:");
             let current_label = self.backend.display_name().to_string();
             let was_custom = self.backend.is_custom();
             egui::ComboBox::from_id_salt("provider_backend")
                 .selected_text(&current_label)
-                .width(140.0)
+                .width(120.0)
                 .show_ui(ui, |ui| {
-                    // Ollama option
                     if ui.selectable_label(
                         matches!(self.backend, crate::llm::ProviderBackend::Ollama),
                         "Ollama (local)",
                     ).clicked() {
                         self.backend = crate::llm::ProviderBackend::Ollama;
                     }
-                    // Custom providers from JSON — collect names to avoid borrow conflict
                     let provider_names: Vec<String> = self.custom_providers.iter()
                         .map(|c| c.name.clone())
                         .collect();
@@ -1569,7 +1861,6 @@ impl DockOckApp {
             // Auto-assign models when provider changes
             let is_custom = self.backend.is_custom();
             if is_custom && !was_custom {
-                // Switching TO custom — save Ollama models & apply defaults
                 self.saved_ollama_models = (
                     self.generator_model.clone(),
                     self.extractor_model.clone(),
@@ -1585,54 +1876,72 @@ impl DockOckApp {
                     self.vision_model = cfg.defaults.vision.clone().unwrap_or(first);
                 }
             } else if !is_custom && was_custom {
-                // Switching BACK to Ollama — restore saved models
                 self.generator_model = self.saved_ollama_models.0.clone();
                 self.extractor_model = self.saved_ollama_models.1.clone();
                 self.reviewer_model = self.saved_ollama_models.2.clone();
                 self.vision_model = self.saved_ollama_models.3.clone();
             }
 
-            // API key indicator for custom providers
             if self.backend.is_custom() {
                 ui.colored_label(egui::Color32::GREEN, "🔑");
             }
 
             ui.separator();
-            ui.label("Models ─");
 
-            // Gen/Ext/Rev use custom models when custom provider selected
-            let custom_models: Vec<String> = if self.backend.is_custom() {
-                crate::llm::custom_model_ids(&self.custom_providers)
-            } else {
-                Vec::new()
-            };
+            // ── Models popup ──
+            let models_label = format!("🤖 Models: {}", short_model_name(&self.generator_model));
+            let models_btn = ui.button(&models_label);
+            let models_popup_id = ui.make_persistent_id("models_popup");
+            if models_btn.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(models_popup_id));
+            }
+            egui::popup_below_widget(ui, models_popup_id, &models_btn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                ui.set_min_width(340.0);
+                ui.heading("🤖 Model Selection");
+                ui.separator();
 
-            ui.label("Gen:");
-            if self.backend.is_custom() {
-                custom_model_combo(ui, "gen_model", &mut self.generator_model, &custom_models);
-            } else {
-                model_combo(ui, "gen_model", &mut self.generator_model);
-            }
-            ui.label("Ext:");
-            if self.backend.is_custom() {
-                custom_model_combo(ui, "ext_model", &mut self.extractor_model, &custom_models);
-            } else {
-                model_combo(ui, "ext_model", &mut self.extractor_model);
-            }
-            ui.label("Rev:");
-            if self.backend.is_custom() {
-                custom_model_combo(ui, "rev_model", &mut self.reviewer_model, &custom_models);
-            } else {
-                model_combo(ui, "rev_model", &mut self.reviewer_model);
-            }
+                let custom_models: Vec<String> = if self.backend.is_custom() {
+                    crate::llm::custom_model_ids(&self.custom_providers)
+                } else {
+                    Vec::new()
+                };
 
-            // Vision uses cloud models when custom provider selected, local otherwise
-            ui.label("Vis:");
-            if self.backend.is_custom() {
-                custom_model_combo(ui, "vis_model", &mut self.vision_model, &custom_models);
-            } else {
-                model_combo(ui, "vis_model", &mut self.vision_model);
-            }
+                egui::Grid::new("models_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Generator:");
+                    if self.backend.is_custom() {
+                        custom_model_combo(ui, "gen_model", &mut self.generator_model, &custom_models);
+                    } else {
+                        model_combo(ui, "gen_model", &mut self.generator_model);
+                    }
+                    ui.end_row();
+
+                    ui.label("Extractor:");
+                    if self.backend.is_custom() {
+                        custom_model_combo(ui, "ext_model", &mut self.extractor_model, &custom_models);
+                    } else {
+                        model_combo(ui, "ext_model", &mut self.extractor_model);
+                    }
+                    ui.end_row();
+
+                    ui.label("Reviewer:");
+                    if self.backend.is_custom() {
+                        custom_model_combo(ui, "rev_model", &mut self.reviewer_model, &custom_models);
+                    } else {
+                        model_combo(ui, "rev_model", &mut self.reviewer_model);
+                    }
+                    ui.end_row();
+
+                    ui.label("Vision:");
+                    if self.backend.is_custom() {
+                        custom_model_combo(ui, "vis_model", &mut self.vision_model, &custom_models);
+                    } else {
+                        model_combo(ui, "vis_model", &mut self.vision_model);
+                    }
+                    ui.end_row();
+                });
+            });
+
+            // ── Pipeline & Output (inline — compact) ──
             ui.separator();
             ui.label("Pipeline:");
             egui::ComboBox::from_id_salt("pipeline_mode")
@@ -1642,7 +1951,7 @@ impl DockOckApp {
                         ui.selectable_value(&mut self.pipeline_mode, mode, mode.to_string());
                     }
                 });
-            ui.separator();
+
             ui.label("Output:");
             egui::ComboBox::from_id_salt("output_mode")
                 .selected_text(self.output_mode.to_string())
@@ -1651,40 +1960,59 @@ impl DockOckApp {
                         ui.selectable_value(&mut self.output_mode, mode, mode.to_string());
                     }
                 });
-            // Tech stack selector — only visible in Markdown mode
-            if self.output_mode == crate::llm::OutputMode::Markdown && !self.tech_stack_config.stacks.is_empty() {
-                ui.label("Stack:");
-                let current_label = self.selected_tech_stack.as_ref()
-                    .map(|k| self.tech_stack_config.display_name(k))
-                    .unwrap_or_else(|| "None (generic)".to_string());
-                egui::ComboBox::from_id_salt("tech_stack_combo")
-                    .selected_text(&current_label)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(self.selected_tech_stack.is_none(), "None (generic)").clicked() {
-                            self.selected_tech_stack = None;
-                        }
-                        for key in self.tech_stack_config.stack_keys() {
-                            let name = self.tech_stack_config.display_name(&key);
-                            let selected = self.selected_tech_stack.as_deref() == Some(&key);
-                            if ui.selectable_label(selected, &name).clicked() {
-                                self.selected_tech_stack = Some(key.clone());
-                            }
-                        }
-                    });
-            }
-            ui.label("∥");
-            ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0).max_decimals(0).update_while_editing(false))
-                .on_hover_text("Max concurrent LLM tasks");
+
             ui.separator();
-            ui.label("RAG:");
-            egui::ComboBox::from_id_salt("embedding_choice")
-                .selected_text(self.embedding_choice.to_string())
-                .width(180.0)
-                .show_ui(ui, |ui| {
-                    for &choice in crate::rag::EmbeddingChoice::ALL {
-                        ui.selectable_value(&mut self.embedding_choice, choice, choice.to_string());
+
+            // ── Settings popup (concurrency, RAG, tech stack) ──
+            let settings_btn = ui.button("⚙ Settings");
+            let settings_popup_id = ui.make_persistent_id("settings_popup");
+            if settings_btn.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(settings_popup_id));
+            }
+            egui::popup_below_widget(ui, settings_popup_id, &settings_btn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                ui.set_min_width(300.0);
+                ui.heading("⚙ Settings");
+                ui.separator();
+
+                egui::Grid::new("settings_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                    ui.label("Max concurrent LLM:");
+                    ui.add(egui::DragValue::new(&mut self.max_concurrent).range(1..=1000).speed(0).max_decimals(0).update_while_editing(false));
+                    ui.end_row();
+
+                    ui.label("RAG / Embeddings:");
+                    egui::ComboBox::from_id_salt("embedding_choice")
+                        .selected_text(self.embedding_choice.to_string())
+                        .width(180.0)
+                        .show_ui(ui, |ui| {
+                            for &choice in crate::rag::EmbeddingChoice::ALL {
+                                ui.selectable_value(&mut self.embedding_choice, choice, choice.to_string());
+                            }
+                        });
+                    ui.end_row();
+
+                    if self.output_mode == crate::llm::OutputMode::Markdown && !self.tech_stack_config.stacks.is_empty() {
+                        ui.label("Tech Stack:");
+                        let current_label = self.selected_tech_stack.as_ref()
+                            .map(|k| self.tech_stack_config.display_name(k))
+                            .unwrap_or_else(|| "None (generic)".to_string());
+                        egui::ComboBox::from_id_salt("tech_stack_combo")
+                            .selected_text(&current_label)
+                            .show_ui(ui, |ui| {
+                                if ui.selectable_label(self.selected_tech_stack.is_none(), "None (generic)").clicked() {
+                                    self.selected_tech_stack = None;
+                                }
+                                for key in self.tech_stack_config.stack_keys() {
+                                    let name = self.tech_stack_config.display_name(&key);
+                                    let selected = self.selected_tech_stack.as_deref() == Some(&key);
+                                    if ui.selectable_label(selected, &name).clicked() {
+                                        self.selected_tech_stack = Some(key.clone());
+                                    }
+                                }
+                            });
+                        ui.end_row();
                     }
                 });
+            });
         });
     }
 
@@ -2095,6 +2423,10 @@ impl DockOckApp {
         }
         if self.output_mode == crate::llm::OutputMode::Markdown {
             self.render_right_panel_markdown(ui);
+            return;
+        }
+        if self.output_mode == crate::llm::OutputMode::IndexOnly {
+            self.render_right_panel_index_only(ui);
             return;
         }
 
@@ -2847,6 +3179,207 @@ impl DockOckApp {
         self.toast = Some((format!("Saved {} markdown files", count), 3.0));
     }
 
+    fn render_right_panel_index_only(&mut self, ui: &mut egui::Ui) {
+        ui.heading("📦 Index Only");
+        ui.separator();
+
+        ui.label("This mode indexes all loaded documents into the vector store (MongoDB) without running any LLM transformations.");
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("How to use:").strong());
+        ui.label("1. Add files using the + button on the left panel");
+        ui.label("2. Select a RAG embedding model in ⚙ Settings");
+        ui.label("3. Click 📦 Index Documents to index all files");
+        ui.label("4. Use 💬 Chat or 🔌 MCP to query the indexed documents");
+        ui.add_space(12.0);
+
+        let embedding_label = self.embedding_choice.to_string();
+        ui.horizontal(|ui| {
+            ui.label("Embedding model:");
+            ui.label(egui::RichText::new(&embedding_label).strong());
+        });
+
+        let n_files = self.selected_files.len();
+        ui.horizontal(|ui| {
+            ui.label("Files loaded:");
+            ui.label(egui::RichText::new(format!("{n_files}")).strong());
+        });
+
+        if self.state == AppState::Processing {
+            ui.add_space(12.0);
+            ui.spinner();
+            ui.label("Indexing in progress…");
+        } else if n_files > 0 {
+            ui.add_space(12.0);
+            if !self.log_entries.is_empty() {
+                if let Some(entry) = self.log_entries.iter().rev().find(|e| {
+                    e.message.contains("indexed") || e.message.contains("RAG") || e.message.contains("Index")
+                }) {
+                    ui.colored_label(entry.level.color(), &entry.message);
+                }
+            }
+        } else {
+            ui.add_space(20.0);
+            ui.label(egui::RichText::new("Add files using the + button and click 📦 Index Documents.")
+                .color(egui::Color32::from_rgb(160, 160, 160)));
+        }
+    }
+
+    fn render_chat_panel(&mut self, ui: &mut egui::Ui) {
+        let is_processing = self.state == AppState::Processing;
+
+        ui.horizontal(|ui| {
+            ui.heading("💬 Document Chat");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(!is_processing, egui::Button::new("🗑 Clear").small()).clicked() {
+                    self.chat_engine.clear();
+                }
+            });
+        });
+        ui.separator();
+
+        if is_processing {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    egui::RichText::new("⏳ Chat is available after processing completes")
+                        .color(egui::Color32::from_rgb(200, 180, 80))
+                        .size(14.0),
+                );
+                ui.add_space(8.0);
+                ui.spinner();
+            });
+            return;
+        }
+
+        // Message history
+        let available = ui.available_height() - 60.0; // Reserve space for input
+        egui::ScrollArea::vertical()
+            .id_salt("chat_messages")
+            .stick_to_bottom(true)
+            .max_height(available.max(100.0))
+            .show(ui, |ui| {
+                if self.chat_engine.history.is_empty() && !self.chat_loading {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(40.0);
+                        ui.label(
+                            egui::RichText::new("Ask questions about your indexed documents")
+                                .color(egui::Color32::from_rgb(140, 140, 140))
+                                .italics(),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("Documents must be indexed first (run Generate with RAG enabled)")
+                                .color(egui::Color32::from_rgb(120, 120, 120))
+                                .small(),
+                        );
+                    });
+                }
+
+                for msg in &self.chat_engine.history {
+                    match msg.role {
+                        crate::chat::ChatRole::User => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new("You: ")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(100, 180, 255)),
+                                );
+                                ui.label(&msg.content);
+                            });
+                        }
+                        crate::chat::ChatRole::Assistant => {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Assistant: ")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(100, 200, 100)),
+                                );
+                            });
+                            ui.label(&msg.content);
+
+                            // Show source references
+                            if !msg.sources.is_empty() {
+                                ui.add_space(4.0);
+                                egui::CollapsingHeader::new(
+                                    egui::RichText::new(format!("📎 {} sources", msg.sources.len()))
+                                        .small()
+                                        .color(egui::Color32::from_rgb(160, 160, 160)),
+                                )
+                                .id_salt(format!("src_{}", msg.timestamp))
+                                .show(ui, |ui| {
+                                    for src in &msg.sources {
+                                        ui.horizontal_wrapped(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "[{}] ({:.0}%)",
+                                                    src.file_name, src.score * 100.0
+                                                ))
+                                                .small()
+                                                .color(egui::Color32::from_rgb(180, 180, 100)),
+                                            );
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(&src.excerpt)
+                                                .small()
+                                                .color(egui::Color32::from_rgb(140, 140, 140)),
+                                        );
+                                    }
+                                });
+                            }
+                        }
+                        crate::chat::ChatRole::System => {}
+                    }
+                    ui.add_space(8.0);
+                }
+
+                // Show streaming response
+                if self.chat_loading {
+                    if let Ok(text) = self.chat_streaming_text.lock() {
+                        if !text.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Assistant: ")
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(100, 200, 100)),
+                                );
+                            });
+                            ui.label(text.as_str());
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Thinking…");
+                            });
+                        }
+                    }
+                }
+            });
+
+        ui.separator();
+
+        // Input area
+        ui.horizontal(|ui| {
+            let response = ui.add_sized(
+                [ui.available_width() - 55.0, 28.0],
+                egui::TextEdit::singleline(&mut self.chat_input)
+                    .hint_text("Ask about your documents…")
+                    .desired_width(f32::INFINITY),
+            );
+
+            let enter_pressed = response.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+            let send_enabled = !self.chat_loading && !self.chat_input.trim().is_empty();
+            if ui
+                .add_enabled(send_enabled, egui::Button::new("📤"))
+                .clicked()
+                || (enter_pressed && send_enabled)
+            {
+                self.send_chat_query();
+            }
+        });
+    }
+
     fn render_bottom_bar(&mut self, ui: &mut egui::Ui) {
         ui.separator();
         ui.horizontal(|ui| {
@@ -2857,6 +3390,7 @@ impl DockOckApp {
                 crate::llm::OutputMode::Gherkin => "⚙ Generate Gherkin",
                 crate::llm::OutputMode::DependencyGraph => "⚙ Generate Dep Graph",
                 crate::llm::OutputMode::Markdown => "⚙ Generate Markdown",
+                crate::llm::OutputMode::IndexOnly => "📦 Index Documents",
             };
             if ui
                 .add_enabled(
@@ -2893,6 +3427,107 @@ impl DockOckApp {
             if !self.log_entries.is_empty() {
                 ui.label(format!("({} entries)", self.log_entries.len()));
             }
+
+            ui.separator();
+
+            // Toggle chat panel
+            let chat_label = if self.show_chat_panel { "💬 Chat ●" } else { "💬 Chat" };
+            if ui.button(
+                egui::RichText::new(chat_label).strong()
+            ).clicked() {
+                self.show_chat_panel = !self.show_chat_panel;
+            }
+
+            // MCP server compact button — details in popup
+            let mcp_btn_label = if self.mcp_running {
+                format!("🔌 MCP :{}", self.mcp_port)
+            } else {
+                "🔌 MCP".to_string()
+            };
+            let mcp_color = if self.mcp_running {
+                egui::Color32::from_rgb(100, 200, 100)
+            } else {
+                ui.visuals().text_color()
+            };
+            let mcp_btn = ui.button(egui::RichText::new(&mcp_btn_label).color(mcp_color));
+            let mcp_popup_id = ui.make_persistent_id("mcp_popup");
+            if mcp_btn.clicked() {
+                ui.memory_mut(|m| m.toggle_popup(mcp_popup_id));
+            }
+            egui::popup_below_widget(ui, mcp_popup_id, &mcp_btn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                ui.set_min_width(320.0);
+                ui.heading("🔌 MCP Server");
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("Status:");
+                    if self.mcp_running {
+                        ui.colored_label(egui::Color32::from_rgb(100, 200, 100), "● Running");
+                    } else {
+                        ui.label("○ Stopped");
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Port:");
+                    ui.add_enabled(
+                        !self.mcp_running,
+                        egui::DragValue::new(&mut self.mcp_port)
+                            .range(1024..=65535)
+                            .speed(1),
+                    );
+                });
+
+                ui.add_space(4.0);
+                let toggle_text = if self.mcp_running { "⏹ Stop Server" } else { "▶ Start Server" };
+                if ui.add_enabled(!is_processing, egui::Button::new(toggle_text)).clicked() {
+                    self.mcp_enabled = !self.mcp_enabled;
+                    self.toggle_mcp_server();
+                    ui.memory_mut(|m| m.close_popup(mcp_popup_id));
+                }
+                if is_processing {
+                    ui.label(
+                        egui::RichText::new("⏳ Unavailable during processing")
+                            .color(egui::Color32::from_rgb(200, 180, 80))
+                            .small(),
+                    );
+                }
+
+                if self.mcp_running {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Endpoints:").strong());
+                    let base = format!("http://localhost:{}", self.mcp_port);
+                    ui.add_space(2.0);
+
+                    ui.horizontal(|ui| {
+                        ui.label("JSON-RPC:");
+                        let url = format!("{base}/mcp");
+                        ui.label(egui::RichText::new(&url).monospace().color(egui::Color32::from_rgb(130, 200, 130)));
+                        if ui.small_button("📋").on_hover_text("Copy").clicked() {
+                            ui.ctx().copy_text(url);
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("SSE:");
+                        let url = format!("{base}/mcp/sse");
+                        ui.label(egui::RichText::new(&url).monospace().color(egui::Color32::from_rgb(130, 200, 130)));
+                        if ui.small_button("📋").on_hover_text("Copy").clicked() {
+                            ui.ctx().copy_text(url);
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("Health:");
+                        let url = format!("{base}/health");
+                        ui.label(egui::RichText::new(&url).monospace().color(egui::Color32::from_rgb(130, 200, 130)));
+                        if ui.small_button("📋").on_hover_text("Copy").clicked() {
+                            ui.ctx().copy_text(url);
+                        }
+                    });
+                }
+            });
 
             ui.separator();
 
@@ -2951,7 +3586,8 @@ impl eframe::App for DockOckApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Poll background events every frame
         self.poll_events();
-        if self.state == AppState::Processing {
+        self.poll_chat_events();
+        if self.state == AppState::Processing || self.chat_loading {
             ctx.request_repaint();
         }
 
@@ -3004,6 +3640,17 @@ impl eframe::App for DockOckApp {
             .show(ctx, |ui| {
                 self.render_left_panel(ui);
             });
+
+        // Chat side panel (right side)
+        if self.show_chat_panel {
+            egui::SidePanel::right("chat_panel")
+                .resizable(true)
+                .default_width(380.0)
+                .min_width(280.0)
+                .show(ctx, |ui| {
+                    self.render_chat_panel(ui);
+                });
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.render_right_panel(ui);
@@ -3164,6 +3811,23 @@ async fn process_files(
                     )));
                 }
 
+                // In IndexOnly mode, report per-file progress as files are parsed
+                if output_mode == crate::llm::OutputMode::IndexOnly
+                    && role == crate::parser::FileRole::Primary
+                {
+                    let _ = tx.send(ProcessingEvent::FileStarted(path.clone()));
+                    let _ = tx.send(ProcessingEvent::FileResult {
+                        path: path.clone(),
+                        gherkin: GherkinDocument {
+                            feature_title: String::new(),
+                            description: String::new(),
+                            scenarios: Vec::new(),
+                            source_file: String::new(),
+                        },
+                        elapsed: std::time::Duration::ZERO,
+                    });
+                }
+
                 parsed_map.insert(path, (result.file_type, result.text, result.images, role));
             }
             Ok(Err(e)) => {
@@ -3224,7 +3888,7 @@ async fn process_files(
     ));
 
     // ── Phase 1.35: Prime the generator KV-cache with the shared prefix ──
-    {
+    if output_mode != crate::llm::OutputMode::IndexOnly {
         let glossary = if let Ok(ctx) = context.lock() {
             ctx.build_glossary()
         } else {
@@ -3235,6 +3899,7 @@ async fn process_files(
                 crate::llm::OutputMode::Gherkin => crate::llm::GENERATOR_PREAMBLE,
                 crate::llm::OutputMode::DependencyGraph => crate::llm::DEPGRAPH_GENERATOR_PREAMBLE,
                 crate::llm::OutputMode::Markdown => crate::llm::MARKDOWN_GENERATOR_PREAMBLE,
+                crate::llm::OutputMode::IndexOnly => unreachable!(),
             };
             let _ = tx.send(ProcessingEvent::Status(
                 "⚡ Priming generator KV-cache prefix…".to_string(),
@@ -3480,6 +4145,19 @@ async fn process_files(
         groups.len(), max_concurrent
     )));
 
+    // IndexOnly mode: RAG indexing is already done in Phase 1.3 — skip LLM dispatch
+    if output_mode == crate::llm::OutputMode::IndexOnly {
+        let indexed_msg = if rag_state.is_some() {
+            "✅ Documents indexed successfully — ready for Chat and MCP queries."
+        } else {
+            "⚠ No RAG provider available — ensure MongoDB is running and an embedding model is selected."
+        };
+        let _ = tx.send(ProcessingEvent::Status(indexed_msg.to_string()));
+        let _ = tx.send(ProcessingEvent::Done(if rag_state.is_some() { Ok(()) } else { Err("RAG indexing failed".to_string()) }));
+        let _ = tx.send(ProcessingEvent::OpenSpecDone(Ok(0)));
+        return;
+    }
+
     // ── Dispatch group work items ──
     for group in &groups {
         if cancel_token.is_cancelled() {
@@ -3644,6 +4322,7 @@ async fn process_files(
                             }
                         }
                     }
+                    crate::llm::OutputMode::IndexOnly => unreachable!("IndexOnly returns before dispatch"),
                 }
             });
             continue;
@@ -3776,6 +4455,7 @@ async fn process_files(
                         }
                     }
                 }
+                crate::llm::OutputMode::IndexOnly => unreachable!("IndexOnly returns before dispatch"),
             }
         });
     }
@@ -3933,6 +4613,7 @@ async fn process_files(
                         }
                     }
                 }
+                crate::llm::OutputMode::IndexOnly => unreachable!("IndexOnly returns before dispatch"),
             }
         });
     }
@@ -4054,4 +4735,77 @@ async fn process_files(
     }
 
     let _ = tx.send(ProcessingEvent::OpenSpecDone(Ok(ok_count)));
+}
+
+// ─────────────────────────────────────────────
+// Chat & MCP helper functions
+// ─────────────────────────────────────────────
+
+/// Resolve an embedding provider from the user's choice and backend.
+async fn resolve_embedding_provider(
+    choice: crate::rag::EmbeddingChoice,
+    _backend: &crate::llm::ProviderBackend,
+) -> Option<crate::rag::EmbeddingProvider> {
+    let ollama_url = "http://localhost:11435";
+
+    let try_ollama = |model_name: &str| -> Option<(rig::providers::ollama::Client, String)> {
+        let client = rig::providers::ollama::Client::builder()
+            .api_key(rig::client::Nothing)
+            .base_url(ollama_url)
+            .build()
+            .ok()?;
+        Some((client, model_name.to_string()))
+    };
+
+    match choice {
+        crate::rag::EmbeddingChoice::OllamaNomicEmbedText => {
+            let (client, model) = try_ollama("nomic-embed-text")?;
+            Some(crate::rag::EmbeddingProvider::Ollama { client, model })
+        }
+        crate::rag::EmbeddingChoice::OllamaMxbaiEmbedLarge => {
+            let (client, model) = try_ollama("mxbai-embed-large")?;
+            Some(crate::rag::EmbeddingProvider::Ollama { client, model })
+        }
+        crate::rag::EmbeddingChoice::FastEmbedMiniLM => {
+            Some(crate::rag::EmbeddingProvider::FastEmbed)
+        }
+        crate::rag::EmbeddingChoice::Auto => {
+            if let Some((client, model)) = try_ollama("nomic-embed-text") {
+                Some(crate::rag::EmbeddingProvider::Ollama { client, model })
+            } else {
+                Some(crate::rag::EmbeddingProvider::FastEmbed)
+            }
+        }
+        crate::rag::EmbeddingChoice::None => None,
+    }
+}
+
+/// Resolve LLM clients from the backend configuration.
+fn resolve_llm_clients(
+    backend: &crate::llm::ProviderBackend,
+) -> (Option<rig::providers::ollama::Client>, Option<rig::providers::openai::CompletionsClient>) {
+    match backend {
+        crate::llm::ProviderBackend::Ollama => {
+            let client = rig::providers::ollama::Client::builder()
+                .api_key(rig::client::Nothing)
+                .base_url("http://localhost:11434")
+                .build()
+                .ok();
+            (client, None)
+        }
+        crate::llm::ProviderBackend::Custom { api_key, base_url, .. } => {
+            let http_client = reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .read_timeout(std::time::Duration::from_secs(90))
+                .build()
+                .unwrap_or_default();
+            let openai_client = rig::providers::openai::CompletionsClient::builder()
+                .api_key(api_key)
+                .base_url(base_url)
+                .http_client(http_client)
+                .build()
+                .ok();
+            (None, openai_client)
+        }
+    }
 }

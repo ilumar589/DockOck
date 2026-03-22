@@ -1,0 +1,307 @@
+{
+	"info": {
+		"_postman_id": "dockock-mcp-collection",
+		"name": "DockOck MCP Server",
+		"description": "JSON-RPC 2.0 API for the DockOck MCP (Model Context Protocol) server.\n\nExposes document search and Q&A tools that external AI agents can consume.\n\n**Prerequisites:**\n1. Index documents in DockOck (run \"Index Documents\" with RAG enabled)\n2. Start the MCP server via the 🔌 MCP button in the bottom bar\n\nDefault base URL: `http://localhost:3100`",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"variable": [
+		{
+			"key": "base_url",
+			"value": "http://localhost:3100",
+			"type": "string"
+		}
+	],
+	"item": [
+		{
+			"name": "Health & Lifecycle",
+			"item": [
+				{
+					"name": "Health Check",
+					"request": {
+						"method": "GET",
+						"header": [],
+						"url": {
+							"raw": "{{base_url}}/health",
+							"host": ["{{base_url}}"],
+							"path": ["health"]
+						},
+						"description": "Returns the service status and protocol version."
+					},
+					"response": [
+						{
+							"name": "200 OK",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"status\": \"ok\",\n  \"service\": \"dockock-mcp\",\n  \"protocol\": \"mcp/1.0\"\n}"
+						}
+					]
+				},
+				{
+					"name": "Initialize (Handshake)",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"method\": \"initialize\",\n  \"params\": {}\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/mcp",
+							"host": ["{{base_url}}"],
+							"path": ["mcp"]
+						},
+						"description": "MCP handshake — returns server capabilities and version info. Call this first before using any tools."
+					},
+					"response": [
+						{
+							"name": "200 OK",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 1,\n  \"result\": {\n    \"protocolVersion\": \"2024-11-05\",\n    \"capabilities\": {\n      \"tools\": {}\n    },\n    \"serverInfo\": {\n      \"name\": \"dockock-mcp\",\n      \"version\": \"0.1.0\"\n    }\n  }\n}"
+						}
+					]
+				},
+				{
+					"name": "Ping",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 99,\n  \"method\": \"ping\",\n  \"params\": {}\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/mcp",
+							"host": ["{{base_url}}"],
+							"path": ["mcp"]
+						},
+						"description": "Simple connectivity check."
+					},
+					"response": [
+						{
+							"name": "200 OK",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 99,\n  \"result\": {}\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Tool Discovery",
+			"item": [
+				{
+					"name": "List Tools",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"method\": \"tools/list\",\n  \"params\": {}\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/mcp",
+							"host": ["{{base_url}}"],
+							"path": ["mcp"]
+						},
+						"description": "List all available MCP tools with their names, descriptions, and input schemas."
+					},
+					"response": [
+						{
+							"name": "200 OK",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 2,\n  \"result\": {\n    \"tools\": [\n      {\n        \"name\": \"query_documents\",\n        \"description\": \"Search the indexed document knowledge base and generate an AI answer...\",\n        \"inputSchema\": {\n          \"type\": \"object\",\n          \"properties\": {\n            \"query\": { \"type\": \"string\" },\n            \"top_k\": { \"type\": \"integer\", \"default\": 10 }\n          },\n          \"required\": [\"query\"]\n        }\n      },\n      {\n        \"name\": \"search_documents\",\n        \"description\": \"Perform a semantic search over indexed documents...\",\n        \"inputSchema\": { \"...\" : \"...\" }\n      },\n      {\n        \"name\": \"list_documents\",\n        \"description\": \"List all documents that have been indexed...\",\n        \"inputSchema\": { \"type\": \"object\", \"properties\": {} }\n      }\n    ]\n  }\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Tools",
+			"item": [
+				{
+					"name": "query_documents — Ask a Question",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"query_documents\",\n    \"arguments\": {\n      \"query\": \"How does meter creation work?\",\n      \"top_k\": 5\n    }\n  }\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/mcp",
+							"host": ["{{base_url}}"],
+							"path": ["mcp"]
+						},
+						"description": "Semantic search + LLM-generated answer.\n\nSearches the indexed documents for relevant chunks, then sends them to the LLM to generate a natural language answer with source citations.\n\n**Parameters:**\n- `query` (string, required) — The question to ask\n- `top_k` (integer, optional, default: 10) — Max source chunks to retrieve\n\n**Response:**\n- `content[].text` — The generated answer with sources\n- `_meta.sources[]` — Structured source references (document, chunk_id, relevance, excerpt)"
+					},
+					"response": [
+						{
+							"name": "200 OK — Answer with Sources",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 3,\n  \"result\": {\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"Meter creation involves selecting the appropriate meter type...\\n\\n---\\nSources: [Create meter from inventory.docx], [MTU for inventory.docx]\"\n      }\n    ],\n    \"_meta\": {\n      \"sources\": [\n        {\n          \"document\": \"Create meter from inventory.docx\",\n          \"chunk_id\": \"abc123\",\n          \"relevance\": 0.92,\n          \"excerpt\": \"The process begins when a field technician...\"\n        }\n      ]\n    }\n  }\n}"
+						}
+					]
+				},
+				{
+					"name": "search_documents — Semantic Search",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"search_documents\",\n    \"arguments\": {\n      \"query\": \"inspection status flow\",\n      \"top_k\": 10\n    }\n  }\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/mcp",
+							"host": ["{{base_url}}"],
+							"path": ["mcp"]
+						},
+						"description": "Raw semantic search — returns matching document chunks with relevance scores. No LLM generation, so it's faster than query_documents.\n\n**Parameters:**\n- `query` (string, required) — Search query text\n- `top_k` (integer, optional, default: 10) — Max results to return\n\n**Response:**\n- `content[].text` — Formatted search results\n- `_meta.results[]` — Structured data (document, chunk_id, relevance, excerpt)"
+					},
+					"response": [
+						{
+							"name": "200 OK — Search Results",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 4,\n  \"result\": {\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"Search results:\\n\\n1. [Inspection Status Flow.vsdx] (score: 0.89)\\nThe inspection workflow begins with...\\n\\n2. [Cross connection testing.docx] (score: 0.74)\\nBackflow device testing requires...\"\n      }\n    ],\n    \"_meta\": {\n      \"results\": [\n        {\n          \"document\": \"Inspection Status Flow.vsdx\",\n          \"chunk_id\": \"def456\",\n          \"relevance\": 0.89,\n          \"excerpt\": \"The inspection workflow begins with...\"\n        },\n        {\n          \"document\": \"Cross connection testing.docx\",\n          \"chunk_id\": \"ghi789\",\n          \"relevance\": 0.74,\n          \"excerpt\": \"Backflow device testing requires...\"\n        }\n      ]\n    }\n  }\n}"
+						}
+					]
+				},
+				{
+					"name": "list_documents — List Indexed Files",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"list_documents\",\n    \"arguments\": {}\n  }\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/mcp",
+							"host": ["{{base_url}}"],
+							"path": ["mcp"]
+						},
+						"description": "List all documents that have been indexed in the knowledge base, with their chunk counts.\n\nNo parameters required.\n\n**Response:**\n- `content[].text` — Formatted document list\n- `_meta.documents[]` — Structured data (file_name, chunk_count)"
+					},
+					"response": [
+						{
+							"name": "200 OK — Document List",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 5,\n  \"result\": {\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"Indexed documents (3 total):\\n\\n- Create meter from inventory.docx (12 chunks)\\n- Inspection Status Flow.vsdx (8 chunks)\\n- Training Manual v1.0.docx (45 chunks)\"\n      }\n    ],\n    \"_meta\": {\n      \"documents\": [\n        { \"file_name\": \"Create meter from inventory.docx\", \"chunk_count\": 12 },\n        { \"file_name\": \"Inspection Status Flow.vsdx\", \"chunk_count\": 8 },\n        { \"file_name\": \"Training Manual v1.0.docx\", \"chunk_count\": 45 }\n      ]\n    }\n  }\n}"
+						}
+					]
+				}
+			]
+		},
+		{
+			"name": "Error Examples",
+			"item": [
+				{
+					"name": "Error — Unknown Method",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 100,\n  \"method\": \"nonexistent\",\n  \"params\": {}\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/mcp",
+							"host": ["{{base_url}}"],
+							"path": ["mcp"]
+						},
+						"description": "Demonstrates the error response when calling an unknown method."
+					},
+					"response": [
+						{
+							"name": "200 OK — Method Not Found",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 100,\n  \"error\": {\n    \"code\": -32601,\n    \"message\": \"Method not found: nonexistent\"\n  }\n}"
+						}
+					]
+				},
+				{
+					"name": "Error — Missing Query Parameter",
+					"request": {
+						"method": "POST",
+						"header": [
+							{
+								"key": "Content-Type",
+								"value": "application/json"
+							}
+						],
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 101,\n  \"method\": \"tools/call\",\n  \"params\": {\n    \"name\": \"query_documents\",\n    \"arguments\": {}\n  }\n}"
+						},
+						"url": {
+							"raw": "{{base_url}}/mcp",
+							"host": ["{{base_url}}"],
+							"path": ["mcp"]
+						},
+						"description": "Demonstrates the error when calling query_documents without a query parameter."
+					},
+					"response": [
+						{
+							"name": "200 OK — Invalid Params",
+							"status": "OK",
+							"code": 200,
+							"header": [{"key": "Content-Type", "value": "application/json"}],
+							"body": "{\n  \"jsonrpc\": \"2.0\",\n  \"id\": 101,\n  \"error\": {\n    \"code\": -32602,\n    \"message\": \"Missing or empty 'query' parameter\"\n  }\n}"
+						}
+					]
+				}
+			]
+		}
+	]
+}
