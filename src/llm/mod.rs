@@ -1985,7 +1985,7 @@ impl AgentOrchestrator {
         skip(self, raw_text, images, status_tx, cancel_token),
         fields(file_name, image_count = images.len())
     )]
-    async fn enrich_text_with_images(
+    pub async fn enrich_text_with_images(
         &self,
         raw_text: &str,
         images: &[crate::parser::ExtractedImage],
