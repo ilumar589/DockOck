@@ -15,11 +15,13 @@
 
 mod app;
 mod cache;
+mod chat;
 mod context;
 mod depgraph;
 mod gherkin;
 mod llm;
 mod markdown;
+mod mcp;
 mod memory;
 mod openspec;
 mod parser;

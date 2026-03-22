@@ -154,6 +154,9 @@ pub enum OutputMode {
     DependencyGraph,
     /// Generate rich Markdown knowledge-base documents.
     Markdown,
+    /// Index documents only — no LLM transformation. Stores vectors in MongoDB
+    /// for Chat and MCP tool queries.
+    IndexOnly,
 }
 
 impl Default for OutputMode {
@@ -168,12 +171,13 @@ impl std::fmt::Display for OutputMode {
             Self::Gherkin => write!(f, "Gherkin (.feature)"),
             Self::DependencyGraph => write!(f, "Dependency Graph"),
             Self::Markdown => write!(f, "Markdown (.md)"),
+            Self::IndexOnly => write!(f, "Index Only (Chat/MCP)"),
         }
     }
 }
 
 impl OutputMode {
-    pub const ALL: [OutputMode; 3] = [Self::Gherkin, Self::DependencyGraph, Self::Markdown];
+    pub const ALL: [OutputMode; 4] = [Self::Gherkin, Self::DependencyGraph, Self::Markdown, Self::IndexOnly];
 }
 
 /// Ollama instance definitions.
