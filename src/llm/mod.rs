@@ -152,6 +152,8 @@ pub enum OutputMode {
     Gherkin,
     /// Generate dependency graphs with business logic and state transitions.
     DependencyGraph,
+    /// Generate rich Markdown knowledge-base documents.
+    Markdown,
 }
 
 impl Default for OutputMode {
@@ -165,12 +167,13 @@ impl std::fmt::Display for OutputMode {
         match self {
             Self::Gherkin => write!(f, "Gherkin (.feature)"),
             Self::DependencyGraph => write!(f, "Dependency Graph"),
+            Self::Markdown => write!(f, "Markdown (.md)"),
         }
     }
 }
 
 impl OutputMode {
-    pub const ALL: [OutputMode; 2] = [Self::Gherkin, Self::DependencyGraph];
+    pub const ALL: [OutputMode; 3] = [Self::Gherkin, Self::DependencyGraph, Self::Markdown];
 }
 
 /// Ollama instance definitions.
@@ -612,6 +615,243 @@ Rules:
 6. Use consistent naming throughout.
 7. Do not add explanatory prose outside the JSON."#;
 
+// ─────────────────────────────────────────────
+// Markdown knowledge-base preambles
+// ─────────────────────────────────────────────
+
+pub const MARKDOWN_EXTRACTOR_PREAMBLE: &str = r#"You are a senior technical documentation architect.
+Your task is to consume raw document content and decompose it into a richly structured knowledge inventory.
+
+OUTPUT FORMAT — You must produce these sections in order. If a section has no relevant data, write "N/A".
+
+## DATABASE SCHEMA
+For every table, entity, or data store mentioned:
+- Table/collection name
+- Column/field list with: name, type, nullable?, default, constraints (PK, FK, unique, check)
+- Index definitions if mentioned
+- Relationships to other tables (FK references, junction tables)
+
+## DATA MODELS
+For every business object, DTO, or aggregate:
+- Class/struct name and purpose
+- Fields with types and validation rules
+- Inheritance or composition hierarchies
+- Serialization notes (JSON field names, XML element mappings)
+
+## ARCHITECTURE
+For every system component, service, or layer mentioned:
+- Component name and responsibility
+- Technology stack (language, framework, database)
+- Communication protocols (REST, gRPC, message queue, event bus)
+- Deployment topology (container, serverless, on-prem)
+- ASCII or Mermaid representation of component interactions
+
+## ENTITY RELATIONSHIPS
+- Entity pairs and cardinality (1:1, 1:N, M:N)
+- Relationship semantics (owns, references, depends-on, triggers)
+- Lifecycle coupling (cascade delete, orphan rules)
+
+## STATE MACHINES
+For every entity with lifecycle states:
+- State names and descriptions
+- Transitions: from → to, trigger event, guard conditions
+- Terminal states and error states
+
+## BUSINESS RULES
+- Rule ID and plain-language description
+- Trigger (what event invokes it)
+- Preconditions and postconditions
+- Validation formula or pseudo-code if available
+
+## PROCESS FLOWS
+For every workflow or business process:
+- Step sequence (numbered)
+- Decision points with branch conditions
+- Parallel paths
+- Exception/error paths
+- Actors involved at each step
+
+## TEST DATA TABLES
+For every table of test data, acceptance criteria, or example values:
+- Reproduce the table in pipe-delimited Markdown format
+- Preserve column headers exactly
+- Note which scenarios each row is intended to validate
+
+## UI / SCREENS
+For every UI dialog, form, or page:
+- Screen name and purpose
+- Field list with control type, mandatory/optional, validation
+- Button actions and navigation targets
+- Layout notes (tabs, sections, groups)
+
+## IMAGE / DIAGRAM CONTENT
+For every embedded image or diagram:
+- Diagram type (flowchart, ER, deployment, sequence, etc.)
+- Full transcription of all text, labels, connectors
+- Structure in Mermaid syntax when possible
+
+## CROSS-DOCUMENT REFERENCES
+- List every reference to another document (by name, ID, or hyperlink)
+- Describe what is referenced and why
+
+Keep all information faithful to the source. Do not invent data. Transcribe technical details verbatim.
+Maximum output: 2000 words."#;
+
+pub const MARKDOWN_GENERATOR_PREAMBLE: &str = r#"You are a technical knowledge-base author.
+Your task is to convert a structured knowledge inventory into a polished, comprehensive Markdown document
+that another AI agent can consume to implement the described system feature-by-feature.
+
+DOCUMENT STRUCTURE — Generate exactly this layout:
+
+# <Feature/Document Title>
+
+## Summary
+One paragraph: what this document describes, which system area it covers, and key entities involved.
+
+## Database Schema
+For each table: render as a Markdown table with columns: Field | Type | Nullable | Default | Constraints.
+Below each table, list foreign-key relationships as bullet points.
+Include CREATE TABLE pseudo-SQL if the source contains enough detail.
+
+## Data Models
+For each entity/class:
+- Heading with entity name
+- Bullet list of fields with type annotations
+- Validation rules as nested bullets
+- Relationships to other models
+
+## Architecture
+- Component diagram in Mermaid ```mermaid fenced block
+- Bullet list of each component with: name, responsibility, tech stack, protocol
+- Data flow arrows described textually
+
+## Entity Relationships
+- ER diagram in Mermaid ```mermaid fenced block
+- Prose description of each relationship with cardinality
+
+## State Machines
+- State diagram in Mermaid ```mermaid fenced block (stateDiagram-v2)
+- Transition table: | From | To | Trigger | Guard |
+
+## Business Rules
+Numbered list. Each rule:
+> **BR-NNN**: <description>
+> - Trigger: <event>
+> - Precondition: <condition>
+> - Postcondition: <result>
+> - Validation: <formula or pseudo-code>
+
+## Process Flows
+For each process:
+- Flowchart in Mermaid ```mermaid fenced block
+- Numbered step list with actor, action, decision branches
+
+## Test Data
+Reproduce every data table from the source as a Markdown pipe table.
+Add a "Purpose" column if not present, explaining what each row verifies.
+
+## UI Specifications
+For each screen/dialog:
+- Screen name heading
+- Field table: | Field | Control | Required | Validation | Notes |
+- Button list with actions
+- Navigation flows
+
+## Visio Diagram Content
+For each Visio page:
+- Page title
+- All shapes and connections transcribed
+- Flow direction and decision logic
+- Mermaid equivalent where feasible
+
+## Excel Reference Data
+For each worksheet:
+- Sheet name heading
+- Full data table in Markdown pipe format
+- Column type annotations
+- Notable patterns or groupings
+
+## Cross-References
+Bullet list: each entry is `[Document Name](relative-link) — relationship description`.
+
+## Appendix: Raw Extracted Content
+Preserve a collapsed <details> block with the original extracted text for traceability.
+
+OUTPUT RULES:
+1. Output ONLY valid Markdown. No conversational text outside the document structure.
+2. Mermaid diagrams must be syntactically valid.
+3. Every piece of information from the source must appear — nothing omitted.
+4. Tables must have header rows and separator rows.
+5. Use heading levels consistently: # for title, ## for major sections, ### for subsections.
+6. Cross-reference other project documents by name whenever the source mentions them.
+7. End with a blank line."#;
+
+pub const MARKDOWN_REVIEWER_PREAMBLE: &str = r#"You are a technical documentation quality auditor.
+Your task is to review a Markdown knowledge-base document and ensure it is complete, accurate, and
+well-structured enough for another AI agent to implement the described system from it alone.
+
+REVIEW CHECKLIST — verify each item and fix violations:
+
+1. COMPLETENESS: Every section from the template must be present (even if "N/A").
+   Cross-check against the source material — flag any omitted data.
+2. DATABASE ACCURACY: Table schemas must have all columns with correct types.
+   Foreign keys must reference existing tables. Constraints must match the source.
+3. MERMAID VALIDITY: Every ```mermaid block must parse without errors.
+   Common fixes: quote labels with special chars, ensure arrow syntax (-->), close subgraphs.
+4. TABLE FORMATTING: Every Markdown table must have a header row and |---|---| separator.
+   Columns must align. No empty tables.
+5. CROSS-REFERENCES: Every mentioned external document must appear in the Cross-References section.
+   Links must use consistent naming.
+6. BUSINESS RULE FIDELITY: Rules must match source wording exactly. No invented rules.
+   Conditions must be verbatim, not paraphrased.
+7. STATE MACHINE COVERAGE: All states and transitions from the source must be present.
+   No orphan states (unreachable or dead-end without documentation).
+8. TEST DATA PRESERVATION: All rows from source tables must be reproduced exactly.
+   No summarization of tabular data.
+9. HEADING HIERARCHY: # > ## > ### — no skipped levels.
+10. NO CONVERSATIONAL PROSE: Remove any "Here is the document..." or "I hope this helps" text.
+
+Output ONLY the corrected Markdown document — no review commentary."#;
+
+pub const MARKDOWN_GROUP_GENERATOR_PREAMBLE: &str = r#"You are a technical knowledge-base author specialising in multi-document synthesis.
+You will receive structured summaries from MULTIPLE related documents. Your task is to produce
+a single unified Markdown knowledge-base document that merges all information, resolves overlaps,
+and creates a coherent reference for another AI agent to implement the described system.
+
+Follow the same document structure as for single-document generation (# Title, ## Summary,
+## Database Schema, ## Data Models, ## Architecture, ## Entity Relationships, ## State Machines,
+## Business Rules, ## Process Flows, ## Test Data, ## UI Specifications, ## Cross-References).
+
+MERGE RULES:
+1. Combine database schemas from all documents — merge tables that share the same name,
+   union columns, deduplicate constraints.
+2. Merge data models — if the same entity appears in multiple documents, merge fields
+   and note which document each field originates from.
+3. Architecture sections — combine into one component diagram showing the full system.
+4. Cross-references should list ALL source documents and their inter-relationships.
+5. Preserve ALL test data from ALL documents — do not drop rows.
+6. For conflicting information, include both versions and note the conflict.
+
+OUTPUT RULES:
+1. Output ONLY valid Markdown.
+2. Mermaid diagrams must be syntactically valid.
+3. Every piece of information from every source document must appear.
+4. End with a blank line."#;
+
+pub const MARKDOWN_MERGE_REVIEWER_PREAMBLE: &str = r#"You are a Markdown knowledge-base merge specialist.
+You will receive Markdown knowledge-base fragments generated from multiple overlapping sections
+of the same document. Your task is to merge them into a single cohesive Markdown document.
+
+Rules:
+1. Output ONLY valid Markdown following the standard knowledge-base structure.
+2. Combine duplicate sections — same heading appearing in multiple chunks — into one section,
+   merging their content.
+3. Deduplicate tables and business rules — remove exact duplicates.
+4. Merge database schemas — combine tables, union columns.
+5. Preserve all unique content — do not drop anything.
+6. Use consistent heading hierarchy: # > ## > ### .
+7. Do not add explanatory prose outside the document structure."#;
+
 /// Streaming chunk from Ollama's `/api/generate` endpoint.
 #[derive(serde::Deserialize)]
 pub(crate) struct OllamaStreamGenerateChunk {
@@ -679,6 +919,8 @@ pub struct AgentOrchestrator {
     rag_indexes: Vec<crate::rag::SharedVectorIndex>,
     /// Custom provider configs for looking up real model token limits.
     custom_configs: Vec<CustomProviderConfig>,
+    /// Optional tech stack prompt block prepended to Markdown-mode preambles.
+    pub tech_stack_prompt: Option<String>,
 }
 
 /// Result of checking which Ollama endpoints are reachable.
@@ -799,6 +1041,7 @@ impl AgentOrchestrator {
                         )),
                         rag_indexes: Vec::new(),
                         custom_configs: Vec::new(),
+                        tech_stack_prompt: None,
                     },
                     statuses,
                 ))
@@ -873,6 +1116,7 @@ impl AgentOrchestrator {
                         generator_prefix_cache: None, // not applicable for cloud APIs
                         rag_indexes: Vec::new(),
                         custom_configs: Vec::new(),
+                        tech_stack_prompt: None,
                     },
                     statuses,
                 ))
@@ -890,6 +1134,14 @@ impl AgentOrchestrator {
     /// Store custom provider configs for model limit lookups.
     pub fn set_custom_configs(&mut self, configs: Vec<CustomProviderConfig>) {
         self.custom_configs = configs;
+    }
+
+    /// Build a markdown preamble with optional tech stack block prepended.
+    fn markdown_preamble(&self, base_preamble: &str) -> String {
+        match &self.tech_stack_prompt {
+            Some(block) => format!("{}{}", block, base_preamble),
+            None => base_preamble.to_string(),
+        }
     }
 
     /// Compute the input character budget for a model, using real token limits
@@ -2980,6 +3232,626 @@ impl AgentOrchestrator {
                 cancel_token,
             ).await
         }
+    }
+
+    // ─────────────────────────────────────────────
+    // Markdown knowledge-base pipeline
+    // ─────────────────────────────────────────────
+
+    /// Run the full markdown knowledge-base pipeline for a single file.
+    #[tracing::instrument(
+        name = "llm.process_file_markdown",
+        skip(self, raw_text, images, context, status_tx, cancel_token),
+        fields(file_name, file_type)
+    )]
+    pub async fn process_file_markdown(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        raw_text: &str,
+        images: &[crate::parser::ExtractedImage],
+        context: &ProjectContext,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        force_regenerate: bool,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let (context_summary, glossary, context_overhead) =
+            self.build_bounded_context(context, &std::collections::HashSet::new());
+        let images_hash = {
+            let mut h = sha2::Sha256::new();
+            for img in images {
+                sha2::Digest::update(&mut h, &img.data);
+            }
+            format!("{:x}", h.finalize())
+        };
+        let cache_key = crate::cache::composite_key(&[
+            b"markdown",
+            file_name.as_bytes(),
+            raw_text.as_bytes(),
+            format!("{:?}", self.mode).as_bytes(),
+            self.generator_model.as_bytes(),
+            self.extractor_model.as_bytes(),
+            self.reviewer_model.as_bytes(),
+            images_hash.as_bytes(),
+            context_summary.as_bytes(),
+        ]);
+
+        if !force_regenerate {
+            if let Some(cached) = self.cache.get_text(crate::cache::NS_MARKDOWN, &cache_key) {
+                let _ = status_tx.send(format!("📦 [Cache] {} — markdown loaded from cache", file_name));
+                return Ok(cached);
+            }
+        }
+
+        // ── Step 0: Describe images with vision model ──
+        let enriched_text = if !images.is_empty() {
+            let _ = status_tx.send(format!(
+                "👁 [Vision] Describing {} image(s) from {}…", images.len(), file_name
+            ));
+            self.enrich_text_with_images(raw_text, images, file_name, status_tx, cancel_token).await
+        } else {
+            raw_text.to_string()
+        };
+
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+        let model_budget = self.model_input_budget(budget_model);
+
+        // ── Chunk-and-merge path for oversized documents ──
+        if needs_chunking(&enriched_text, model_budget, context_overhead) {
+            let result = self.process_file_chunked_markdown(
+                file_name, file_type, &enriched_text, context, context_overhead, status_tx, cancel_token,
+            ).await?;
+            self.cache.put_text(crate::cache::NS_MARKDOWN, &cache_key, &result);
+            return Ok(result);
+        }
+
+        // ── Step 1: Extract structured inventory ──
+        let budget = self.model_input_budget(&self.generator_model);
+        let summary = if self.mode == PipelineMode::Full {
+            let _ = status_tx.send(format!("🔍 [Extractor] Analysing {}…", file_name));
+            self.extract_markdown(file_name, file_type, &enriched_text, status_tx, cancel_token).await
+                .unwrap_or_else(|e| {
+                    warn!("Markdown extraction failed for {}: {} — falling back to preprocessor", file_name, e);
+                    preprocess_text(&enriched_text, file_name, file_type, budget)
+                })
+        } else {
+            let _ = status_tx.send(format!("⚡ [Preprocess] Structuring {}…", file_name));
+            preprocess_text(&enriched_text, file_name, file_type, budget)
+        };
+
+        // ── Step 2: Generate Markdown ──
+        let _ = status_tx.send(format!("📝 [MD-Gen] Building knowledge-base for {}…", file_name));
+        let markdown = self.generate_markdown(
+            file_name, &summary, &context_summary, &glossary, status_tx, cancel_token,
+        ).await?;
+
+        // ── Step 3: Review / refine ──
+        let do_review = self.mode != PipelineMode::Fast
+            && (self.reviewer_client.is_some() || self.openai_client.is_some());
+        let result = if do_review {
+            let _ = status_tx.send(format!("✅ [MD-Review] Validating markdown for {}…", file_name));
+            match self.review_markdown(file_name, &markdown, status_tx, cancel_token).await {
+                Ok(refined) => refined,
+                Err(e) => {
+                    warn!("Markdown review failed for {}: {} — using unreviewed output", file_name, e);
+                    markdown
+                }
+            }
+        } else {
+            markdown
+        };
+
+        self.cache.put_text(crate::cache::NS_MARKDOWN, &cache_key, &result);
+        Ok(result)
+    }
+
+    /// Run the markdown knowledge-base pipeline for a group of files.
+    #[tracing::instrument(
+        name = "llm.process_group_markdown",
+        skip(self, members, context, status_tx, cancel_token),
+        fields(group_name, member_count = members.len())
+    )]
+    pub async fn process_group_markdown(
+        &self,
+        group_name: &str,
+        members: &[(String, String, String, Vec<crate::parser::ExtractedImage>)],
+        context: &ProjectContext,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        force_regenerate: bool,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let group_cache_key = {
+            let mut parts: Vec<Vec<u8>> = Vec::new();
+            parts.push(b"markdown".to_vec());
+            parts.push(group_name.as_bytes().to_vec());
+            for (name, ftype, text, images) in members {
+                parts.push(name.as_bytes().to_vec());
+                parts.push(ftype.as_bytes().to_vec());
+                parts.push(text.as_bytes().to_vec());
+                for img in images {
+                    parts.push(img.data.clone());
+                }
+            }
+            parts.push(format!("{:?}", self.mode).into_bytes());
+            parts.push(self.generator_model.as_bytes().to_vec());
+            parts.push(self.extractor_model.as_bytes().to_vec());
+            parts.push(self.reviewer_model.as_bytes().to_vec());
+            let refs: Vec<&[u8]> = parts.iter().map(|v| v.as_slice()).collect();
+            crate::cache::composite_key(&refs)
+        };
+
+        if !force_regenerate {
+            if let Some(cached) = self.cache.get_text(crate::cache::NS_MARKDOWN, &group_cache_key) {
+                let _ = status_tx.send(format!("📦 [Cache] group {} — markdown loaded from cache", group_name));
+                return Ok(cached);
+            }
+        }
+
+        // ── Step 0: Build merged text and images from all members ──
+        let budget = self.model_input_budget(&self.generator_model);
+        let mut merged_text = String::new();
+        let mut all_images: Vec<&crate::parser::ExtractedImage> = Vec::new();
+        let chars_per_member = budget / members.len().max(1);
+
+        for (i, (file_name, file_type, raw_text, images)) in members.iter().enumerate() {
+            merged_text.push_str(&format!(
+                "=== Document {}: {} ({}) ===\n", i + 1, file_name, file_type
+            ));
+            let excerpt: String = raw_text.chars().take(chars_per_member).collect();
+            merged_text.push_str(&excerpt);
+            if raw_text.len() > chars_per_member {
+                merged_text.push_str("\n[… content truncated …]\n");
+            }
+            merged_text.push_str("\n\n");
+            all_images.extend(images.iter());
+        }
+
+        if !all_images.is_empty() {
+            let _ = status_tx.send(format!(
+                "👁 [Vision] Describing {} image(s) from group {}…", all_images.len(), group_name
+            ));
+            let owned_images: Vec<crate::parser::ExtractedImage> =
+                all_images.iter().map(|img| (*img).clone()).collect();
+            merged_text =
+                self.enrich_text_with_images(&merged_text, &owned_images, group_name, status_tx, cancel_token).await;
+        }
+
+        let member_names: std::collections::HashSet<&str> =
+            members.iter().map(|(name, _, _, _)| name.as_str()).collect();
+        let exclude: std::collections::HashSet<String> = context
+            .file_contents
+            .keys()
+            .filter(|path| {
+                let fname = std::path::Path::new(path.as_str())
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                member_names.contains(fname.as_str())
+            })
+            .cloned()
+            .collect();
+
+        let (context_summary, glossary, context_overhead) =
+            self.build_bounded_context(context, &exclude);
+
+        // ── Chunk-and-merge path for oversized merged groups ──
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+        let group_budget = self.model_input_budget(budget_model);
+        if needs_chunking(&merged_text, group_budget, context_overhead) {
+            let result = self.process_file_chunked_markdown(
+                group_name, "Multi-document group", &merged_text, context, context_overhead, status_tx, cancel_token,
+            ).await?;
+            self.cache.put_text(crate::cache::NS_MARKDOWN, &group_cache_key, &result);
+            return Ok(result);
+        }
+
+        // ── Step 1: Extract/preprocess ──
+        let summary = if self.mode == PipelineMode::Full {
+            let _ = status_tx.send(format!("🔍 [Extractor] Analysing group {}…", group_name));
+            self.extract_group(group_name, &merged_text, status_tx, cancel_token)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Group extraction failed for {}: {} — falling back to preprocessor", group_name, e);
+                    preprocess_text(&merged_text, group_name, "Multi-document group", budget)
+                })
+        } else {
+            let _ = status_tx.send(format!("⚡ [Preprocess] Structuring group {}…", group_name));
+            preprocess_text(&merged_text, group_name, "Multi-document group", budget)
+        };
+
+        // ── Step 2: Generate Markdown ──
+        let _ = status_tx.send(format!("📝 [MD-Gen] Building knowledge-base for group {}…", group_name));
+        let markdown = self.generate_group_markdown(
+            group_name, &summary, &context_summary, &glossary, status_tx, cancel_token,
+        ).await?;
+
+        // ── Step 3: Review / refine ──
+        let do_review = self.mode != PipelineMode::Fast
+            && (self.reviewer_client.is_some() || self.openai_client.is_some());
+        let result = if do_review {
+            let _ = status_tx.send(format!("✅ [MD-Review] Validating markdown for group {}…", group_name));
+            match self.review_markdown(group_name, &markdown, status_tx, cancel_token).await {
+                Ok(refined) => refined,
+                Err(e) => {
+                    warn!("Markdown review failed for group {}: {} — using unreviewed output", group_name, e);
+                    markdown
+                }
+            }
+        } else {
+            markdown
+        };
+
+        self.cache.put_text(crate::cache::NS_MARKDOWN, &group_cache_key, &result);
+        Ok(result)
+    }
+
+    /// Extract structured knowledge inventory using the markdown-specific extractor preamble.
+    async fn extract_markdown(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        enriched_text: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let budget = self.model_input_budget(&self.extractor_model);
+        let truncated = truncate_for_prompt(
+            enriched_text,
+            budget,
+            "[… document content truncated to fit model input budget …]",
+        );
+        let prompt = format!(
+            "=== Document: {} ({}) ===\n{}\n\nExtract the structured knowledge inventory from this document.",
+            file_name, file_type, truncated
+        );
+        let preamble = self.markdown_preamble(MARKDOWN_EXTRACTOR_PREAMBLE);
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.extractor_model, &preamble,
+                &prompt, vec![], "MD-Extract", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.extractor_client.as_ref().unwrap_or_else(||
+                    self.generator_client.as_ref().expect("Ollama client required")
+                ),
+                &self.extractor_model, &preamble,
+                &prompt, vec![], "MD-Extract", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Generate markdown knowledge-base document from a structured summary.
+    async fn generate_markdown(
+        &self,
+        file_name: &str,
+        summary: &str,
+        context_summary: &str,
+        glossary: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let model_budget = self.model_input_budget(&self.generator_model);
+        let (summary_cap, context_cap, glossary_cap) = prompt_section_caps(model_budget);
+        let bounded_summary = truncate_for_prompt(
+            summary,
+            summary_cap,
+            "[… structured summary truncated to fit model input budget …]",
+        );
+        let bounded_context_summary = truncate_for_prompt(
+            context_summary,
+            context_cap,
+            "[… cross-file context truncated to fit model input budget …]",
+        );
+        let bounded_glossary = truncate_for_prompt(
+            glossary,
+            glossary_cap,
+            "[… glossary truncated to fit model input budget …]",
+        );
+
+        let mut history: Vec<Message> = Vec::new();
+        if !bounded_glossary.is_empty() {
+            history.push(Message::user(bounded_glossary));
+        }
+        if !bounded_context_summary.contains("No prior files") && !bounded_context_summary.is_empty() {
+            history.push(Message::user(bounded_context_summary));
+        }
+
+        let prompt = if !self.rag_indexes.is_empty() {
+            format!(
+                "=== Structured Summary ===\n{bounded_summary}\n\n\
+                 Generate the Markdown knowledge-base document for: {file_name}"
+            )
+        } else {
+            history.push(Message::user(format!(
+                "=== Structured Summary ===\n{bounded_summary}"
+            )));
+            format!("Generate the Markdown knowledge-base document for: {file_name}")
+        };
+
+        let preamble = self.markdown_preamble(MARKDOWN_GENERATOR_PREAMBLE);
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, &preamble,
+                &prompt, history, "MD-Gen", file_name, &self.rag_indexes,
+                status_tx,
+                std::time::Duration::from_secs(240),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, &preamble,
+                &prompt, history, "MD-Gen", file_name, &self.rag_indexes,
+                status_tx,
+                std::time::Duration::from_secs(240),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Generate markdown knowledge-base for a group using the group-specific preamble.
+    async fn generate_group_markdown(
+        &self,
+        group_name: &str,
+        summary: &str,
+        context_summary: &str,
+        glossary: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let model_budget = self.model_input_budget(&self.generator_model);
+        let (summary_cap, context_cap, glossary_cap) = prompt_section_caps(model_budget);
+        let bounded_summary = truncate_for_prompt(
+            summary,
+            summary_cap,
+            "[… unified structured summary truncated to fit model input budget …]",
+        );
+        let bounded_context_summary = truncate_for_prompt(
+            context_summary,
+            context_cap,
+            "[… cross-file context truncated to fit model input budget …]",
+        );
+        let bounded_glossary = truncate_for_prompt(
+            glossary,
+            glossary_cap,
+            "[… glossary truncated to fit model input budget …]",
+        );
+
+        let mut history: Vec<Message> = Vec::new();
+        if !bounded_glossary.is_empty() {
+            history.push(Message::user(bounded_glossary));
+        }
+        if !bounded_context_summary.contains("No prior files") && !bounded_context_summary.is_empty() {
+            history.push(Message::user(bounded_context_summary));
+        }
+
+        let prompt = if !self.rag_indexes.is_empty() {
+            format!(
+                "=== Unified Structured Summary ===\n{bounded_summary}\n\n\
+                 Generate a single unified Markdown knowledge-base document for document group: {group_name}"
+            )
+        } else {
+            history.push(Message::user(format!(
+                "=== Unified Structured Summary ===\n{bounded_summary}"
+            )));
+            format!("Generate a single unified Markdown knowledge-base document for document group: {group_name}")
+        };
+
+        let preamble = self.markdown_preamble(MARKDOWN_GROUP_GENERATOR_PREAMBLE);
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, &preamble,
+                &prompt, history, "MD-Gen", group_name, &self.rag_indexes,
+                status_tx,
+                std::time::Duration::from_secs(300),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, &preamble,
+                &prompt, history, "MD-Gen", group_name, &self.rag_indexes,
+                status_tx,
+                std::time::Duration::from_secs(300),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Review and improve a markdown knowledge-base document.
+    async fn review_markdown(
+        &self,
+        file_name: &str,
+        markdown: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let model = self.effective_reviewer_model();
+        let history = vec![
+            Message::user(markdown.to_owned()),
+        ];
+
+        let preamble = self.markdown_preamble(MARKDOWN_REVIEWER_PREAMBLE);
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, model, &preamble,
+                "Review and correct the Markdown knowledge-base document above. Output only the corrected Markdown:",
+                history, "MD-Review", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.ollama_reviewer_client(), model, &preamble,
+                "Review and correct the Markdown knowledge-base document above. Output only the corrected Markdown:",
+                history, "MD-Review", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Merge markdown chunks from an oversized document.
+    async fn merge_chunk_markdown(
+        &self,
+        file_name: &str,
+        chunk_markdowns: &[String],
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        if chunk_markdowns.len() == 1 {
+            return Ok(chunk_markdowns[0].clone());
+        }
+
+        let _ = status_tx.send(format!(
+            "🔀 [MD-Merge] {}: merging {} chunks…", file_name, chunk_markdowns.len()
+        ));
+
+        let mut combined = String::new();
+        let merge_budget = self.model_input_budget(&self.generator_model);
+        let per_chunk = merge_budget / chunk_markdowns.len().max(1);
+        for (i, md) in chunk_markdowns.iter().enumerate() {
+            let header = format!(
+                "=== Markdown from Part {}/{} ===\n",
+                i + 1, chunk_markdowns.len(),
+            );
+            let excerpt: String = md.chars().take(per_chunk.saturating_sub(header.len() + 2)).collect();
+            combined.push_str(&header);
+            combined.push_str(&excerpt);
+            if md.len() > per_chunk {
+                combined.push_str("\n[… truncated …]");
+            }
+            combined.push_str("\n\n");
+        }
+
+        let history = vec![Message::user(combined)];
+        let prompt = format!(
+            "Merge the {} Markdown knowledge-base chunks above into a single cohesive document for '{}'.",
+            chunk_markdowns.len(), file_name
+        );
+
+        let preamble = self.markdown_preamble(MARKDOWN_MERGE_REVIEWER_PREAMBLE);
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, &self.generator_model, &preamble,
+                &prompt, history, "MD-Merge", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(240),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.generator_client.as_ref().expect("Ollama generator required"),
+                &self.generator_model, &preamble,
+                &prompt, history, "MD-Merge", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(240),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Chunked pipeline for markdown mode — oversized documents.
+    async fn process_file_chunked_markdown(
+        &self,
+        file_name: &str,
+        file_type: &str,
+        enriched_text: &str,
+        context: &ProjectContext,
+        context_overhead: usize,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let budget_model = if self.mode == PipelineMode::Full {
+            if self.extractor_client.is_some() || self.openai_client.is_some() { &self.extractor_model } else { &self.generator_model }
+        } else {
+            &self.generator_model
+        };
+        let model_budget = self.model_input_budget(budget_model);
+        let chunks = chunk_for_llm(enriched_text, model_budget, context_overhead);
+        let n = chunks.len();
+
+        let _ = status_tx.send(format!(
+            "📐 [Chunked-MD] {}: splitting into {} chunks", file_name, n
+        ));
+
+        let budget = self.model_input_budget(&self.generator_model);
+        let mut summaries: Vec<String> = Vec::with_capacity(n);
+
+        for chunk in &chunks {
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("Cancelled during chunked extraction for {file_name}");
+            }
+            let chunk_label = format!("{} [{}/{}]", file_name, chunk.index + 1, chunk.total);
+
+            let summary = if self.mode == PipelineMode::Full {
+                let _ = status_tx.send(format!("🔍 [Extractor] Analysing {}…", chunk_label));
+                self.extract_markdown(&chunk_label, file_type, &chunk.text, status_tx, cancel_token)
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!("Extraction failed for {}: {} — falling back to preprocessor", chunk_label, e);
+                        preprocess_text(&chunk.text, &chunk_label, file_type, budget)
+                    })
+            } else {
+                let _ = status_tx.send(format!("⚡ [Preprocess] Structuring {}…", chunk_label));
+                preprocess_text(&chunk.text, &chunk_label, file_type, budget)
+            };
+            summaries.push(summary);
+        }
+
+        let (context_summary, glossary, _) =
+            self.build_bounded_context(context, &std::collections::HashSet::new());
+        let mut chunk_markdowns: Vec<String> = Vec::with_capacity(n);
+
+        for (i, summary) in summaries.iter().enumerate() {
+            if cancel_token.is_cancelled() {
+                anyhow::bail!("Cancelled during chunked markdown generation for {file_name}");
+            }
+            let chunk_label = format!("{} [{}/{}]", file_name, i + 1, n);
+            let _ = status_tx.send(format!("📝 [MD-Gen] Building knowledge-base for {}…", chunk_label));
+
+            let mut other_summaries = String::new();
+            for (j, s) in summaries.iter().enumerate() {
+                if j != i {
+                    other_summaries.push_str(&format!(
+                        "--- Summary from part {}/{} ---\n{}\n\n",
+                        j + 1, n, &s[..s.len().min(500)]
+                    ));
+                }
+            }
+            let chunk_context = if other_summaries.is_empty() {
+                context_summary.clone()
+            } else {
+                format!(
+                    "{}\n\n=== Summaries from other parts of the same document ===\n{}",
+                    context_summary, other_summaries
+                )
+            };
+
+            let markdown = self.generate_markdown(
+                &chunk_label, summary, &chunk_context, &glossary, status_tx, cancel_token,
+            ).await?;
+            chunk_markdowns.push(markdown);
+        }
+
+        self.merge_chunk_markdown(file_name, &chunk_markdowns, status_tx, cancel_token).await
     }
 }
 

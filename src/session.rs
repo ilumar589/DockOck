@@ -61,6 +61,24 @@ pub struct SessionData {
     /// Previous merged dependency graph for diffing.
     #[serde(default)]
     pub previous_merged_depgraph: Option<DependencyGraph>,
+    /// Markdown knowledge-base results (file-keyed, serialized as string paths).
+    #[serde(default)]
+    pub markdown_results: HashMap<String, String>,
+    /// Markdown knowledge-base results for groups.
+    #[serde(default)]
+    pub group_markdown_results: HashMap<String, String>,
+    /// Previous markdown results for diffing.
+    #[serde(default)]
+    pub previous_markdown_results: HashMap<String, String>,
+    /// Previous group markdown results for diffing.
+    #[serde(default)]
+    pub previous_group_markdown_results: HashMap<String, String>,
+    /// Selected tech stack key (for Markdown mode).
+    #[serde(default)]
+    pub selected_tech_stack: Option<String>,
+    /// Auto-generated project knowledge-base index markdown.
+    #[serde(default)]
+    pub markdown_project_index: Option<String>,
 }
 
 /// Build the session file path from the output directory.
