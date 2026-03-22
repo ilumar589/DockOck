@@ -159,7 +159,7 @@ fn short_model_name(name: &str) -> &str {
     if name.len() <= 22 {
         name
     } else {
-        &name[..22]
+        &name[..name.floor_char_boundary(22)]
     }
 }
 
@@ -223,6 +223,8 @@ pub enum ProcessingEvent {
         markdown: String,
         elapsed: std::time::Duration,
     },
+    /// RAG indexing completed — carries the MongoDB client for caching
+    RagReady(mongodb::Client),
 }
 
 /// Events from background chat queries.
@@ -1509,6 +1511,9 @@ impl DockOckApp {
                         }
                     }
                     self.auto_save_session();
+                }
+                ProcessingEvent::RagReady(client) => {
+                    self.mongo_client = Some(client);
                 }
             }
         }
@@ -4066,10 +4071,7 @@ async fn process_files(
             }
         };
 
-        // Ensure vector search indexes exist (idempotent — ignores "already exists")
-        crate::rag::ensure_search_indexes(&mongo_client).await;
-
-        // Determine embedding provider based on user's choice
+        // Determine embedding provider based on user's choice (needed before index creation)
         let embedding_provider = {
             let ollama_url = match &backend {
                 crate::llm::ProviderBackend::Ollama => "http://localhost:11435".to_string(),
@@ -4220,6 +4222,30 @@ async fn process_files(
                     .into_iter()
                     .collect();
                 let _ = crate::rag::cleanup_orphaned_chunks(&collection, &active_files).await;
+
+                // Create vector search indexes AFTER documents exist in
+                // the collection.  On a clean database the collection is
+                // only created by the upsert_embeddings step above, so
+                // calling createSearchIndexes before that would create an
+                // index on a non-existent collection that never activates.
+                crate::rag::ensure_search_indexes(&mongo_client, &embedding_provider).await;
+
+                // Wait for the chunks vector search index to become queryable.
+                // On a fresh database the index is built asynchronously after
+                // createSearchIndexes returns, so queries would return 0
+                // results until it finishes processing the new documents.
+                let tx_wait = tx.clone();
+                crate::rag::wait_for_search_index_ready(
+                    &mongo_client, "chunks", "vector_index",
+                    std::time::Duration::from_secs(120),
+                    |msg| { let _ = tx_wait.send(ProcessingEvent::Status(msg.to_string())); },
+                ).await;
+                let tx_wait2 = tx.clone();
+                crate::rag::wait_for_search_index_ready(
+                    &mongo_client, "memories", "memory_vector_index",
+                    std::time::Duration::from_secs(60),
+                    |msg| { let _ = tx_wait2.send(ProcessingEvent::Status(msg.to_string())); },
+                ).await;
             }
             Ok(false) => {
                 let _ = tx.send(ProcessingEvent::Status(
@@ -4234,6 +4260,9 @@ async fn process_files(
                 break 'rag None;
             }
         }
+
+        // Cache the MongoDB client back to the UI for chat/MCP reuse
+        let _ = tx.send(ProcessingEvent::RagReady(mongo_client.clone()));
 
         Some((embedding_provider, mongo_client))
     };

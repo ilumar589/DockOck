@@ -162,9 +162,17 @@ pub async fn retrieve_chunks(
     };
 
     match results {
-        Ok(refs) => refs,
+        Ok(refs) => {
+            if refs.is_empty() {
+                info!("Chat RAG retrieval returned 0 chunks for query (len={})", query.len());
+            } else {
+                info!("Chat RAG retrieval found {} chunks", refs.len());
+            }
+            refs
+        }
         Err(e) => {
             warn!("Chat RAG retrieval failed: {e}");
+            eprintln!("[CHAT] RAG retrieval error: {e}");
             Vec::new()
         }
     }
@@ -226,7 +234,7 @@ async fn do_retrieve_chunks<I: rig::vector_store::VectorStoreIndex>(
         .samples((CHAT_TOP_K + 2) as u64)
         .build()?;
 
-    let results: Vec<(f64, String, String)> = tokio::select! {
+    let results: Vec<(f64, String, serde_json::Value)> = tokio::select! {
         r = index.top_n(request) => r?,
         _ = cancel_token.cancelled() => {
             anyhow::bail!("Chat retrieval cancelled");
@@ -236,9 +244,19 @@ async fn do_retrieve_chunks<I: rig::vector_store::VectorStoreIndex>(
     let mut refs = Vec::new();
     let mut chars_used = 0usize;
 
-    for (score, id, text) in results {
+    for (score, id, doc) in results {
         if refs.len() >= CHAT_TOP_K {
             break;
+        }
+
+        // Extract text from the document — field is "text" for chunks
+        let text = doc.get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        if text.is_empty() {
+            continue;
         }
         if chars_used + text.len() > MAX_CHAT_CONTEXT_CHARS {
             break;
@@ -246,7 +264,8 @@ async fn do_retrieve_chunks<I: rig::vector_store::VectorStoreIndex>(
 
         let file_name = id.split(':').next().unwrap_or(&id).to_string();
         let excerpt = if text.len() > 200 {
-            format!("{}…", &text[..200])
+            let end = text.floor_char_boundary(200);
+            format!("{}…", &text[..end])
         } else {
             text.clone()
         };

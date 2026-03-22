@@ -361,7 +361,7 @@ async fn do_retrieve_memories<I: VectorStoreIndex>(
         .samples(MEMORY_TOP_K as u64)
         .build()?;
 
-    let results: Vec<(f64, String, String)> = tokio::select! {
+    let results: Vec<(f64, String, serde_json::Value)> = tokio::select! {
         r = index.top_n(request) => r?,
         _ = cancel_token.cancelled() => {
             anyhow::bail!("Cancelled during memory retrieval");
@@ -373,8 +373,14 @@ async fn do_retrieve_memories<I: VectorStoreIndex>(
     }
 
     let mut context = String::from("\n--- Historical Memories (from previous runs) ---\n");
-    for (score, _id, text) in &results {
-        context.push_str(&format!("• (relevance: {score:.2}) {text}\n"));
+    for (score, _id, doc) in &results {
+        // Extract memory text — field is "memory" for the memories collection
+        let text = doc.get("memory")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !text.is_empty() {
+            context.push_str(&format!("\u{2022} (relevance: {score:.2}) {text}\n"));
+        }
     }
 
     Ok(context)

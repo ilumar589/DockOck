@@ -163,13 +163,30 @@ pub fn chunks_collection(client: &MongoClient) -> Collection<bson::Document> {
     client.database("dockock").collection("chunks")
 }
 
+/// Return the embedding dimensions for the active provider / model.
+pub fn embedding_dimensions(provider: &EmbeddingProvider) -> i32 {
+    match provider {
+        EmbeddingProvider::Ollama { model, .. } => match model.as_str() {
+            "mxbai-embed-large" => 1024,
+            "nomic-embed-text" => 768,
+            _ => 768, // safe default for unknown Ollama models
+        },
+        EmbeddingProvider::FastEmbed => 384,
+    }
+}
+
 /// Ensure that the required Atlas Search vector indexes exist on both the
 /// `chunks` and `memories` collections.  On `mongodb-atlas-local` the indexes
 /// are created via `createSearchIndexes`; if they already exist the command
 /// returns an error that we silently ignore.
+///
+/// The `numDimensions` is set dynamically based on the selected embedding
+/// provider so that the index matches the actual embedding vectors.
 #[instrument(skip_all)]
-pub async fn ensure_search_indexes(client: &MongoClient) {
+pub async fn ensure_search_indexes(client: &MongoClient, provider: &EmbeddingProvider) {
     let db = client.database("dockock");
+    let dims = embedding_dimensions(provider);
+    eprintln!("[RAG] ensure_search_indexes: dims={dims} provider={:?}", std::mem::discriminant(provider));
 
     // Index for `chunks` collection
     let chunks_cmd = doc! {
@@ -181,16 +198,20 @@ pub async fn ensure_search_indexes(client: &MongoClient) {
                 "fields": [{
                     "type": "vector",
                     "path": "embedding",
-                    "numDimensions": 768,
+                    "numDimensions": dims,
                     "similarity": "cosine"
                 }]
             }
         }]
     };
     match db.run_command(chunks_cmd).await {
-        Ok(_) => info!("Created vector_index on chunks collection"),
+        Ok(_) => {
+            eprintln!("[RAG] Created vector_index on chunks (dims={dims})");
+            info!("Created vector_index on chunks collection (dims={dims})");
+        }
         Err(e) => {
             let msg = e.to_string();
+            eprintln!("[RAG] createSearchIndexes chunks error: {msg}");
             if msg.contains("already exists") || msg.contains("Duplicate") {
                 info!("vector_index already exists on chunks collection");
             } else {
@@ -199,7 +220,21 @@ pub async fn ensure_search_indexes(client: &MongoClient) {
         }
     }
 
-    // Index for `memories` collection
+    // Index for `memories` collection — create the collection first if it
+    // doesn't exist (createSearchIndexes requires the collection to exist).
+    let has_memories = db.list_collection_names()
+        .await
+        .map(|names| names.iter().any(|n| n == "memories"))
+        .unwrap_or(false);
+
+    if !has_memories {
+        eprintln!("[RAG] memories collection does not exist — creating it");
+        if let Err(e) = db.create_collection("memories").await {
+            eprintln!("[RAG] Failed to create memories collection: {e}");
+            warn!("Failed to create memories collection: {e}");
+        }
+    }
+
     let memories_cmd = doc! {
         "createSearchIndexes": "memories",
         "indexes": [{
@@ -209,22 +244,87 @@ pub async fn ensure_search_indexes(client: &MongoClient) {
                 "fields": [{
                     "type": "vector",
                     "path": "embedding",
-                    "numDimensions": 768,
+                    "numDimensions": dims,
                     "similarity": "cosine"
                 }]
             }
         }]
     };
     match db.run_command(memories_cmd).await {
-        Ok(_) => info!("Created memory_vector_index on memories collection"),
+        Ok(_) => {
+            eprintln!("[RAG] Created memory_vector_index on memories (dims={dims})");
+            info!("Created memory_vector_index on memories collection (dims={dims})");
+        }
         Err(e) => {
             let msg = e.to_string();
+            eprintln!("[RAG] createSearchIndexes memories error: {msg}");
             if msg.contains("already exists") || msg.contains("Duplicate") {
                 info!("memory_vector_index already exists on memories collection");
             } else {
                 warn!("Failed to create memory_vector_index on memories: {e}");
             }
         }
+    }
+}
+
+/// Wait for a vector search index to reach READY status on the given
+/// collection.  Polls `$listSearchIndexes` every 2 seconds up to `timeout`.
+/// Returns `true` if the index became ready, `false` on timeout.
+#[instrument(skip_all, fields(collection, index_name))]
+pub async fn wait_for_search_index_ready(
+    client: &MongoClient,
+    collection_name: &str,
+    index_name: &str,
+    timeout: std::time::Duration,
+    on_status: impl Fn(&str),
+) -> bool {
+    use futures::TryStreamExt;
+
+    let db = client.database("dockock");
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    on_status(&format!("⏳ Waiting for search index '{index_name}' to become queryable…"));
+    eprintln!("[RAG] wait_for_search_index_ready: collection={collection_name} index={index_name} timeout={}s", timeout.as_secs());
+
+    loop {
+        // Use the aggregation pipeline form: db.collection.aggregate([{$listSearchIndexes:{name:...}}])
+        let coll: Collection<bson::Document> = db.collection(collection_name);
+        let pipeline = vec![doc! { "$listSearchIndexes": { "name": index_name } }];
+        match coll.aggregate(pipeline).await {
+            Ok(mut cursor) => {
+                let mut found_any = false;
+                while let Ok(Some(doc)) = cursor.try_next().await {
+                    found_any = true;
+                    eprintln!("[RAG] listSearchIndexes result: {doc:?}");
+                    if let Ok(status) = doc.get_str("status") {
+                        info!("Search index '{index_name}' on '{collection_name}': status={status}");
+                        if status == "READY" {
+                            on_status(&format!("✅ Search index '{index_name}' is ready"));
+                            return true;
+                        }
+                    }
+                    // "queryable" field is also a good signal
+                    if let Ok(true) = doc.get_bool("queryable") {
+                        on_status(&format!("✅ Search index '{index_name}' is queryable"));
+                        return true;
+                    }
+                }
+                if !found_any {
+                    eprintln!("[RAG] listSearchIndexes returned 0 results for '{index_name}' on '{collection_name}'");
+                }
+            }
+            Err(e) => {
+                eprintln!("[RAG] listSearchIndexes aggregation failed: {e}");
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            warn!("Timed out waiting for search index '{index_name}' on '{collection_name}'");
+            on_status(&format!("⚠ Search index '{index_name}' not ready after {}s — queries may return empty results", timeout.as_secs()));
+            return false;
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
 }
 
@@ -617,7 +717,7 @@ async fn do_retrieve<I: VectorStoreIndex>(
         .samples((TOP_K + 2) as u64)
         .build()?;
 
-    let results: Vec<(f64, String, String)> = tokio::select! {
+    let results: Vec<(f64, String, serde_json::Value)> = tokio::select! {
         r = index.top_n(request) => r?,
         _ = cancel_token.cancelled() => {
             anyhow::bail!("Cancelled during RAG retrieval");
@@ -628,7 +728,15 @@ async fn do_retrieve<I: VectorStoreIndex>(
     let mut chars_used = context.len();
     let mut count = 0usize;
 
-    for (score, id, text) in results {
+    for (score, id, doc) in results {
+        // Extract text from the document — field is "text" for chunks
+        let text = doc.get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        if text.is_empty() {
+            continue;
+        }
         // Skip chunks from the same file
         if id.starts_with(exclude_file) {
             continue;
