@@ -348,6 +348,38 @@ pub fn generate_project_index(
 }
 
 // ─────────────────────────────────────────────
+// Section utilities (for indexing)
+// ─────────────────────────────────────────────
+
+/// Flatten a section tree into `(heading, kind_str, body, parent_heading, depth)` tuples.
+/// This recursively walks subsections so all content is available for indexing.
+pub fn flatten_sections(sections: &[Section]) -> Vec<(String, String, String, Option<String>, usize)> {
+    let mut out = Vec::new();
+    flatten_rec(sections, None, 1, &mut out);
+    out
+}
+
+fn flatten_rec(
+    sections: &[Section],
+    parent: Option<&str>,
+    depth: usize,
+    out: &mut Vec<(String, String, String, Option<String>, usize)>,
+) {
+    for section in sections {
+        out.push((
+            section.heading.clone(),
+            format!("{:?}", section.kind),
+            section.body.clone(),
+            parent.map(|s| s.to_string()),
+            depth,
+        ));
+        if !section.subsections.is_empty() {
+            flatten_rec(&section.subsections, Some(&section.heading), depth + 1, out);
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────
 

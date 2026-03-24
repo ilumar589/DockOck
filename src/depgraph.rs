@@ -521,6 +521,50 @@ r#"<!DOCTYPE html>
     }
 }
 
+impl GraphNode {
+    /// Render this entity node as a prose paragraph suitable for embedding.
+    pub fn to_embeddable_text(&self) -> String {
+        let mut text = format!("Entity: {} ({})", self.name, self.entity_type);
+        if !self.description.is_empty() {
+            text.push_str(&format!("\nDescription: {}", self.description));
+        }
+        if !self.states.is_empty() {
+            let names: Vec<&str> = self.states.iter().map(|s| s.name.as_str()).collect();
+            text.push_str(&format!("\nStates: {}", names.join(" → ")));
+        }
+        if !self.transitions.is_empty() {
+            text.push_str("\nTransitions:");
+            for tr in &self.transitions {
+                text.push_str(&format!(" {} → {} ({})", tr.from_state, tr.to_state, tr.trigger));
+                if !tr.guards.is_empty() {
+                    text.push_str(&format!(" [guards: {}]", tr.guards.join(", ")));
+                }
+            }
+        }
+        if !self.rules.is_empty() {
+            text.push_str("\nRules:");
+            for rule in &self.rules {
+                text.push_str(&format!(" {}: {}", rule.id, rule.description));
+            }
+        }
+        text
+    }
+}
+
+impl BusinessRule {
+    /// Render this rule as a prose sentence suitable for embedding.
+    pub fn to_embeddable_text(&self, entity_name: &str) -> String {
+        let mut text = format!(
+            "{}: {}. Category: {:?}. Entity: {}.",
+            self.id, self.description, self.category, entity_name,
+        );
+        if !self.lifecycle_phases.is_empty() {
+            text.push_str(&format!(" Lifecycle phases: {}.", self.lifecycle_phases.join(", ")));
+        }
+        text
+    }
+}
+
 // ─────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────

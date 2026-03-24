@@ -225,6 +225,33 @@ pub enum ProcessingEvent {
     },
     /// RAG indexing completed — carries the MongoDB client for caching
     RagReady(mongodb::Client),
+    /// A file's output was corrected by the validation pass
+    CorrectedFileResult {
+        path: PathBuf,
+        gherkin: GherkinDocument,
+    },
+    /// A group's output was corrected by the validation pass
+    CorrectedGroupResult {
+        group_name: String,
+        gherkin: GherkinDocument,
+    },
+    /// A file's markdown was corrected by the validation pass
+    CorrectedMarkdownResult {
+        path: PathBuf,
+        markdown: String,
+    },
+    /// A group's markdown was corrected by the validation pass
+    CorrectedGroupMarkdownResult {
+        group_name: String,
+        markdown: String,
+    },
+    /// Validation patterns were extracted
+    ValidationPatterns(crate::validation::AggregatedPatterns),
+    /// Correction phase progress update
+    CorrectionProgress {
+        completed: usize,
+        total: usize,
+    },
 }
 
 /// Events from background chat queries.
@@ -263,6 +290,8 @@ enum Selection {
     MergedDepGraph,
     /// The auto-generated Markdown project index
     ProjectIndex,
+    /// Validation patterns summary
+    ValidationSummary,
 }
 
 /// Main application state owned by the egui event loop.
@@ -303,6 +332,8 @@ pub struct DockOckApp {
     output_dir: Option<PathBuf>,
     /// Processing progress: (items_completed, total_items) — items = groups + ungrouped files
     progress: (usize, usize),
+    /// Correction phase progress: (corrected, total_to_correct)
+    correction_progress: (usize, usize),
     /// Number of items that have started LLM processing (for sub-unit progress)
     files_started: usize,
     /// Whether the log panel is expanded
@@ -408,6 +439,10 @@ pub struct DockOckApp {
     mcp_shutdown: Option<CancellationToken>,
     /// Cached MongoDB client (set after first successful RAG indexing)
     mongo_client: Option<mongodb::Client>,
+    /// Validation golden set — source-of-truth files added by the user
+    validation_files: Vec<crate::validation::ValidationFile>,
+    /// Aggregated validation patterns from last generation run
+    validation_patterns: Option<crate::validation::AggregatedPatterns>,
 }
 
 impl DockOckApp {
@@ -513,6 +548,9 @@ impl DockOckApp {
             mcp_running: false,
             mcp_shutdown: None,
             mongo_client: None,
+            validation_files: Vec::new(),
+            validation_patterns: None,
+            correction_progress: (0, 0),
         }
     }
 
@@ -617,6 +655,59 @@ impl DockOckApp {
         }
     }
 
+    /// Open a file dialog for validation (golden set) files.
+    fn open_validation_file_dialog(&mut self) {
+        let paths = rfd::FileDialog::new()
+            .add_filter("Validation files", crate::validation::VALIDATION_EXTENSIONS)
+            .pick_files();
+
+        if let Some(paths) = paths {
+            let mut added = 0usize;
+            for p in paths {
+                if self.validation_files.iter().any(|vf| vf.path == p) {
+                    continue;
+                }
+                if let Some(vf) = crate::validation::ValidationFile::from_path(&p) {
+                    self.push_status(format!("📋 Validation: {}", p.display()));
+                    self.validation_files.push(vf);
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                self.push_status(format!("📋 Added {} validation file(s)", added));
+                self.validation_patterns = None; // invalidate cached patterns
+            }
+        }
+    }
+
+    /// Open a folder-picker dialog and recursively add validation files.
+    fn open_validation_folder_dialog(&mut self) {
+        let folder = rfd::FileDialog::new().pick_folder();
+
+        if let Some(folder) = folder {
+            let found = crate::validation::collect_validation_files(&folder);
+            let mut added = 0usize;
+            for p in found {
+                if self.validation_files.iter().any(|vf| vf.path == p) {
+                    continue;
+                }
+                if let Some(vf) = crate::validation::ValidationFile::from_path(&p) {
+                    self.push_status(format!("📋 Validation: {}", p.display()));
+                    self.validation_files.push(vf);
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                self.push_status(format!(
+                    "📋 Added {} validation file(s) from {}",
+                    added,
+                    folder.display()
+                ));
+                self.validation_patterns = None;
+            }
+        }
+    }
+
     /// Clear the file list and all results.
     fn clear_all(&mut self) {
         self.selected_files.clear();
@@ -630,6 +721,7 @@ impl DockOckApp {
         self.selection = None;
         self.state = AppState::Idle;
         self.progress = (0, 0);
+        self.correction_progress = (0, 0);
         self.files_started = 0;
         self.cancel_token.cancel();
         self.cancel_token = CancellationToken::new();
@@ -829,6 +921,7 @@ impl DockOckApp {
             previous_group_markdown_results: self.previous_group_markdown_results.clone(),
             selected_tech_stack: self.selected_tech_stack.clone(),
             markdown_project_index: self.markdown_project_index.clone(),
+            validation_paths: self.validation_files.iter().map(|vf| vf.path.clone()).collect(),
         }
     }
 
@@ -890,6 +983,12 @@ impl DockOckApp {
         self.previous_group_markdown_results = data.previous_group_markdown_results;
         self.selected_tech_stack = data.selected_tech_stack;
         self.markdown_project_index = data.markdown_project_index;
+        // Re-parse validation files from saved paths
+        self.validation_files = data
+            .validation_paths
+            .iter()
+            .filter_map(|p| crate::validation::ValidationFile::from_path(p))
+            .collect();
         if !self.results.is_empty() || !self.group_results.is_empty()
             || !self.depgraph_results.is_empty() || !self.group_depgraph_results.is_empty()
             || self.merged_depgraph.is_some()
@@ -918,6 +1017,7 @@ impl DockOckApp {
             Some(Selection::Group(name)) => Some(name.clone()),
             Some(Selection::MergedDepGraph) => Some("__merged_depgraph__".to_string()),
             Some(Selection::ProjectIndex) => Some("__project_index__".to_string()),
+            Some(Selection::ValidationSummary) => None,
             None => None,
         }
     }
@@ -973,6 +1073,7 @@ impl DockOckApp {
         let total_items = primary_group_count + ungrouped_count;
 
         self.progress = (0, total_items);
+        self.correction_progress = (0, 0);
         self.files_started = 0;
         // Create a fresh token for this run (the old token, if any, stays cancelled)
         self.cancel_token = CancellationToken::new();
@@ -1012,6 +1113,30 @@ impl DockOckApp {
             .and_then(|key| self.tech_stack_config.stacks.get(key))
             .map(|stack| stack.to_prompt_block());
 
+        // Collect existing session artifacts for IndexOnly re-indexing
+        let existing_artifacts = {
+            let mut scenarios: Vec<crate::gherkin::GherkinDocument> = Vec::new();
+            scenarios.extend(self.results.values().cloned());
+            scenarios.extend(self.group_results.values().cloned());
+
+            let mut depgraphs: Vec<crate::depgraph::DependencyGraph> = Vec::new();
+            depgraphs.extend(self.depgraph_results.values().cloned());
+            depgraphs.extend(self.group_depgraph_results.values().cloned());
+
+            let mut markdown_docs: Vec<(String, crate::markdown::MarkdownDocument)> = Vec::new();
+            for (path, raw_md) in &self.markdown_results {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                markdown_docs.push((name.clone(), crate::markdown::MarkdownDocument::parse_from_llm_output(raw_md, &name)));
+            }
+            for (group_name, raw_md) in &self.group_markdown_results {
+                markdown_docs.push((group_name.clone(), crate::markdown::MarkdownDocument::parse_from_llm_output(raw_md, group_name)));
+            }
+
+            ExistingArtifacts { scenarios, depgraphs, markdown_docs }
+        };
+
+        let validation_files = self.validation_files.clone();
+
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
             handle.block_on(process_files(
@@ -1021,6 +1146,8 @@ impl DockOckApp {
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
                 cache, force_regenerate, embedding_choice, custom_providers,
                 tech_stack_prompt,
+                existing_artifacts,
+                validation_files,
                 tx, cancel_token,
             ));
         });
@@ -1511,6 +1638,39 @@ impl DockOckApp {
                         }
                     }
                     self.auto_save_session();
+                }
+                ProcessingEvent::CorrectedFileResult { path, gherkin } => {
+                    let name = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    self.log(LogLevel::Info, format!("📋 Corrected: {}", name));
+                    self.results.insert(path, gherkin);
+                }
+                ProcessingEvent::CorrectedGroupResult { group_name, gherkin } => {
+                    self.log(LogLevel::Info, format!("📋 Corrected group: {}", group_name));
+                    self.group_results.insert(group_name, gherkin);
+                }
+                ProcessingEvent::CorrectedMarkdownResult { path, markdown } => {
+                    let name = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "unknown".into());
+                    self.log(LogLevel::Info, format!("📋 Corrected markdown: {}", name));
+                    self.markdown_results.insert(path, markdown);
+                }
+                ProcessingEvent::CorrectedGroupMarkdownResult { group_name, markdown } => {
+                    self.log(LogLevel::Info, format!("📋 Corrected group markdown: {}", group_name));
+                    self.group_markdown_results.insert(group_name, markdown);
+                }
+                ProcessingEvent::ValidationPatterns(patterns) => {
+                    self.log(LogLevel::Success, format!(
+                        "📋 Validation patterns extracted: {} recurring, {} conventions",
+                        patterns.recurring.len(),
+                        patterns.conventions.len(),
+                    ));
+                    self.validation_patterns = Some(patterns);
+                }
+                ProcessingEvent::CorrectionProgress { completed, total } => {
+                    self.correction_progress = (completed, total);
                 }
                 ProcessingEvent::RagReady(client) => {
                     self.mongo_client = Some(client);
@@ -2056,6 +2216,48 @@ impl DockOckApp {
             }
         });
 
+        // ── Validation toolbar ──
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!is_processing, egui::Button::new("📋 Add Validation"))
+                .on_hover_text("Add golden .feature / .md files as source of truth")
+                .clicked()
+            {
+                self.open_validation_file_dialog();
+            }
+            if ui
+                .add_enabled(!is_processing, egui::Button::new("📋 Add Val. Folder"))
+                .on_hover_text("Recursively add validation files from a folder")
+                .clicked()
+            {
+                self.open_validation_folder_dialog();
+            }
+            if !self.validation_files.is_empty() {
+                if ui
+                    .add_enabled(!is_processing, egui::Button::new("🗑 Clear Val."))
+                    .on_hover_text("Remove all validation files")
+                    .clicked()
+                {
+                    self.validation_files.clear();
+                    self.validation_patterns = None;
+                }
+            }
+        });
+
+        // Validation file count indicator
+        if !self.validation_files.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "📋 {} golden file(s) loaded",
+                        self.validation_files.len()
+                    ))
+                    .color(egui::Color32::from_rgb(180, 200, 255))
+                    .small(),
+                );
+            });
+        }
+
         // Auto-group toggle
         ui.horizontal(|ui| {
             let prev = self.auto_group_enabled;
@@ -2099,6 +2301,18 @@ impl DockOckApp {
                 .text(format!("{}/{} items", self.progress.0, self.progress.1))
                 .animate(true);
             ui.add(bar);
+
+            // Correction phase progress bar
+            if self.correction_progress.1 > 0 {
+                ui.add_space(2.0);
+                let c_completed = self.correction_progress.0 as f32;
+                let c_total = self.correction_progress.1 as f32;
+                let c_fraction = (c_completed / c_total).clamp(0.0, 1.0);
+                let c_bar = egui::ProgressBar::new(c_fraction)
+                    .text(format!("📋 Correcting {}/{}", self.correction_progress.0, self.correction_progress.1))
+                    .animate(true);
+                ui.add(c_bar);
+            }
         }
 
         ui.add_space(4.0);
@@ -2271,6 +2485,19 @@ impl DockOckApp {
                     }
                 }
 
+                // ── Validation Patterns entry ──
+                if self.validation_patterns.is_some() {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    let selected = self.selection == Some(Selection::ValidationSummary);
+                    let label = egui::RichText::new("📋 Validation Patterns")
+                        .strong()
+                        .color(egui::Color32::from_rgb(255, 200, 100));
+                    if ui.selectable_label(selected, label).clicked() {
+                        self.selection = Some(Selection::ValidationSummary);
+                    }
+                }
+
                 // ── Render ungrouped files ──
                 if self.selected_files.iter().any(|p| !grouped_paths.contains(p)) {
                     ui.add_space(4.0);
@@ -2373,6 +2600,33 @@ impl DockOckApp {
                     }
                 }
 
+                // ── Validation files section ──
+                if !self.validation_files.is_empty() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "📋 Validation Files ({})",
+                            self.validation_files.len()
+                        ))
+                        .strong(),
+                    );
+                    for vf in &self.validation_files {
+                        let icon = match vf.kind {
+                            crate::validation::ValidationKind::Gherkin => "📋",
+                            crate::validation::ValidationKind::Markdown => "📝",
+                        };
+                        let name = vf
+                            .path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("?");
+                        ui.horizontal(|ui| {
+                            ui.label(format!("  {} {}  ({})", icon, name, vf.summary()));
+                        });
+                    }
+                }
+
                 // ── Apply deferred mutations ──
                 if let Some(idx) = remove_file {
                     let path = self.selected_files.remove(idx);
@@ -2422,6 +2676,72 @@ impl DockOckApp {
     }
 
     fn render_right_panel(&mut self, ui: &mut egui::Ui) {
+        // ── Validation Patterns summary panel ──
+        if self.selection == Some(Selection::ValidationSummary) {
+            if let Some(ref patterns) = self.validation_patterns {
+                ui.heading("📋 Validation Patterns");
+                ui.separator();
+
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    // LLM summary
+                    if let Some(ref summary) = patterns.llm_pattern_summary {
+                        ui.label(egui::RichText::new("LLM Pattern Analysis").strong().size(16.0));
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::TextEdit::multiline(&mut summary.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false),
+                        );
+                        ui.add_space(12.0);
+                    }
+
+                    // Recurring patterns
+                    if !patterns.recurring.is_empty() {
+                        ui.label(egui::RichText::new("Recurring Patterns").strong().size(16.0));
+                        ui.add_space(4.0);
+                        let block = crate::validation::build_patterns_block(patterns);
+                        ui.add(
+                            egui::TextEdit::multiline(&mut block.as_str())
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(f32::INFINITY)
+                                .interactive(false),
+                        );
+                        ui.add_space(12.0);
+                    }
+
+                    // Conventions
+                    if !patterns.conventions.is_empty() {
+                        ui.label(egui::RichText::new("Conventions").strong().size(16.0));
+                        ui.add_space(4.0);
+                        for conv in &patterns.conventions {
+                            ui.label(format!("• {}", conv));
+                        }
+                        ui.add_space(12.0);
+                    }
+
+                    // Structural rules
+                    if !patterns.structural_rules.is_empty() {
+                        ui.label(egui::RichText::new("Structural Rules").strong().size(16.0));
+                        ui.add_space(4.0);
+                        for rule in &patterns.structural_rules {
+                            ui.label(format!("• {}", rule));
+                        }
+                    }
+
+                    if patterns.recurring.is_empty()
+                        && patterns.conventions.is_empty()
+                        && patterns.structural_rules.is_empty()
+                        && patterns.llm_pattern_summary.is_none()
+                    {
+                        ui.label("No validation patterns were extracted.");
+                    }
+                });
+
+                return;
+            }
+        }
+
         if self.output_mode == crate::llm::OutputMode::DependencyGraph {
             self.render_right_panel_depgraph(ui);
             return;
@@ -3413,12 +3733,19 @@ impl DockOckApp {
                     self.log(LogLevel::Warning, "⏹ Cancellation requested…".to_string());
                 }
                 ui.spinner();
-                let pct = if self.progress.1 > 0 {
-                    (self.progress.0 as f32 / self.progress.1 as f32 * 100.0).clamp(0.0, 100.0) as u32
+                if self.correction_progress.1 > 0 {
+                    ui.label(format!(
+                        "Correcting… {}/{}",
+                        self.correction_progress.0, self.correction_progress.1,
+                    ));
                 } else {
-                    0
-                };
-                ui.label(format!("Processing… {}%", pct));
+                    let pct = if self.progress.1 > 0 {
+                        (self.progress.0 as f32 / self.progress.1 as f32 * 100.0).clamp(0.0, 100.0) as u32
+                    } else {
+                        0
+                    };
+                    ui.label(format!("Processing… {}%", pct));
+                }
             }
 
             ui.separator();
@@ -3670,6 +3997,13 @@ impl eframe::App for DockOckApp {
 // Background processing task
 // ─────────────────────────────────────────────
 
+/// Existing session artifacts for re-indexing in IndexOnly mode.
+struct ExistingArtifacts {
+    scenarios: Vec<crate::gherkin::GherkinDocument>,
+    depgraphs: Vec<crate::depgraph::DependencyGraph>,
+    markdown_docs: Vec<(String, crate::markdown::MarkdownDocument)>,
+}
+
 /// Async task that parses all files in parallel, then runs them through the
 /// multi-agent pipeline (Extract → Generate → Review) concurrently.
 /// Groups of related files produce a single merged Gherkin output each.
@@ -3693,6 +4027,8 @@ async fn process_files(
     embedding_choice: crate::rag::EmbeddingChoice,
     custom_providers: Vec<crate::llm::CustomProviderConfig>,
     tech_stack_prompt: Option<String>,
+    existing_artifacts: ExistingArtifacts,
+    validation_files: Vec<crate::validation::ValidationFile>,
     tx: Sender<ProcessingEvent>,
     cancel_token: CancellationToken,
 ) {
@@ -3887,6 +4223,8 @@ async fn process_files(
                     feature_title: String::new(),
                     description: String::new(),
                     scenarios: Vec::new(),
+                    background: Vec::new(),
+                    tags: Vec::new(),
                     source_file: String::new(),
                 },
                 elapsed: std::time::Duration::ZERO,
@@ -3962,6 +4300,8 @@ async fn process_files(
                                     feature_title: String::new(),
                                     description: String::new(),
                                     scenarios: Vec::new(),
+                                    background: Vec::new(),
+                                    tags: Vec::new(),
                                     source_file: String::new(),
                                 },
                                 elapsed: std::time::Duration::ZERO,
@@ -4229,6 +4569,9 @@ async fn process_files(
                 // calling createSearchIndexes before that would create an
                 // index on a non-existent collection that never activates.
                 crate::rag::ensure_search_indexes(&mongo_client, &embedding_provider).await;
+                // Also prepare indexes for extended collections (scenarios,
+                // entities, sections, images, rules, xrefs).
+                crate::rag::ensure_extended_indexes(&mongo_client, &embedding_provider).await;
 
                 // Wait for the chunks vector search index to become queryable.
                 // On a fresh database the index is built asynchronously after
@@ -4292,20 +4635,104 @@ async fn process_files(
     // Shared collection for OpenSpec: (change_name, gherkin_feature_text)
     let gherkin_docs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Shared collectors for extended indexing (depgraph, markdown, scenarios)
+    let depgraph_collector: Arc<Mutex<Vec<crate::depgraph::DependencyGraph>>> = Arc::new(Mutex::new(Vec::new()));
+    let markdown_collector: Arc<Mutex<Vec<(String, crate::markdown::MarkdownDocument)>>> = Arc::new(Mutex::new(Vec::new()));
+    let scenario_collector: Arc<Mutex<Vec<crate::gherkin::GherkinDocument>>> = Arc::new(Mutex::new(Vec::new()));
+
     let _ = tx.send(ProcessingEvent::Status(format!(
         "🔧 Dispatching {} groups + ungrouped files (concurrency: {})…",
         groups.len(), max_concurrent
     )));
 
     // IndexOnly mode: RAG indexing is already done in Phase 1.3 — skip LLM dispatch
+    // but re-index any existing session artifacts (from previous Gherkin/DepGraph/Markdown runs)
     if output_mode == crate::llm::OutputMode::IndexOnly {
-        let indexed_msg = if rag_state.is_some() {
-            "✅ Documents indexed successfully — ready for Chat and MCP queries."
+        if let Some(ref rs) = rag_state {
+            let (ref provider, ref mongo) = *rs;
+            let has_artifacts = !existing_artifacts.scenarios.is_empty()
+                || !existing_artifacts.depgraphs.is_empty()
+                || !existing_artifacts.markdown_docs.is_empty();
+
+            if has_artifacts && !cancel_token.is_cancelled() {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📇 Re-indexing existing session artifacts into extended collections…".to_string(),
+                ));
+
+                if !existing_artifacts.scenarios.is_empty() {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📇 Indexing {} Gherkin document(s) into scenarios collection…",
+                        existing_artifacts.scenarios.len()
+                    )));
+                    match crate::rag::index_scenarios(provider, &existing_artifacts.scenarios, mongo, &cancel_token, |msg| {
+                        let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                    }).await {
+                        Ok(n) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "✅ Indexed {n} scenarios"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Scenario indexing failed (non-fatal): {e}"
+                            )));
+                        }
+                    }
+                }
+
+                if !existing_artifacts.depgraphs.is_empty() {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📇 Indexing {} dependency graph(s) into entity/rule collections…",
+                        existing_artifacts.depgraphs.len()
+                    )));
+                    match crate::rag::index_dependency_graphs(provider, &existing_artifacts.depgraphs, mongo, &cancel_token, |msg| {
+                        let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                    }).await {
+                        Ok((ne, nr)) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "✅ Indexed {ne} entities + {nr} business rules"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Dependency graph indexing failed (non-fatal): {e}"
+                            )));
+                        }
+                    }
+                }
+
+                if !existing_artifacts.markdown_docs.is_empty() {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📇 Indexing {} markdown document(s) into sections collection…",
+                        existing_artifacts.markdown_docs.len()
+                    )));
+                    match crate::rag::index_markdown_sections(provider, &existing_artifacts.markdown_docs, mongo, &cancel_token, |msg| {
+                        let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                    }).await {
+                        Ok((ns, nx)) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "✅ Indexed {ns} sections + {nx} cross-refs"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Markdown section indexing failed (non-fatal): {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(ProcessingEvent::Status(
+                "✅ Documents indexed successfully — ready for Chat and MCP queries.".to_string(),
+            ));
+            let _ = tx.send(ProcessingEvent::Done(Ok(())));
         } else {
-            "⚠ No RAG provider available — ensure MongoDB is running and an embedding model is selected."
-        };
-        let _ = tx.send(ProcessingEvent::Status(indexed_msg.to_string()));
-        let _ = tx.send(ProcessingEvent::Done(if rag_state.is_some() { Ok(()) } else { Err("RAG indexing failed".to_string()) }));
+            let _ = tx.send(ProcessingEvent::Status(
+                "⚠ No RAG provider available — ensure MongoDB is running and an embedding model is selected.".to_string(),
+            ));
+            let _ = tx.send(ProcessingEvent::Done(Err("RAG indexing failed".to_string())));
+        }
         let _ = tx.send(ProcessingEvent::OpenSpecDone(Ok(0)));
         return;
     }
@@ -4358,6 +4785,9 @@ async fn process_files(
             let tx = tx.clone();
             let ctx = ctx_snapshot.clone();
             let gdocs = Arc::clone(&gherkin_docs);
+            let dg_coll = Arc::clone(&depgraph_collector);
+            let md_coll = Arc::clone(&markdown_collector);
+            let sc_coll = Arc::clone(&scenario_collector);
             let force_regen = force_regenerate;
             let child_token = cancel_token.child_token();
             let out_mode = output_mode;
@@ -4406,6 +4836,9 @@ async fn process_files(
                                         .unwrap_or_else(|| file_name.clone());
                                     docs.push((stem, feature_text));
                                 }
+                                if let Ok(mut coll) = sc_coll.lock() {
+                                    coll.push(doc.clone());
+                                }
                                 let _ = tx.send(ProcessingEvent::FileResult {
                                     path: member_path,
                                     gherkin: doc,
@@ -4433,6 +4866,9 @@ async fn process_files(
                         match result {
                             Ok(raw_json) => {
                                 let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&file_name]);
+                                if let Ok(mut coll) = dg_coll.lock() {
+                                    coll.push(graph.clone());
+                                }
                                 let _ = tx.send(ProcessingEvent::DepGraphResult {
                                     path: member_path,
                                     graph,
@@ -4459,6 +4895,10 @@ async fn process_files(
                         let elapsed = file_start.elapsed();
                         match result {
                             Ok(raw_md) => {
+                                let md_doc = crate::markdown::MarkdownDocument::parse_from_llm_output(&raw_md, &file_name);
+                                if let Ok(mut coll) = md_coll.lock() {
+                                    coll.push((file_name.clone(), md_doc));
+                                }
                                 let _ = tx.send(ProcessingEvent::MarkdownResult {
                                     path: member_path,
                                     markdown: raw_md,
@@ -4487,6 +4927,9 @@ async fn process_files(
         let tx = tx.clone();
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
+        let dg_coll = Arc::clone(&depgraph_collector);
+        let md_coll = Arc::clone(&markdown_collector);
+        let sc_coll = Arc::clone(&scenario_collector);
         let force_regen = force_regenerate;
         let child_token = cancel_token.child_token();
         let out_mode = output_mode;
@@ -4539,6 +4982,9 @@ async fn process_files(
                             if let Ok(mut docs) = gdocs.lock() {
                                 docs.push((group_name.clone(), feature_text));
                             }
+                            if let Ok(mut coll) = sc_coll.lock() {
+                                coll.push(doc.clone());
+                            }
                             let _ = tx.send(ProcessingEvent::GroupResult {
                                 group_name,
                                 gherkin: doc,
@@ -4566,6 +5012,9 @@ async fn process_files(
                     match result {
                         Ok(raw_json) => {
                             let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&group_name]);
+                            if let Ok(mut coll) = dg_coll.lock() {
+                                coll.push(graph.clone());
+                            }
                             let _ = tx.send(ProcessingEvent::GroupDepGraphResult {
                                 group_name,
                                 graph,
@@ -4592,6 +5041,10 @@ async fn process_files(
                     let elapsed = group_start.elapsed();
                     match result {
                         Ok(raw_md) => {
+                            let md_doc = crate::markdown::MarkdownDocument::parse_from_llm_output(&raw_md, &group_name);
+                            if let Ok(mut coll) = md_coll.lock() {
+                                coll.push((group_name.clone(), md_doc));
+                            }
                             let _ = tx.send(ProcessingEvent::GroupMarkdownResult {
                                 group_name,
                                 markdown: raw_md,
@@ -4642,6 +5095,9 @@ async fn process_files(
         let tx = tx.clone();
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
+        let dg_coll = Arc::clone(&depgraph_collector);
+        let md_coll = Arc::clone(&markdown_collector);
+        let sc_coll = Arc::clone(&scenario_collector);
         let force_regen = force_regenerate;
         let child_token = cancel_token.child_token();
         let out_mode = output_mode;
@@ -4697,6 +5153,9 @@ async fn process_files(
                                     .unwrap_or_else(|| file_name.clone());
                                 docs.push((stem, feature_text));
                             }
+                            if let Ok(mut coll) = sc_coll.lock() {
+                                coll.push(doc.clone());
+                            }
                             let _ = tx.send(ProcessingEvent::FileResult {
                                 path: path.clone(),
                                 gherkin: doc,
@@ -4724,6 +5183,9 @@ async fn process_files(
                     match result {
                         Ok(raw_json) => {
                             let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&file_name]);
+                            if let Ok(mut coll) = dg_coll.lock() {
+                                coll.push(graph.clone());
+                            }
                             let _ = tx.send(ProcessingEvent::DepGraphResult {
                                 path: path.clone(),
                                 graph,
@@ -4750,6 +5212,10 @@ async fn process_files(
                     let file_elapsed = file_start.elapsed();
                     match result {
                         Ok(raw_md) => {
+                            let md_doc = crate::markdown::MarkdownDocument::parse_from_llm_output(&raw_md, &file_name);
+                            if let Ok(mut coll) = md_coll.lock() {
+                                coll.push((file_name.clone(), md_doc));
+                            }
                             let _ = tx.send(ProcessingEvent::MarkdownResult {
                                 path: path.clone(),
                                 markdown: raw_md,
@@ -4801,6 +5267,348 @@ async fn process_files(
                         "⚠ Factoid extraction failed (non-fatal): {e}"
                     )));
                 }
+            }
+        }
+    }
+
+    // ── Phase 2.7: Index extended collections (scenarios, entities, markdown sections) ──
+    if let Some(ref rs) = rag_state {
+        if !cancel_token.is_cancelled() {
+            let (ref provider, ref mongo) = *rs;
+
+            // Index Gherkin scenarios
+            let scenarios = scenario_collector.lock().map(|d| d.clone()).unwrap_or_default();
+            if !scenarios.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📇 Indexing Gherkin scenarios into MongoDB…".to_string(),
+                ));
+                match crate::rag::index_scenarios(provider, &scenarios, mongo, &cancel_token, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    Ok(n) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "✅ Indexed {n} scenarios"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Scenario indexing failed (non-fatal): {e}"
+                        )));
+                    }
+                }
+            }
+
+            // Index dependency graphs (entities + business rules)
+            let graphs = depgraph_collector.lock().map(|d| d.clone()).unwrap_or_default();
+            if !graphs.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📇 Indexing dependency graph entities into MongoDB…".to_string(),
+                ));
+                match crate::rag::index_dependency_graphs(provider, &graphs, mongo, &cancel_token, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    Ok((ne, nr)) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "✅ Indexed {ne} entities + {nr} business rules"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Dependency graph indexing failed (non-fatal): {e}"
+                        )));
+                    }
+                }
+            }
+
+            // Index markdown sections
+            let md_docs = markdown_collector.lock().map(|d| d.clone()).unwrap_or_default();
+            if !md_docs.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📇 Indexing markdown sections into MongoDB…".to_string(),
+                ));
+                match crate::rag::index_markdown_sections(provider, &md_docs, mongo, &cancel_token, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    Ok((ns, nx)) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "✅ Indexed {ns} sections + {nx} cross-refs"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Markdown section indexing failed (non-fatal): {e}"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Phase 2.8: Validation correction pass ──
+    if !validation_files.is_empty() && !cancel_token.is_cancelled()
+        && output_mode != crate::llm::OutputMode::IndexOnly
+        && output_mode != crate::llm::OutputMode::DependencyGraph
+    {
+        let is_markdown = output_mode == crate::llm::OutputMode::Markdown;
+
+        let _ = tx.send(ProcessingEvent::Status(
+            "📋 Starting validation correction pass…".to_string(),
+        ));
+
+        // Collect generated artifacts keyed by stem/name
+        let generated_items: Vec<(String, String)> = if is_markdown {
+            markdown_collector.lock()
+                .map(|d| d.iter().map(|(name, md)| (name.clone(), md.to_markdown_string())).collect())
+                .unwrap_or_default()
+        } else {
+            gherkin_docs.lock()
+                .map(|d| d.clone())
+                .unwrap_or_default()
+        };
+
+        if !generated_items.is_empty() {
+            let generated_keys: Vec<String> = generated_items.iter().map(|(k, _)| k.clone()).collect();
+            let generated_map: std::collections::HashMap<String, String> = generated_items.into_iter().collect();
+
+            // Build a key→GherkinDocument map for feature-title matching
+            let gen_docs_vec = scenario_collector.lock()
+                .map(|d| d.clone())
+                .unwrap_or_default();
+            // Build a lookup from stem → GherkinDocument (best effort — same stems used in gherkin_docs)
+            let gen_doc_by_key: std::collections::HashMap<String, crate::gherkin::GherkinDocument> = {
+                let mut m = std::collections::HashMap::new();
+                // Generated keys are stems; match by feature_title or source_file
+                for doc in &gen_docs_vec {
+                    let src = doc.source_file.trim().to_lowercase();
+                    // Try to find which generated_key this doc belongs to
+                    for k in &generated_keys {
+                        let k_lower = k.to_lowercase();
+                        if !m.contains_key(k) && (src.contains(&k_lower) || k_lower.contains(&src)
+                            || std::path::Path::new(&src).file_stem().and_then(|s| s.to_str()).map(|s| s.to_lowercase()) == Some(k_lower.clone()))
+                        {
+                            m.insert(k.clone(), doc.clone());
+                            break;
+                        }
+                    }
+                }
+                m
+            };
+
+            // Build ordered gen_docs slice aligned with generated_keys
+            let gen_docs_aligned: Vec<crate::gherkin::GherkinDocument> = generated_keys.iter()
+                .map(|k| gen_doc_by_key.get(k).cloned().unwrap_or_else(|| crate::gherkin::GherkinDocument {
+                    feature_title: String::new(),
+                    description: String::new(),
+                    scenarios: Vec::new(),
+                    background: Vec::new(),
+                    tags: Vec::new(),
+                    source_file: String::new(),
+                }))
+                .collect();
+            let gen_docs_opt: Option<&[crate::gherkin::GherkinDocument]> = if !is_markdown {
+                Some(&gen_docs_aligned)
+            } else {
+                None
+            };
+
+            let (matched_pairs, unmatched) = crate::validation::match_validation_files(
+                &generated_keys, gen_docs_opt, &validation_files,
+            );
+
+            if !unmatched.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "📋 {} validation file(s) unmatched: {}",
+                    unmatched.len(),
+                    unmatched.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+                )));
+            }
+
+            if !matched_pairs.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "📋 Matched {} validation pair(s), computing diffs…",
+                    matched_pairs.len(),
+                )));
+
+                // Compute structural diffs
+                let mut gherkin_diffs = Vec::new();
+                let mut extraction_pairs: Vec<(String, String)> = Vec::new();
+
+                for mp in &matched_pairs {
+                    let gen_text = match generated_map.get(&mp.generated_key) {
+                        Some(t) => t.clone(),
+                        None => continue,
+                    };
+
+                    if is_markdown {
+                        if let Some(ref golden_md) = mp.validation_file.markdown {
+                            let gen_md = crate::markdown::MarkdownDocument::parse_from_llm_output(
+                                &gen_text, &mp.generated_key,
+                            );
+                            let _md_diff = crate::validation::diff_markdown_pair(
+                                &gen_md, golden_md, &mp.generated_key,
+                            );
+                            extraction_pairs.push((gen_text, mp.validation_file.raw_text.clone()));
+                        }
+                    } else if let Some(ref golden_doc) = mp.validation_file.gherkin {
+                        let gen_doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                            &gen_text, &mp.generated_key,
+                        );
+                        let diff = crate::validation::diff_gherkin_pair(
+                            &gen_doc, golden_doc, &mp.generated_key,
+                        );
+                        gherkin_diffs.push(diff);
+                        extraction_pairs.push((gen_text, mp.validation_file.raw_text.clone()));
+                    }
+                }
+
+                // Aggregate structural patterns (Gherkin only)
+                let mut aggregated = if !gherkin_diffs.is_empty() {
+                    crate::validation::aggregate_patterns(&gherkin_diffs)
+                } else {
+                    crate::validation::AggregatedPatterns::default()
+                };
+
+                // LLM pattern extraction (semantic analysis)
+                if !extraction_pairs.is_empty() && !cancel_token.is_cancelled() {
+                    let _ = tx.send(ProcessingEvent::Status(
+                        "🔍 Extracting semantic patterns via LLM…".to_string(),
+                    ));
+                    let pairs_prompt = crate::validation::build_pattern_extraction_prompt(&extraction_pairs);
+
+                    let (pattern_status_tx, pattern_status_rx) = std::sync::mpsc::channel::<String>();
+                    let tx_fwd = tx.clone();
+                    let fwd_handle = std::thread::spawn(move || {
+                        while let Ok(msg) = pattern_status_rx.recv() {
+                            let _ = tx_fwd.send(ProcessingEvent::Status(msg));
+                        }
+                    });
+
+                    match orchestrator.extract_patterns_llm(
+                        &pairs_prompt, &pattern_status_tx, &cancel_token,
+                    ).await {
+                        Ok(llm_summary) => {
+                            aggregated.llm_pattern_summary = Some(llm_summary);
+                            let _ = tx.send(ProcessingEvent::Status(
+                                "✅ LLM pattern extraction complete".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ LLM pattern extraction failed (non-fatal): {e}"
+                            )));
+                        }
+                    }
+                    drop(pattern_status_tx);
+                    let _ = fwd_handle.join();
+                }
+
+                let patterns_block = crate::validation::build_patterns_block(&aggregated);
+
+                // Build golden lookup keyed by generated_key
+                let golden_map: std::collections::HashMap<String, String> = matched_pairs
+                    .iter()
+                    .map(|mp| (mp.generated_key.clone(), mp.validation_file.raw_text.clone()))
+                    .collect();
+
+                // Send aggregated patterns to UI
+                let _ = tx.send(ProcessingEvent::ValidationPatterns(aggregated));
+
+                // Apply corrections to each generated artifact
+                if !patterns_block.is_empty() && !cancel_token.is_cancelled() {
+                    let correction_total = generated_map.len();
+                    let mut correction_done: usize = 0;
+                    let _ = tx.send(ProcessingEvent::CorrectionProgress {
+                        completed: 0,
+                        total: correction_total,
+                    });
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📋 Correcting {} generated artifact(s)…",
+                        correction_total,
+                    )));
+
+                    for (key, gen_text) in &generated_map {
+                        if cancel_token.is_cancelled() { break; }
+
+                        let golden_text = golden_map.get(key).map(|s| s.as_str());
+
+                        let (corr_status_tx, corr_status_rx) = std::sync::mpsc::channel::<String>();
+                        let tx_fwd = tx.clone();
+                        let fwd = std::thread::spawn(move || {
+                            while let Ok(msg) = corr_status_rx.recv() {
+                                let _ = tx_fwd.send(ProcessingEvent::Status(msg));
+                            }
+                        });
+
+                        let result = orchestrator.correct(
+                            key, gen_text, &patterns_block, golden_text,
+                            is_markdown, &corr_status_tx, &cancel_token,
+                        ).await;
+
+                        drop(corr_status_tx);
+                        let _ = fwd.join();
+
+                        match result {
+                            Ok(corrected_text) => {
+                                // Determine if this was a file or group result and send accordingly
+                                if is_markdown {
+                                    // Try to find matching file path
+                                    let maybe_path = files.iter().find(|p| {
+                                        p.file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .map(|s| s == key)
+                                            .unwrap_or(false)
+                                    });
+                                    if let Some(path) = maybe_path {
+                                        let _ = tx.send(ProcessingEvent::CorrectedMarkdownResult {
+                                            path: path.clone(),
+                                            markdown: corrected_text,
+                                        });
+                                    } else {
+                                        let _ = tx.send(ProcessingEvent::CorrectedGroupMarkdownResult {
+                                            group_name: key.clone(),
+                                            markdown: corrected_text,
+                                        });
+                                    }
+                                } else {
+                                    let doc = crate::gherkin::GherkinDocument::parse_from_llm_output(
+                                        &corrected_text, key,
+                                    );
+                                    let maybe_path = files.iter().find(|p| {
+                                        p.file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .map(|s| s == key)
+                                            .unwrap_or(false)
+                                    });
+                                    if let Some(path) = maybe_path {
+                                        let _ = tx.send(ProcessingEvent::CorrectedFileResult {
+                                            path: path.clone(),
+                                            gherkin: doc,
+                                        });
+                                    } else {
+                                        let _ = tx.send(ProcessingEvent::CorrectedGroupResult {
+                                            group_name: key.clone(),
+                                            gherkin: doc,
+                                        });
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ProcessingEvent::Status(format!(
+                                    "⚠ Correction failed for {}: {e}", key,
+                                )));
+                            }
+                        }
+                        correction_done += 1;
+                        let _ = tx.send(ProcessingEvent::CorrectionProgress {
+                            completed: correction_done,
+                            total: correction_total,
+                        });
+                    }
+                }
+            } else {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📋 No generated artifacts matched validation files — skipping correction".to_string(),
+                ));
             }
         }
     }

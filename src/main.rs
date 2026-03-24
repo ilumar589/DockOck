@@ -28,6 +28,7 @@ mod parser;
 mod rag;
 mod session;
 mod tech_stack;
+mod validation;
 
 /// Initialise structured tracing with `EnvFilter` and optional OTEL export.
 ///
