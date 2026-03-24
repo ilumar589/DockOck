@@ -377,6 +377,53 @@ Rules:
     is read-only after creation must never appear as the target of a When/And edit step in a
     post-creation scenario."#;
 
+/// Preamble for the correction pass (Gherkin mode).
+pub const CORRECTION_PREAMBLE: &str = r#"You are a Gherkin quality improver. You have been given:
+1. A GENERATED Gherkin feature file
+2. A set of CORRECTION PATTERNS extracted from comparing generated files against
+   the team's approved source-of-truth files
+
+Your task: apply the correction patterns to improve the generated Gherkin.
+
+RULES:
+- Fix every instance of every pattern that applies to this file
+- Do NOT remove scenarios or steps that are correct
+- Do NOT add content that isn't in the source document
+- Preserve the Feature title and overall structure
+- If a golden reference is provided, prefer its structure, wording, and scenario
+  organisation — but ensure all documented requirements are still covered
+- Output ONLY the complete, corrected Gherkin feature file"#;
+
+/// Preamble for the correction pass (Markdown mode).
+pub const MARKDOWN_CORRECTION_PREAMBLE: &str = r#"You are a Markdown knowledge-base quality improver. You have been given:
+1. A GENERATED Markdown document
+2. A set of CORRECTION PATTERNS extracted from comparing generated documents against
+   the team's approved source-of-truth files
+
+Your task: apply the correction patterns to improve the generated Markdown.
+
+RULES:
+- Fix section structure and ordering to match the team's conventions
+- Ensure completeness of coverage (do not remove correct content)
+- Apply cross-reference and formatting conventions from the patterns
+- If a golden reference is provided, prefer its structure and section layout
+- Output ONLY the complete, corrected Markdown document"#;
+
+/// Preamble for LLM-assisted pattern extraction from generated/golden pairs.
+pub const PATTERN_EXTRACTION_PREAMBLE: &str = r#"You are a Gherkin quality analyst. Below are pairs of (GENERATED, GOLDEN) Gherkin
+features for the same source document. The GOLDEN version is the approved
+source of truth.
+
+Analyse ALL pairs and extract RECURRING PATTERNS of difference.
+For each pattern, provide:
+1. Category (Invented, Missing, Terminology, Lifecycle, Optionality, Cardinality,
+   Structure, Style)
+2. Description of what the generator consistently does wrong
+3. Concrete correction rule (what should be done instead)
+4. Confidence: HIGH (3+ examples) / MEDIUM (2 examples) / LOW (1 example)
+
+Output as a numbered list of patterns. Focus on RECURRING issues, not one-off typos."#;
+
 const GROUP_EXTRACTOR_PREAMBLE: &str = r#"You are an expert document analyst.
 You will receive content extracted from MULTIPLE related documents that describe the same
 system, feature, or process. Your task is to produce a single unified structured summary
@@ -1971,6 +2018,111 @@ impl AgentOrchestrator {
                 history, "Reviewer", file_name, &[],
                 status_tx,
                 std::time::Duration::from_secs(120),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Correction pass: apply aggregated validation patterns to a generated artifact.
+    ///
+    /// Runs as an additional LLM call after review (or after generate in Fast mode).
+    /// If a golden reference exists for this file, it is included for direct comparison.
+    #[tracing::instrument(
+        name = "llm.correct",
+        skip(self, generated, patterns_block, golden_text, status_tx, cancel_token),
+        fields(file_name)
+    )]
+    pub async fn correct(
+        &self,
+        file_name: &str,
+        generated: &str,
+        patterns_block: &str,
+        golden_text: Option<&str>,
+        is_markdown: bool,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let preamble = if is_markdown {
+            MARKDOWN_CORRECTION_PREAMBLE
+        } else {
+            CORRECTION_PREAMBLE
+        };
+
+        let mut prompt = format!(
+            "=== CORRECTION PATTERNS ===\n{}\n\n=== GENERATED {} ===\n{}",
+            patterns_block,
+            if is_markdown { "MARKDOWN" } else { "GHERKIN" },
+            generated,
+        );
+
+        if let Some(golden) = golden_text {
+            prompt.push_str(&format!(
+                "\n\n=== GOLDEN REFERENCE ===\n{}\n\nIf the golden reference covers the same {}, prefer its structure, \
+                 wording, and organisation over the generated version — but ensure all \
+                 documented requirements are still covered.",
+                golden,
+                if is_markdown { "document" } else { "Feature" },
+            ));
+        }
+
+        let model = self.effective_reviewer_model();
+        let history = vec![Message::user(prompt)];
+        let user_msg = format!(
+            "Apply the correction patterns and output the improved {}:",
+            if is_markdown { "Markdown" } else { "Gherkin" },
+        );
+
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, model, preamble,
+                &user_msg,
+                history, "Corrector", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.ollama_reviewer_client(), model, preamble,
+                &user_msg,
+                history, "Corrector", file_name, &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        }
+    }
+
+    /// Use the LLM to extract semantic patterns from generated/golden pairs.
+    #[tracing::instrument(
+        name = "llm.extract_patterns",
+        skip(self, pairs_prompt, status_tx, cancel_token),
+    )]
+    pub async fn extract_patterns_llm(
+        &self,
+        pairs_prompt: &str,
+        status_tx: &std::sync::mpsc::Sender<String>,
+        cancel_token: &CancellationToken,
+    ) -> Result<String> {
+        let model = self.effective_reviewer_model();
+        let history = vec![Message::user(pairs_prompt.to_string())];
+
+        if let Some(openai) = &self.openai_client {
+            Self::run_openai_chat(
+                openai, model, PATTERN_EXTRACTION_PREAMBLE,
+                "Extract recurring patterns from the pairs above:",
+                history, "PatternExtractor", "validation", &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
+                cancel_token,
+            ).await
+        } else {
+            Self::run_ollama_chat(
+                self.ollama_reviewer_client(), model, PATTERN_EXTRACTION_PREAMBLE,
+                "Extract recurring patterns from the pairs above:",
+                history, "PatternExtractor", "validation", &[],
+                status_tx,
+                std::time::Duration::from_secs(180),
                 cancel_token,
             ).await
         }

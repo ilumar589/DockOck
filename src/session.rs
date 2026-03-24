@@ -79,6 +79,9 @@ pub struct SessionData {
     /// Auto-generated project knowledge-base index markdown.
     #[serde(default)]
     pub markdown_project_index: Option<String>,
+    /// Validation file paths (re-parsed on reload).
+    #[serde(default)]
+    pub validation_paths: Vec<PathBuf>,
 }
 
 /// Build the session file path from the output directory.
