@@ -2078,7 +2078,7 @@ impl AgentOrchestrator {
                 &user_msg,
                 history, "Corrector", file_name, &[],
                 status_tx,
-                std::time::Duration::from_secs(180),
+                std::time::Duration::from_secs(600),
                 cancel_token,
             ).await
         } else {
@@ -2087,7 +2087,7 @@ impl AgentOrchestrator {
                 &user_msg,
                 history, "Corrector", file_name, &[],
                 status_tx,
-                std::time::Duration::from_secs(180),
+                std::time::Duration::from_secs(600),
                 cancel_token,
             ).await
         }
