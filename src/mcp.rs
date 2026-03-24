@@ -489,15 +489,25 @@ async fn tool_list_documents(
         Ok(docs) => {
             let mut text = format!("Indexed documents ({} total):\n\n", docs.len());
             for d in &docs {
-                text.push_str(&format!("- {} ({} chunks)\n", d.file_name, d.chunk_count));
+                let stem = d.file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&d.file_name);
+                let variants = format!("{}.feature, {}.md", stem, stem);
+                text.push_str(&format!(
+                    "- {} ({} chunks) — available as: {}\n",
+                    d.file_name, d.chunk_count, variants,
+                ));
             }
 
             let docs_json: Vec<serde_json::Value> = docs
                 .iter()
                 .map(|d| {
+                    let stem = d.file_name.rsplit_once('.').map(|(s, _)| s).unwrap_or(&d.file_name);
                     serde_json::json!({
                         "file_name": d.file_name,
                         "chunk_count": d.chunk_count,
+                        "available_as": [
+                            format!("{}.feature", stem),
+                            format!("{}.md", stem),
+                        ],
                     })
                 })
                 .collect();
