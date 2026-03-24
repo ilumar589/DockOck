@@ -318,9 +318,19 @@ pub async fn chat_query(
     cancel_token: &CancellationToken,
     on_token: impl Fn(&str),
 ) -> Result<(String, Vec<SourceReference>)> {
-    // Step 1: Retrieve relevant chunks
+    // Step 1: Retrieve relevant chunks (for source references UI)
     let sources = retrieve_chunks(provider, mongo_client, query, cancel_token).await;
-    let context_block = build_context_from_sources(&sources);
+
+    // Step 1b: Retrieve extended context (chunks + scenarios + entities + sections + …)
+    let context_block = crate::rag::retrieve_extended_context(
+        provider, mongo_client, query, None, cancel_token,
+    ).await;
+    // Fallback to basic context if extended retrieval returned nothing
+    let context_block = if context_block.is_empty() {
+        build_context_from_sources(&sources)
+    } else {
+        context_block
+    };
 
     // Step 2: Build conversation history for the LLM
     let history_start = history.len().saturating_sub(HISTORY_CONTEXT_MESSAGES);

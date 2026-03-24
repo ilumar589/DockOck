@@ -1012,6 +1012,28 @@ impl DockOckApp {
             .and_then(|key| self.tech_stack_config.stacks.get(key))
             .map(|stack| stack.to_prompt_block());
 
+        // Collect existing session artifacts for IndexOnly re-indexing
+        let existing_artifacts = {
+            let mut scenarios: Vec<crate::gherkin::GherkinDocument> = Vec::new();
+            scenarios.extend(self.results.values().cloned());
+            scenarios.extend(self.group_results.values().cloned());
+
+            let mut depgraphs: Vec<crate::depgraph::DependencyGraph> = Vec::new();
+            depgraphs.extend(self.depgraph_results.values().cloned());
+            depgraphs.extend(self.group_depgraph_results.values().cloned());
+
+            let mut markdown_docs: Vec<(String, crate::markdown::MarkdownDocument)> = Vec::new();
+            for (path, raw_md) in &self.markdown_results {
+                let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                markdown_docs.push((name.clone(), crate::markdown::MarkdownDocument::parse_from_llm_output(raw_md, &name)));
+            }
+            for (group_name, raw_md) in &self.group_markdown_results {
+                markdown_docs.push((group_name.clone(), crate::markdown::MarkdownDocument::parse_from_llm_output(raw_md, group_name)));
+            }
+
+            ExistingArtifacts { scenarios, depgraphs, markdown_docs }
+        };
+
         // Spawn a blocking thread that drives the async work
         std::thread::spawn(move || {
             handle.block_on(process_files(
@@ -1021,6 +1043,7 @@ impl DockOckApp {
                 max_concurrent, openspec_enabled, openspec_url, openspec_output_dir,
                 cache, force_regenerate, embedding_choice, custom_providers,
                 tech_stack_prompt,
+                existing_artifacts,
                 tx, cancel_token,
             ));
         });
@@ -3670,6 +3693,13 @@ impl eframe::App for DockOckApp {
 // Background processing task
 // ─────────────────────────────────────────────
 
+/// Existing session artifacts for re-indexing in IndexOnly mode.
+struct ExistingArtifacts {
+    scenarios: Vec<crate::gherkin::GherkinDocument>,
+    depgraphs: Vec<crate::depgraph::DependencyGraph>,
+    markdown_docs: Vec<(String, crate::markdown::MarkdownDocument)>,
+}
+
 /// Async task that parses all files in parallel, then runs them through the
 /// multi-agent pipeline (Extract → Generate → Review) concurrently.
 /// Groups of related files produce a single merged Gherkin output each.
@@ -3693,6 +3723,7 @@ async fn process_files(
     embedding_choice: crate::rag::EmbeddingChoice,
     custom_providers: Vec<crate::llm::CustomProviderConfig>,
     tech_stack_prompt: Option<String>,
+    existing_artifacts: ExistingArtifacts,
     tx: Sender<ProcessingEvent>,
     cancel_token: CancellationToken,
 ) {
@@ -4229,6 +4260,9 @@ async fn process_files(
                 // calling createSearchIndexes before that would create an
                 // index on a non-existent collection that never activates.
                 crate::rag::ensure_search_indexes(&mongo_client, &embedding_provider).await;
+                // Also prepare indexes for extended collections (scenarios,
+                // entities, sections, images, rules, xrefs).
+                crate::rag::ensure_extended_indexes(&mongo_client, &embedding_provider).await;
 
                 // Wait for the chunks vector search index to become queryable.
                 // On a fresh database the index is built asynchronously after
@@ -4292,20 +4326,104 @@ async fn process_files(
     // Shared collection for OpenSpec: (change_name, gherkin_feature_text)
     let gherkin_docs: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Shared collectors for extended indexing (depgraph, markdown, scenarios)
+    let depgraph_collector: Arc<Mutex<Vec<crate::depgraph::DependencyGraph>>> = Arc::new(Mutex::new(Vec::new()));
+    let markdown_collector: Arc<Mutex<Vec<(String, crate::markdown::MarkdownDocument)>>> = Arc::new(Mutex::new(Vec::new()));
+    let scenario_collector: Arc<Mutex<Vec<crate::gherkin::GherkinDocument>>> = Arc::new(Mutex::new(Vec::new()));
+
     let _ = tx.send(ProcessingEvent::Status(format!(
         "🔧 Dispatching {} groups + ungrouped files (concurrency: {})…",
         groups.len(), max_concurrent
     )));
 
     // IndexOnly mode: RAG indexing is already done in Phase 1.3 — skip LLM dispatch
+    // but re-index any existing session artifacts (from previous Gherkin/DepGraph/Markdown runs)
     if output_mode == crate::llm::OutputMode::IndexOnly {
-        let indexed_msg = if rag_state.is_some() {
-            "✅ Documents indexed successfully — ready for Chat and MCP queries."
+        if let Some(ref rs) = rag_state {
+            let (ref provider, ref mongo) = *rs;
+            let has_artifacts = !existing_artifacts.scenarios.is_empty()
+                || !existing_artifacts.depgraphs.is_empty()
+                || !existing_artifacts.markdown_docs.is_empty();
+
+            if has_artifacts && !cancel_token.is_cancelled() {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📇 Re-indexing existing session artifacts into extended collections…".to_string(),
+                ));
+
+                if !existing_artifacts.scenarios.is_empty() {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📇 Indexing {} Gherkin document(s) into scenarios collection…",
+                        existing_artifacts.scenarios.len()
+                    )));
+                    match crate::rag::index_scenarios(provider, &existing_artifacts.scenarios, mongo, &cancel_token, |msg| {
+                        let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                    }).await {
+                        Ok(n) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "✅ Indexed {n} scenarios"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Scenario indexing failed (non-fatal): {e}"
+                            )));
+                        }
+                    }
+                }
+
+                if !existing_artifacts.depgraphs.is_empty() {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📇 Indexing {} dependency graph(s) into entity/rule collections…",
+                        existing_artifacts.depgraphs.len()
+                    )));
+                    match crate::rag::index_dependency_graphs(provider, &existing_artifacts.depgraphs, mongo, &cancel_token, |msg| {
+                        let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                    }).await {
+                        Ok((ne, nr)) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "✅ Indexed {ne} entities + {nr} business rules"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Dependency graph indexing failed (non-fatal): {e}"
+                            )));
+                        }
+                    }
+                }
+
+                if !existing_artifacts.markdown_docs.is_empty() {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "📇 Indexing {} markdown document(s) into sections collection…",
+                        existing_artifacts.markdown_docs.len()
+                    )));
+                    match crate::rag::index_markdown_sections(provider, &existing_artifacts.markdown_docs, mongo, &cancel_token, |msg| {
+                        let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                    }).await {
+                        Ok((ns, nx)) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "✅ Indexed {ns} sections + {nx} cross-refs"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(ProcessingEvent::Status(format!(
+                                "⚠ Markdown section indexing failed (non-fatal): {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+
+            let _ = tx.send(ProcessingEvent::Status(
+                "✅ Documents indexed successfully — ready for Chat and MCP queries.".to_string(),
+            ));
+            let _ = tx.send(ProcessingEvent::Done(Ok(())));
         } else {
-            "⚠ No RAG provider available — ensure MongoDB is running and an embedding model is selected."
-        };
-        let _ = tx.send(ProcessingEvent::Status(indexed_msg.to_string()));
-        let _ = tx.send(ProcessingEvent::Done(if rag_state.is_some() { Ok(()) } else { Err("RAG indexing failed".to_string()) }));
+            let _ = tx.send(ProcessingEvent::Status(
+                "⚠ No RAG provider available — ensure MongoDB is running and an embedding model is selected.".to_string(),
+            ));
+            let _ = tx.send(ProcessingEvent::Done(Err("RAG indexing failed".to_string())));
+        }
         let _ = tx.send(ProcessingEvent::OpenSpecDone(Ok(0)));
         return;
     }
@@ -4358,6 +4476,9 @@ async fn process_files(
             let tx = tx.clone();
             let ctx = ctx_snapshot.clone();
             let gdocs = Arc::clone(&gherkin_docs);
+            let dg_coll = Arc::clone(&depgraph_collector);
+            let md_coll = Arc::clone(&markdown_collector);
+            let sc_coll = Arc::clone(&scenario_collector);
             let force_regen = force_regenerate;
             let child_token = cancel_token.child_token();
             let out_mode = output_mode;
@@ -4406,6 +4527,9 @@ async fn process_files(
                                         .unwrap_or_else(|| file_name.clone());
                                     docs.push((stem, feature_text));
                                 }
+                                if let Ok(mut coll) = sc_coll.lock() {
+                                    coll.push(doc.clone());
+                                }
                                 let _ = tx.send(ProcessingEvent::FileResult {
                                     path: member_path,
                                     gherkin: doc,
@@ -4433,6 +4557,9 @@ async fn process_files(
                         match result {
                             Ok(raw_json) => {
                                 let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&file_name]);
+                                if let Ok(mut coll) = dg_coll.lock() {
+                                    coll.push(graph.clone());
+                                }
                                 let _ = tx.send(ProcessingEvent::DepGraphResult {
                                     path: member_path,
                                     graph,
@@ -4459,6 +4586,10 @@ async fn process_files(
                         let elapsed = file_start.elapsed();
                         match result {
                             Ok(raw_md) => {
+                                let md_doc = crate::markdown::MarkdownDocument::parse_from_llm_output(&raw_md, &file_name);
+                                if let Ok(mut coll) = md_coll.lock() {
+                                    coll.push((file_name.clone(), md_doc));
+                                }
                                 let _ = tx.send(ProcessingEvent::MarkdownResult {
                                     path: member_path,
                                     markdown: raw_md,
@@ -4487,6 +4618,9 @@ async fn process_files(
         let tx = tx.clone();
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
+        let dg_coll = Arc::clone(&depgraph_collector);
+        let md_coll = Arc::clone(&markdown_collector);
+        let sc_coll = Arc::clone(&scenario_collector);
         let force_regen = force_regenerate;
         let child_token = cancel_token.child_token();
         let out_mode = output_mode;
@@ -4539,6 +4673,9 @@ async fn process_files(
                             if let Ok(mut docs) = gdocs.lock() {
                                 docs.push((group_name.clone(), feature_text));
                             }
+                            if let Ok(mut coll) = sc_coll.lock() {
+                                coll.push(doc.clone());
+                            }
                             let _ = tx.send(ProcessingEvent::GroupResult {
                                 group_name,
                                 gherkin: doc,
@@ -4566,6 +4703,9 @@ async fn process_files(
                     match result {
                         Ok(raw_json) => {
                             let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&group_name]);
+                            if let Ok(mut coll) = dg_coll.lock() {
+                                coll.push(graph.clone());
+                            }
                             let _ = tx.send(ProcessingEvent::GroupDepGraphResult {
                                 group_name,
                                 graph,
@@ -4592,6 +4732,10 @@ async fn process_files(
                     let elapsed = group_start.elapsed();
                     match result {
                         Ok(raw_md) => {
+                            let md_doc = crate::markdown::MarkdownDocument::parse_from_llm_output(&raw_md, &group_name);
+                            if let Ok(mut coll) = md_coll.lock() {
+                                coll.push((group_name.clone(), md_doc));
+                            }
                             let _ = tx.send(ProcessingEvent::GroupMarkdownResult {
                                 group_name,
                                 markdown: raw_md,
@@ -4642,6 +4786,9 @@ async fn process_files(
         let tx = tx.clone();
         let ctx = ctx_snapshot.clone();
         let gdocs = Arc::clone(&gherkin_docs);
+        let dg_coll = Arc::clone(&depgraph_collector);
+        let md_coll = Arc::clone(&markdown_collector);
+        let sc_coll = Arc::clone(&scenario_collector);
         let force_regen = force_regenerate;
         let child_token = cancel_token.child_token();
         let out_mode = output_mode;
@@ -4697,6 +4844,9 @@ async fn process_files(
                                     .unwrap_or_else(|| file_name.clone());
                                 docs.push((stem, feature_text));
                             }
+                            if let Ok(mut coll) = sc_coll.lock() {
+                                coll.push(doc.clone());
+                            }
                             let _ = tx.send(ProcessingEvent::FileResult {
                                 path: path.clone(),
                                 gherkin: doc,
@@ -4724,6 +4874,9 @@ async fn process_files(
                     match result {
                         Ok(raw_json) => {
                             let graph = crate::depgraph::DependencyGraph::parse_from_llm_output(&raw_json, &[&file_name]);
+                            if let Ok(mut coll) = dg_coll.lock() {
+                                coll.push(graph.clone());
+                            }
                             let _ = tx.send(ProcessingEvent::DepGraphResult {
                                 path: path.clone(),
                                 graph,
@@ -4750,6 +4903,10 @@ async fn process_files(
                     let file_elapsed = file_start.elapsed();
                     match result {
                         Ok(raw_md) => {
+                            let md_doc = crate::markdown::MarkdownDocument::parse_from_llm_output(&raw_md, &file_name);
+                            if let Ok(mut coll) = md_coll.lock() {
+                                coll.push((file_name.clone(), md_doc));
+                            }
                             let _ = tx.send(ProcessingEvent::MarkdownResult {
                                 path: path.clone(),
                                 markdown: raw_md,
@@ -4800,6 +4957,79 @@ async fn process_files(
                     let _ = tx.send(ProcessingEvent::Status(format!(
                         "⚠ Factoid extraction failed (non-fatal): {e}"
                     )));
+                }
+            }
+        }
+    }
+
+    // ── Phase 2.7: Index extended collections (scenarios, entities, markdown sections) ──
+    if let Some(ref rs) = rag_state {
+        if !cancel_token.is_cancelled() {
+            let (ref provider, ref mongo) = *rs;
+
+            // Index Gherkin scenarios
+            let scenarios = scenario_collector.lock().map(|d| d.clone()).unwrap_or_default();
+            if !scenarios.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📇 Indexing Gherkin scenarios into MongoDB…".to_string(),
+                ));
+                match crate::rag::index_scenarios(provider, &scenarios, mongo, &cancel_token, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    Ok(n) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "✅ Indexed {n} scenarios"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Scenario indexing failed (non-fatal): {e}"
+                        )));
+                    }
+                }
+            }
+
+            // Index dependency graphs (entities + business rules)
+            let graphs = depgraph_collector.lock().map(|d| d.clone()).unwrap_or_default();
+            if !graphs.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📇 Indexing dependency graph entities into MongoDB…".to_string(),
+                ));
+                match crate::rag::index_dependency_graphs(provider, &graphs, mongo, &cancel_token, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    Ok((ne, nr)) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "✅ Indexed {ne} entities + {nr} business rules"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Dependency graph indexing failed (non-fatal): {e}"
+                        )));
+                    }
+                }
+            }
+
+            // Index markdown sections
+            let md_docs = markdown_collector.lock().map(|d| d.clone()).unwrap_or_default();
+            if !md_docs.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(
+                    "📇 Indexing markdown sections into MongoDB…".to_string(),
+                ));
+                match crate::rag::index_markdown_sections(provider, &md_docs, mongo, &cancel_token, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    Ok((ns, nx)) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "✅ Indexed {ns} sections + {nx} cross-refs"
+                        )));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Markdown section indexing failed (non-fatal): {e}"
+                        )));
+                    }
                 }
             }
         }
