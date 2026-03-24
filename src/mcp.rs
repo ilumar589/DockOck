@@ -304,7 +304,14 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
             description: "List all documents that have been indexed in the knowledge base, with their chunk counts.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "format": {
+                        "type": "string",
+                        "description": "Output format: 'summary' (default) or 'detailed'",
+                        "enum": ["summary", "detailed"],
+                        "default": "summary"
+                    }
+                },
                 "required": []
             }),
         },
