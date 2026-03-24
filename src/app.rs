@@ -247,6 +247,11 @@ pub enum ProcessingEvent {
     },
     /// Validation patterns were extracted
     ValidationPatterns(crate::validation::AggregatedPatterns),
+    /// Correction phase progress update
+    CorrectionProgress {
+        completed: usize,
+        total: usize,
+    },
 }
 
 /// Events from background chat queries.
@@ -327,6 +332,8 @@ pub struct DockOckApp {
     output_dir: Option<PathBuf>,
     /// Processing progress: (items_completed, total_items) — items = groups + ungrouped files
     progress: (usize, usize),
+    /// Correction phase progress: (corrected, total_to_correct)
+    correction_progress: (usize, usize),
     /// Number of items that have started LLM processing (for sub-unit progress)
     files_started: usize,
     /// Whether the log panel is expanded
@@ -543,6 +550,7 @@ impl DockOckApp {
             mongo_client: None,
             validation_files: Vec::new(),
             validation_patterns: None,
+            correction_progress: (0, 0),
         }
     }
 
@@ -713,6 +721,7 @@ impl DockOckApp {
         self.selection = None;
         self.state = AppState::Idle;
         self.progress = (0, 0);
+        self.correction_progress = (0, 0);
         self.files_started = 0;
         self.cancel_token.cancel();
         self.cancel_token = CancellationToken::new();
@@ -1064,6 +1073,7 @@ impl DockOckApp {
         let total_items = primary_group_count + ungrouped_count;
 
         self.progress = (0, total_items);
+        self.correction_progress = (0, 0);
         self.files_started = 0;
         // Create a fresh token for this run (the old token, if any, stays cancelled)
         self.cancel_token = CancellationToken::new();
@@ -1658,6 +1668,9 @@ impl DockOckApp {
                         patterns.conventions.len(),
                     ));
                     self.validation_patterns = Some(patterns);
+                }
+                ProcessingEvent::CorrectionProgress { completed, total } => {
+                    self.correction_progress = (completed, total);
                 }
                 ProcessingEvent::RagReady(client) => {
                     self.mongo_client = Some(client);
@@ -2288,6 +2301,18 @@ impl DockOckApp {
                 .text(format!("{}/{} items", self.progress.0, self.progress.1))
                 .animate(true);
             ui.add(bar);
+
+            // Correction phase progress bar
+            if self.correction_progress.1 > 0 {
+                ui.add_space(2.0);
+                let c_completed = self.correction_progress.0 as f32;
+                let c_total = self.correction_progress.1 as f32;
+                let c_fraction = (c_completed / c_total).clamp(0.0, 1.0);
+                let c_bar = egui::ProgressBar::new(c_fraction)
+                    .text(format!("📋 Correcting {}/{}", self.correction_progress.0, self.correction_progress.1))
+                    .animate(true);
+                ui.add(c_bar);
+            }
         }
 
         ui.add_space(4.0);
@@ -3708,12 +3733,19 @@ impl DockOckApp {
                     self.log(LogLevel::Warning, "⏹ Cancellation requested…".to_string());
                 }
                 ui.spinner();
-                let pct = if self.progress.1 > 0 {
-                    (self.progress.0 as f32 / self.progress.1 as f32 * 100.0).clamp(0.0, 100.0) as u32
+                if self.correction_progress.1 > 0 {
+                    ui.label(format!(
+                        "Correcting… {}/{}",
+                        self.correction_progress.0, self.correction_progress.1,
+                    ));
                 } else {
-                    0
-                };
-                ui.label(format!("Processing… {}%", pct));
+                    let pct = if self.progress.1 > 0 {
+                        (self.progress.0 as f32 / self.progress.1 as f32 * 100.0).clamp(0.0, 100.0) as u32
+                    } else {
+                        0
+                    };
+                    ui.label(format!("Processing… {}%", pct));
+                }
             }
 
             ui.separator();
@@ -5338,8 +5370,49 @@ async fn process_files(
             let generated_keys: Vec<String> = generated_items.iter().map(|(k, _)| k.clone()).collect();
             let generated_map: std::collections::HashMap<String, String> = generated_items.into_iter().collect();
 
+            // Build a key→GherkinDocument map for feature-title matching
+            let gen_docs_vec = scenario_collector.lock()
+                .map(|d| d.clone())
+                .unwrap_or_default();
+            // Build a lookup from stem → GherkinDocument (best effort — same stems used in gherkin_docs)
+            let gen_doc_by_key: std::collections::HashMap<String, crate::gherkin::GherkinDocument> = {
+                let mut m = std::collections::HashMap::new();
+                // Generated keys are stems; match by feature_title or source_file
+                for doc in &gen_docs_vec {
+                    let src = doc.source_file.trim().to_lowercase();
+                    // Try to find which generated_key this doc belongs to
+                    for k in &generated_keys {
+                        let k_lower = k.to_lowercase();
+                        if !m.contains_key(k) && (src.contains(&k_lower) || k_lower.contains(&src)
+                            || std::path::Path::new(&src).file_stem().and_then(|s| s.to_str()).map(|s| s.to_lowercase()) == Some(k_lower.clone()))
+                        {
+                            m.insert(k.clone(), doc.clone());
+                            break;
+                        }
+                    }
+                }
+                m
+            };
+
+            // Build ordered gen_docs slice aligned with generated_keys
+            let gen_docs_aligned: Vec<crate::gherkin::GherkinDocument> = generated_keys.iter()
+                .map(|k| gen_doc_by_key.get(k).cloned().unwrap_or_else(|| crate::gherkin::GherkinDocument {
+                    feature_title: String::new(),
+                    description: String::new(),
+                    scenarios: Vec::new(),
+                    background: Vec::new(),
+                    tags: Vec::new(),
+                    source_file: String::new(),
+                }))
+                .collect();
+            let gen_docs_opt: Option<&[crate::gherkin::GherkinDocument]> = if !is_markdown {
+                Some(&gen_docs_aligned)
+            } else {
+                None
+            };
+
             let (matched_pairs, unmatched) = crate::validation::match_validation_files(
-                &generated_keys, &validation_files,
+                &generated_keys, gen_docs_opt, &validation_files,
             );
 
             if !unmatched.is_empty() {
@@ -5442,9 +5515,15 @@ async fn process_files(
 
                 // Apply corrections to each generated artifact
                 if !patterns_block.is_empty() && !cancel_token.is_cancelled() {
+                    let correction_total = generated_map.len();
+                    let mut correction_done: usize = 0;
+                    let _ = tx.send(ProcessingEvent::CorrectionProgress {
+                        completed: 0,
+                        total: correction_total,
+                    });
                     let _ = tx.send(ProcessingEvent::Status(format!(
                         "📋 Correcting {} generated artifact(s)…",
-                        generated_map.len(),
+                        correction_total,
                     )));
 
                     for (key, gen_text) in &generated_map {
@@ -5519,6 +5598,11 @@ async fn process_files(
                                 )));
                             }
                         }
+                        correction_done += 1;
+                        let _ = tx.send(ProcessingEvent::CorrectionProgress {
+                            completed: correction_done,
+                            total: correction_total,
+                        });
                     }
                 }
             } else {

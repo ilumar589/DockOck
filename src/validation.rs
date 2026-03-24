@@ -284,20 +284,25 @@ pub struct MatchedPair {
 
 /// Match generated artifacts against validation files.
 ///
+/// `generated_docs` is an optional parallel slice of parsed GherkinDocuments
+/// (same order/length as `generated_keys`) used for feature-title matching.
+///
 /// Returns matched pairs and a list of unmatched validation file keys.
 pub fn match_validation_files(
     generated_keys: &[String],
+    generated_docs: Option<&[GherkinDocument]>,
     validation_files: &[ValidationFile],
 ) -> (Vec<MatchedPair>, Vec<String>) {
     let mut matched = Vec::new();
     let mut used: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    for gen_key in generated_keys {
+    for (gen_idx, gen_key) in generated_keys.iter().enumerate() {
         let gen_stem = Path::new(gen_key)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or(gen_key)
             .to_lowercase();
+        let gen_desc = extract_descriptive_part(&gen_stem);
 
         // 1. Exact stem match
         if let Some((i, vf)) = validation_files.iter().enumerate().find(|(i, vf)| {
@@ -311,7 +316,7 @@ pub fn match_validation_files(
             continue;
         }
 
-        // 2. Prefix/suffix match
+        // 2. Prefix/suffix match on full stems
         if let Some((i, vf)) = validation_files.iter().enumerate().find(|(i, vf)| {
             if used.contains(i) {
                 return false;
@@ -327,24 +332,110 @@ pub fn match_validation_files(
             continue;
         }
 
-        // 3. Feature title fuzzy match (Gherkin only)
-        if let Some((i, vf)) = validation_files.iter().enumerate().find(|(i, vf)| {
-            if used.contains(i) {
-                return false;
+        // 3. Descriptive-part match — strip document-code prefixes and compare
+        //    e.g. "S747 - LNA - Create premises" → "create premises"
+        //         "6.2.1.1 Create premises"       → "create premises"
+        if !gen_desc.is_empty() {
+            // 3a. Exact descriptive-part match
+            if let Some((i, vf)) = validation_files.iter().enumerate().find(|(i, vf)| {
+                if used.contains(i) { return false; }
+                let vf_desc = extract_descriptive_part(&vf.match_key.to_lowercase());
+                !vf_desc.is_empty() && vf_desc == gen_desc
+            }) {
+                matched.push(MatchedPair {
+                    generated_key: gen_key.clone(),
+                    validation_file: vf.clone(),
+                });
+                used.insert(i);
+                continue;
             }
-            if let Some(ref g) = vf.gherkin {
-                let vf_title = g.feature_title.trim().to_lowercase();
-                let gen_lower = gen_stem.replace('_', " ");
-                levenshtein_ratio(&vf_title, &gen_lower) > 0.7
-            } else {
-                false
+
+            // 3b. Substring containment on descriptive parts
+            if let Some((i, vf)) = validation_files.iter().enumerate().find(|(i, vf)| {
+                if used.contains(i) { return false; }
+                let vf_desc = extract_descriptive_part(&vf.match_key.to_lowercase());
+                !vf_desc.is_empty() && vf_desc.len() >= 5
+                    && (vf_desc.contains(&gen_desc) || gen_desc.contains(&vf_desc))
+            }) {
+                matched.push(MatchedPair {
+                    generated_key: gen_key.clone(),
+                    validation_file: vf.clone(),
+                });
+                used.insert(i);
+                continue;
             }
-        }) {
-            matched.push(MatchedPair {
-                generated_key: gen_key.clone(),
-                validation_file: vf.clone(),
-            });
-            used.insert(i);
+        }
+
+        // 4. Feature title matching — compare generated feature_title to validation feature_title
+        if let Some(gen_doc) = generated_docs.and_then(|docs| docs.get(gen_idx)) {
+            let gen_title = gen_doc.feature_title.trim().to_lowercase();
+            if !gen_title.is_empty() {
+                // 4a. Exact feature title match
+                if let Some((i, vf)) = validation_files.iter().enumerate().find(|(i, vf)| {
+                    if used.contains(i) { return false; }
+                    if let Some(ref g) = vf.gherkin {
+                        g.feature_title.trim().to_lowercase() == gen_title
+                    } else {
+                        false
+                    }
+                }) {
+                    matched.push(MatchedPair {
+                        generated_key: gen_key.clone(),
+                        validation_file: vf.clone(),
+                    });
+                    used.insert(i);
+                    continue;
+                }
+
+                // 4b. Fuzzy feature title match (threshold 0.7)
+                let mut best: Option<(usize, f64)> = None;
+                for (i, vf) in validation_files.iter().enumerate() {
+                    if used.contains(&i) { continue; }
+                    if let Some(ref g) = vf.gherkin {
+                        let vf_title = g.feature_title.trim().to_lowercase();
+                        if !vf_title.is_empty() {
+                            let ratio = levenshtein_ratio(&gen_title, &vf_title);
+                            if ratio > 0.7 {
+                                if best.map_or(true, |(_, br)| ratio > br) {
+                                    best = Some((i, ratio));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some((i, _)) = best {
+                    matched.push(MatchedPair {
+                        generated_key: gen_key.clone(),
+                        validation_file: validation_files[i].clone(),
+                    });
+                    used.insert(i);
+                    continue;
+                }
+            }
+        }
+
+        // 5. Fuzzy descriptive-part match (threshold 0.75)
+        if !gen_desc.is_empty() {
+            let mut best: Option<(usize, f64)> = None;
+            for (i, vf) in validation_files.iter().enumerate() {
+                if used.contains(&i) { continue; }
+                let vf_desc = extract_descriptive_part(&vf.match_key.to_lowercase());
+                if vf_desc.len() >= 4 {
+                    let ratio = levenshtein_ratio(&gen_desc, &vf_desc);
+                    if ratio > 0.75 {
+                        if best.map_or(true, |(_, br)| ratio > br) {
+                            best = Some((i, ratio));
+                        }
+                    }
+                }
+            }
+            if let Some((i, _)) = best {
+                matched.push(MatchedPair {
+                    generated_key: gen_key.clone(),
+                    validation_file: validation_files[i].clone(),
+                });
+                used.insert(i);
+            }
         }
     }
 
@@ -356,6 +447,67 @@ pub fn match_validation_files(
         .collect();
 
     (matched, unmatched)
+}
+
+/// Extract the descriptive part of a file stem by stripping common prefixes.
+///
+/// Handles patterns like:
+/// - `s747 - lna - create premises` → `create premises`
+/// - `d028 - ius - xml disconnection notification` → `xml disconnection notification`
+/// - `6.2.1.1 create premises` → `create premises`
+/// - `6.2.1.1 create premises unhappy` → `create premises unhappy`
+/// - `create premises` → `create premises` (no prefix)
+fn extract_descriptive_part(stem: &str) -> String {
+    let s = stem.trim();
+
+    // Pattern 1: "S747 - LNA - Description" or "D028 – IUS – Description"
+    // Match: code - system - description (with - or –)
+    if let Some(rest) = strip_multi_dash_prefix(s) {
+        return rest.trim().to_string();
+    }
+
+    // Pattern 2: "6.2.1.1 Description" — dotted numeric prefix followed by space
+    let trimmed = s.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if trimmed.len() < s.len() && trimmed.starts_with(|c: char| c == ' ') {
+        return trimmed.trim().to_string();
+    }
+
+    // No prefix found — return as-is
+    s.to_string()
+}
+
+/// Strip a multi-segment dash prefix like "S747 - LNA - " or "D028 – IUS – ".
+/// Returns the remainder after the second dash separator.
+fn strip_multi_dash_prefix(s: &str) -> Option<&str> {
+    // Find the first dash separator (either " - " or " – ")
+    let first_sep = find_dash_separator(s)?;
+    let after_first = &s[first_sep..].trim_start_matches(|c: char| c == '-' || c == '–' || c == ' ');
+
+    // Find the second dash separator
+    if let Some(second_sep) = find_dash_separator(after_first) {
+        let desc = &after_first[second_sep..].trim_start_matches(|c: char| c == '-' || c == '–' || c == ' ');
+        if !desc.is_empty() {
+            return Some(desc);
+        }
+    }
+    None
+}
+
+/// Find the byte offset of the first " - " or " – " separator.
+fn find_dash_separator(s: &str) -> Option<usize> {
+    // " - " (space-hyphen-space)
+    if let Some(pos) = s.find(" - ") {
+        return Some(pos + 3);
+    }
+    // " – " (space-en-dash-space)
+    if let Some(pos) = s.find(" – ") {
+        return Some(pos + " – ".len());
+    }
+    // " — " (space-em-dash-space)
+    if let Some(pos) = s.find(" — ") {
+        return Some(pos + " — ".len());
+    }
+    None
 }
 
 /// Simple Levenshtein distance ratio (0.0–1.0, where 1.0 = identical).
@@ -738,7 +890,7 @@ mod tests {
             markdown: None,
             raw_text: String::new(),
         };
-        let (matched, _) = match_validation_files(&["D028_Req.docx".to_string()], &[vf]);
+        let (matched, _) = match_validation_files(&["D028_Req.docx".to_string()], None, &[vf]);
         assert_eq!(matched.len(), 1);
         assert_eq!(matched[0].generated_key, "D028_Req.docx");
     }
@@ -753,7 +905,7 @@ mod tests {
             markdown: None,
             raw_text: String::new(),
         };
-        let (matched, _) = match_validation_files(&["D028_Req.docx".to_string()], &[vf]);
+        let (matched, _) = match_validation_files(&["D028_Req.docx".to_string()], None, &[vf]);
         assert_eq!(matched.len(), 1);
     }
 
@@ -761,5 +913,57 @@ mod tests {
     fn test_alignment_score() {
         let score = alignment_score("Feature: Foo", "Feature: Foo");
         assert!((score - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_extract_descriptive_part_story_code() {
+        assert_eq!(
+            extract_descriptive_part("s747 - lna - create premises"),
+            "create premises"
+        );
+        assert_eq!(
+            extract_descriptive_part("d028 – ius – xml disconnection notification"),
+            "xml disconnection notification"
+        );
+    }
+
+    #[test]
+    fn test_extract_descriptive_part_dotted_prefix() {
+        assert_eq!(
+            extract_descriptive_part("6.2.1.1 create premises"),
+            "create premises"
+        );
+        assert_eq!(
+            extract_descriptive_part("6.2.3.3 change meter status"),
+            "change meter status"
+        );
+    }
+
+    #[test]
+    fn test_extract_descriptive_part_no_prefix() {
+        assert_eq!(
+            extract_descriptive_part("create premises"),
+            "create premises"
+        );
+    }
+
+    #[test]
+    fn test_match_cross_naming_scheme() {
+        // Simulates: generated "S747 - LNA - Create premises" vs validation "6.2.1.1 Create premises"
+        let vf = ValidationFile {
+            path: PathBuf::from("6.2.1.1 Create premises.feature"),
+            match_key: "6.2.1.1 Create premises".to_string(),
+            kind: ValidationKind::Gherkin,
+            gherkin: None,
+            markdown: None,
+            raw_text: String::new(),
+        };
+        let (matched, unmatched) = match_validation_files(
+            &["S747 - LNA - Create premises".to_string()],
+            None,
+            &[vf],
+        );
+        assert_eq!(matched.len(), 1, "Should match via descriptive-part: matched={}, unmatched={:?}", matched.len(), unmatched);
+        assert_eq!(matched[0].generated_key, "S747 - LNA - Create premises");
     }
 }
