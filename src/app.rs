@@ -2187,50 +2187,80 @@ impl DockOckApp {
 
         let is_processing = self.state == AppState::Processing;
 
-        // ── Toolbar ──
+        // ── Source documents ──
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("📄 Source").strong());
+                ui.separator();
+                if ui
+                    .add_enabled(!is_processing, egui::Button::new("➕ Add Files"))
+                    .on_hover_text("Pick individual documents to process")
+                    .clicked()
+                {
+                    self.open_file_dialog();
+                }
+                if ui
+                    .add_enabled(!is_processing, egui::Button::new("📁 Add Folder"))
+                    .on_hover_text("Recursively add all supported files from a folder")
+                    .clicked()
+                {
+                    self.open_folder_dialog();
+                }
+            });
+        });
+
+        ui.add_space(2.0);
+
+        // ── Validation (golden) documents ──
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("✅ Golden").strong());
+                ui.separator();
+                if ui
+                    .add_enabled(!is_processing, egui::Button::new("➕ Add Files"))
+                    .on_hover_text("Add golden .feature / .md files as source of truth")
+                    .clicked()
+                {
+                    self.open_validation_file_dialog();
+                }
+                if ui
+                    .add_enabled(!is_processing, egui::Button::new("📁 Add Folder"))
+                    .on_hover_text("Recursively add validation files from a folder")
+                    .clicked()
+                {
+                    self.open_validation_folder_dialog();
+                }
+            });
+            if !self.validation_files.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "  📋 {} golden file(s) loaded",
+                        self.validation_files.len()
+                    ))
+                    .color(egui::Color32::from_rgb(180, 200, 255))
+                    .small(),
+                );
+            }
+        });
+
+        ui.add_space(2.0);
+
+        // ── Actions ──
         ui.horizontal(|ui| {
             if ui
-                .add_enabled(!is_processing, egui::Button::new("➕ Add Files"))
-                .clicked()
-            {
-                self.open_file_dialog();
-            }
-            if ui
-                .add_enabled(!is_processing, egui::Button::new("� Add Folder"))
-                .clicked()
-            {
-                self.open_folder_dialog();
-            }
-            if ui
-                .add_enabled(!is_processing, egui::Button::new("�🗑 Clear"))
+                .add_enabled(!is_processing, egui::Button::new("🗑 Clear All"))
+                .on_hover_text("Remove all source files")
                 .clicked()
             {
                 self.clear_all();
             }
             if ui
                 .add_enabled(!is_processing, egui::Button::new("📎 New Group"))
+                .on_hover_text("Create a new file group")
                 .clicked()
             {
                 self.show_new_group_input = !self.show_new_group_input;
                 self.new_group_name.clear();
-            }
-        });
-
-        // ── Validation toolbar ──
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(!is_processing, egui::Button::new("📋 Add Validation"))
-                .on_hover_text("Add golden .feature / .md files as source of truth")
-                .clicked()
-            {
-                self.open_validation_file_dialog();
-            }
-            if ui
-                .add_enabled(!is_processing, egui::Button::new("📋 Add Val. Folder"))
-                .on_hover_text("Recursively add validation files from a folder")
-                .clicked()
-            {
-                self.open_validation_folder_dialog();
             }
             if !self.validation_files.is_empty() {
                 if ui
@@ -2243,20 +2273,6 @@ impl DockOckApp {
                 }
             }
         });
-
-        // Validation file count indicator
-        if !self.validation_files.is_empty() {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "📋 {} golden file(s) loaded",
-                        self.validation_files.len()
-                    ))
-                    .color(egui::Color32::from_rgb(180, 200, 255))
-                    .small(),
-                );
-            });
-        }
 
         // Auto-group toggle
         ui.horizontal(|ui| {
@@ -3539,6 +3555,7 @@ impl DockOckApp {
             if !self.log_entries.is_empty() {
                 if let Some(entry) = self.log_entries.iter().rev().find(|e| {
                     e.message.contains("indexed") || e.message.contains("RAG") || e.message.contains("Index")
+                        || e.message.contains("Stored") || e.message.contains("Storing")
                 }) {
                     ui.colored_label(entry.level.color(), &entry.message);
                 }
@@ -4572,6 +4589,8 @@ async fn process_files(
                 // Also prepare indexes for extended collections (scenarios,
                 // entities, sections, images, rules, xrefs).
                 crate::rag::ensure_extended_indexes(&mongo_client, &embedding_provider).await;
+                // Ensure the full-document storage collections exist.
+                crate::rag::ensure_full_doc_collections(&mongo_client).await;
 
                 // Wait for the chunks vector search index to become queryable.
                 // On a fresh database the index is built asynchronously after
@@ -4678,6 +4697,22 @@ async fn process_files(
                             )));
                         }
                     }
+
+                    // Store full Gherkin feature files for direct retrieval
+                    let full_gherkin: Vec<(String, String)> = existing_artifacts.scenarios.iter()
+                        .map(|doc| (doc.source_file.clone(), doc.to_feature_string()))
+                        .collect();
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "💾 Storing {} full Gherkin document(s) for MCP retrieval…",
+                        full_gherkin.len()
+                    )));
+                    if let Err(e) = crate::rag::upsert_full_gherkin_docs(&full_gherkin, mongo, |msg| {
+                        let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                    }).await {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Full Gherkin doc storage failed (non-fatal): {e}"
+                        )));
+                    }
                 }
 
                 if !existing_artifacts.depgraphs.is_empty() {
@@ -4720,12 +4755,52 @@ async fn process_files(
                             )));
                         }
                     }
+
+                    // Store full markdown documents for direct retrieval
+                    let full_docs: Vec<(String, String)> = existing_artifacts.markdown_docs.iter()
+                        .map(|(name, md)| (name.clone(), md.to_markdown_string()))
+                        .collect();
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "💾 Storing {} full Markdown document(s) for MCP retrieval…",
+                        full_docs.len()
+                    )));
+                    if let Err(e) = crate::rag::upsert_full_markdown_docs(&full_docs, mongo, |msg| {
+                        let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                    }).await {
+                        let _ = tx.send(ProcessingEvent::Status(format!(
+                            "⚠ Full markdown doc storage failed (non-fatal): {e}"
+                        )));
+                    }
                 }
             }
 
             let _ = tx.send(ProcessingEvent::Status(
                 "✅ Documents indexed successfully — ready for Chat and MCP queries.".to_string(),
             ));
+
+            // Store source documents for direct retrieval
+            let source_docs: Vec<(String, String, String)> = context.lock()
+                .map(|ctx| ctx.file_contents.values().map(|fc| {
+                    let name = fc.path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    (name, fc.file_type.clone(), fc.raw_text.clone())
+                }).collect())
+                .unwrap_or_default();
+            if !source_docs.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "💾 Storing {} source document(s) for MCP retrieval…",
+                    source_docs.len()
+                )));
+                if let Err(e) = crate::rag::upsert_source_docs(&source_docs, mongo, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "⚠ Source doc storage failed (non-fatal): {e}"
+                    )));
+                }
+            }
+
             let _ = tx.send(ProcessingEvent::Done(Ok(())));
         } else {
             let _ = tx.send(ProcessingEvent::Status(
@@ -5296,6 +5371,22 @@ async fn process_files(
                         )));
                     }
                 }
+
+                // Store full Gherkin feature files for direct retrieval
+                let full_gherkin: Vec<(String, String)> = scenarios.iter()
+                    .map(|doc| (doc.source_file.clone(), doc.to_feature_string()))
+                    .collect();
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "💾 Storing {} full Gherkin document(s) for MCP retrieval…",
+                    full_gherkin.len()
+                )));
+                if let Err(e) = crate::rag::upsert_full_gherkin_docs(&full_gherkin, mongo, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "⚠ Full Gherkin doc storage failed (non-fatal): {e}"
+                    )));
+                }
             }
 
             // Index dependency graphs (entities + business rules)
@@ -5339,6 +5430,45 @@ async fn process_files(
                             "⚠ Markdown section indexing failed (non-fatal): {e}"
                         )));
                     }
+                }
+
+                // Store full markdown documents for direct retrieval
+                let full_docs: Vec<(String, String)> = md_docs.iter()
+                    .map(|(name, md)| (name.clone(), md.to_markdown_string()))
+                    .collect();
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "💾 Storing {} full Markdown document(s) for MCP retrieval…",
+                    full_docs.len()
+                )));
+                if let Err(e) = crate::rag::upsert_full_markdown_docs(&full_docs, mongo, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "⚠ Full markdown doc storage failed (non-fatal): {e}"
+                    )));
+                }
+            }
+
+            // Store source documents for direct retrieval
+            let source_docs: Vec<(String, String, String)> = context.lock()
+                .map(|ctx| ctx.file_contents.values().map(|fc| {
+                    let name = fc.path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    (name, fc.file_type.clone(), fc.raw_text.clone())
+                }).collect())
+                .unwrap_or_default();
+            if !source_docs.is_empty() {
+                let _ = tx.send(ProcessingEvent::Status(format!(
+                    "💾 Storing {} source document(s) for MCP retrieval…",
+                    source_docs.len()
+                )));
+                if let Err(e) = crate::rag::upsert_source_docs(&source_docs, mongo, |msg| {
+                    let _ = tx.send(ProcessingEvent::Status(msg.to_string()));
+                }).await {
+                    let _ = tx.send(ProcessingEvent::Status(format!(
+                        "⚠ Source doc storage failed (non-fatal): {e}"
+                    )));
                 }
             }
         }

@@ -315,6 +315,48 @@ fn handle_tools_list(id: Option<serde_json::Value>) -> JsonRpcResponse {
                 "required": []
             }),
         },
+        McpToolDefinition {
+            name: "get_document".to_string(),
+            description: "Retrieve the full generated markdown for a specific source document by filename. Returns the complete markdown content.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "The source document filename (e.g. 'D028.docx')"
+                    }
+                },
+                "required": ["filename"]
+            }),
+        },
+        McpToolDefinition {
+            name: "get_gherkin".to_string(),
+            description: "Retrieve the full generated Gherkin .feature file for a specific source document by filename. Returns the complete feature text.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "The source document filename (e.g. 'D028.docx')"
+                    }
+                },
+                "required": ["filename"]
+            }),
+        },
+        McpToolDefinition {
+            name: "get_source".to_string(),
+            description: "Retrieve the original parsed source text for a specific document by filename. Returns the raw extracted text content.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "The source document filename (e.g. 'D028.docx')"
+                    }
+                },
+                "required": ["filename"]
+            }),
+        },
     ];
 
     JsonRpcResponse::success(id, serde_json::json!({ "tools": tools }))
@@ -338,6 +380,9 @@ async fn handle_tools_call(
         "query_documents" => tool_query_documents(id, arguments, state).await,
         "search_documents" => tool_search_documents(id, arguments, state).await,
         "list_documents" => tool_list_documents(id, state).await,
+        "get_document" => tool_get_document(id, arguments, state).await,
+        "get_gherkin" => tool_get_gherkin(id, arguments, state).await,
+        "get_source" => tool_get_source(id, arguments, state).await,
         _ => JsonRpcResponse::error(
             id,
             -32602,
@@ -526,5 +571,117 @@ async fn tool_list_documents(
             )
         }
         Err(e) => JsonRpcResponse::error(id, -32000, format!("Failed to list documents: {e}")),
+    }
+}
+
+async fn tool_get_document(
+    id: Option<serde_json::Value>,
+    args: serde_json::Value,
+    state: &McpState,
+) -> JsonRpcResponse {
+    let filename = match args.get("filename").and_then(|v| v.as_str()) {
+        Some(f) if !f.trim().is_empty() => f.trim().to_string(),
+        _ => {
+            return JsonRpcResponse::error(id, -32602, "Missing or empty 'filename' parameter".to_string());
+        }
+    };
+
+    match crate::rag::get_full_markdown_doc(&state.mongo_client, &filename).await {
+        Ok(Some(markdown)) => {
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": markdown
+                    }],
+                    "_meta": {
+                        "document": filename,
+                        "char_count": markdown.len()
+                    }
+                }),
+            )
+        }
+        Ok(None) => {
+            JsonRpcResponse::error(id, -32001, format!("Document '{}' not found. Use list_documents to see available documents.", filename))
+        }
+        Err(e) => {
+            JsonRpcResponse::error(id, -32000, format!("Failed to retrieve document: {e}"))
+        }
+    }
+}
+
+async fn tool_get_gherkin(
+    id: Option<serde_json::Value>,
+    args: serde_json::Value,
+    state: &McpState,
+) -> JsonRpcResponse {
+    let filename = match args.get("filename").and_then(|v| v.as_str()) {
+        Some(f) if !f.trim().is_empty() => f.trim().to_string(),
+        _ => {
+            return JsonRpcResponse::error(id, -32602, "Missing or empty 'filename' parameter".to_string());
+        }
+    };
+
+    match crate::rag::get_full_gherkin_doc(&state.mongo_client, &filename).await {
+        Ok(Some(feature_text)) => {
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": feature_text
+                    }],
+                    "_meta": {
+                        "document": filename,
+                        "char_count": feature_text.len()
+                    }
+                }),
+            )
+        }
+        Ok(None) => {
+            JsonRpcResponse::error(id, -32001, format!("Gherkin document '{}' not found. Use list_documents to see available documents.", filename))
+        }
+        Err(e) => {
+            JsonRpcResponse::error(id, -32000, format!("Failed to retrieve Gherkin document: {e}"))
+        }
+    }
+}
+
+async fn tool_get_source(
+    id: Option<serde_json::Value>,
+    args: serde_json::Value,
+    state: &McpState,
+) -> JsonRpcResponse {
+    let filename = match args.get("filename").and_then(|v| v.as_str()) {
+        Some(f) if !f.trim().is_empty() => f.trim().to_string(),
+        _ => {
+            return JsonRpcResponse::error(id, -32602, "Missing or empty 'filename' parameter".to_string());
+        }
+    };
+
+    match crate::rag::get_source_doc(&state.mongo_client, &filename).await {
+        Ok(Some((file_type, raw_text))) => {
+            JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": raw_text
+                    }],
+                    "_meta": {
+                        "document": filename,
+                        "file_type": file_type,
+                        "char_count": raw_text.len()
+                    }
+                }),
+            )
+        }
+        Ok(None) => {
+            JsonRpcResponse::error(id, -32001, format!("Source document '{}' not found. Use list_documents to see available documents.", filename))
+        }
+        Err(e) => {
+            JsonRpcResponse::error(id, -32000, format!("Failed to retrieve source document: {e}"))
+        }
     }
 }

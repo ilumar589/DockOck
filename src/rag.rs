@@ -62,6 +62,14 @@ pub const SECTIONS: CollectionConfig = CollectionConfig { name: "sections", inde
 pub const IMAGES: CollectionConfig = CollectionConfig { name: "images", index_name: "image_vector_index" };
 pub const BUSINESS_RULES: CollectionConfig = CollectionConfig { name: "business_rules", index_name: "rule_vector_index" };
 pub const CROSS_REFS: CollectionConfig = CollectionConfig { name: "cross_references", index_name: "xref_vector_index" };
+pub const MARKDOWN_DOCS: CollectionConfig = CollectionConfig { name: "markdown_documents", index_name: "" };
+pub const GHERKIN_DOCS: CollectionConfig = CollectionConfig { name: "gherkin_documents", index_name: "" };
+pub const SOURCE_DOCS: CollectionConfig = CollectionConfig { name: "source_documents", index_name: "" };
+
+/// Collections for full-document storage (no vector index needed).
+pub const FULL_DOC_COLLECTIONS: &[CollectionConfig] = &[
+    MARKDOWN_DOCS, GHERKIN_DOCS, SOURCE_DOCS,
+];
 
 /// All extended collections (excluding chunks and memories which are handled
 /// by the existing `ensure_search_indexes`).
@@ -1605,6 +1613,204 @@ pub async fn create_dynamic_indexes(
     }
 
     indexes
+}
+
+/// Store full markdown documents in the `markdown_documents` collection.
+/// Each document is keyed by source filename and contains the complete
+/// rendered markdown string for direct retrieval by MCP clients.
+#[instrument(skip_all, fields(doc_count = docs.len()))]
+pub async fn upsert_full_markdown_docs(
+    docs: &[(String, String)], // (source_file, full_markdown)
+    client: &MongoClient,
+    on_progress: impl Fn(&str),
+) -> Result<usize> {
+    if docs.is_empty() {
+        return Ok(0);
+    }
+
+    let collection = get_collection(client, &MARKDOWN_DOCS);
+    let now = chrono::Utc::now().timestamp();
+    let mut upserted = 0usize;
+
+    for (source_file, markdown) in docs {
+        let d = doc! {
+            "_id": source_file.as_str(),
+            "source_file": source_file.as_str(),
+            "markdown": markdown.as_str(),
+            "char_count": markdown.len() as i64,
+            "updated_at": now,
+        };
+        match collection
+            .replace_one(doc! { "_id": source_file.as_str() }, d)
+            .upsert(true)
+            .await
+        {
+            Ok(_) => upserted += 1,
+            Err(e) => warn!("Failed to upsert markdown doc '{}': {e}", source_file),
+        }
+    }
+
+    on_progress(&format!("✅ Stored {} full markdown document(s)", upserted));
+    info!("Stored {} full markdown documents in {}", upserted, MARKDOWN_DOCS.name);
+    Ok(upserted)
+}
+
+/// Retrieve the full markdown string for a given source file.
+pub async fn get_full_markdown_doc(
+    client: &MongoClient,
+    source_file: &str,
+) -> Result<Option<String>> {
+    let collection = get_collection(client, &MARKDOWN_DOCS);
+    let filter = doc! { "_id": source_file };
+    match collection.find_one(filter).await? {
+        Some(d) => Ok(d.get_str("markdown").ok().map(|s| s.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// List all stored full markdown documents (source_file, char_count).
+pub async fn list_full_markdown_docs(
+    client: &MongoClient,
+) -> Result<Vec<(String, i64)>> {
+    use futures::TryStreamExt;
+    let collection = get_collection(client, &MARKDOWN_DOCS);
+    let mut cursor = collection
+        .find(doc! {})
+        .projection(doc! { "_id": 1, "char_count": 1 })
+        .await?;
+    let mut results = Vec::new();
+    while let Some(d) = cursor.try_next().await? {
+        if let Ok(id) = d.get_str("_id") {
+            let chars = d.get_i64("char_count").unwrap_or(0);
+            results.push((id.to_string(), chars));
+        }
+    }
+    Ok(results)
+}
+
+/// Store full Gherkin feature files in the `gherkin_documents` collection.
+#[instrument(skip_all, fields(doc_count = docs.len()))]
+pub async fn upsert_full_gherkin_docs(
+    docs: &[(String, String)], // (source_file, feature_text)
+    client: &MongoClient,
+    on_progress: impl Fn(&str),
+) -> Result<usize> {
+    if docs.is_empty() {
+        return Ok(0);
+    }
+
+    let collection = get_collection(client, &GHERKIN_DOCS);
+    let now = chrono::Utc::now().timestamp();
+    let mut upserted = 0usize;
+
+    for (source_file, feature_text) in docs {
+        let d = doc! {
+            "_id": source_file.as_str(),
+            "source_file": source_file.as_str(),
+            "feature_text": feature_text.as_str(),
+            "char_count": feature_text.len() as i64,
+            "updated_at": now,
+        };
+        match collection
+            .replace_one(doc! { "_id": source_file.as_str() }, d)
+            .upsert(true)
+            .await
+        {
+            Ok(_) => upserted += 1,
+            Err(e) => warn!("Failed to upsert gherkin doc '{}': {e}", source_file),
+        }
+    }
+
+    on_progress(&format!("\u{2705} Stored {} full Gherkin document(s)", upserted));
+    info!("Stored {} full Gherkin documents in {}", upserted, GHERKIN_DOCS.name);
+    Ok(upserted)
+}
+
+/// Retrieve the full Gherkin feature text for a given source file.
+pub async fn get_full_gherkin_doc(
+    client: &MongoClient,
+    source_file: &str,
+) -> Result<Option<String>> {
+    let collection = get_collection(client, &GHERKIN_DOCS);
+    let filter = doc! { "_id": source_file };
+    match collection.find_one(filter).await? {
+        Some(d) => Ok(d.get_str("feature_text").ok().map(|s| s.to_string())),
+        None => Ok(None),
+    }
+}
+
+/// Store full source document texts in the `source_documents` collection.
+#[instrument(skip_all, fields(doc_count = docs.len()))]
+pub async fn upsert_source_docs(
+    docs: &[(String, String, String)], // (filename, file_type, raw_text)
+    client: &MongoClient,
+    on_progress: impl Fn(&str),
+) -> Result<usize> {
+    if docs.is_empty() {
+        return Ok(0);
+    }
+
+    let collection = get_collection(client, &SOURCE_DOCS);
+    let now = chrono::Utc::now().timestamp();
+    let mut upserted = 0usize;
+
+    for (filename, file_type, raw_text) in docs {
+        let d = doc! {
+            "_id": filename.as_str(),
+            "source_file": filename.as_str(),
+            "file_type": file_type.as_str(),
+            "raw_text": raw_text.as_str(),
+            "char_count": raw_text.len() as i64,
+            "updated_at": now,
+        };
+        match collection
+            .replace_one(doc! { "_id": filename.as_str() }, d)
+            .upsert(true)
+            .await
+        {
+            Ok(_) => upserted += 1,
+            Err(e) => warn!("Failed to upsert source doc '{}': {e}", filename),
+        }
+    }
+
+    on_progress(&format!("\u{2705} Stored {} source document(s)", upserted));
+    info!("Stored {} source documents in {}", upserted, SOURCE_DOCS.name);
+    Ok(upserted)
+}
+
+/// Retrieve the full source text for a given filename.
+pub async fn get_source_doc(
+    client: &MongoClient,
+    filename: &str,
+) -> Result<Option<(String, String)>> { // (file_type, raw_text)
+    let collection = get_collection(client, &SOURCE_DOCS);
+    let filter = doc! { "_id": filename };
+    match collection.find_one(filter).await? {
+        Some(d) => {
+            let file_type = d.get_str("file_type").unwrap_or("Unknown").to_string();
+            let raw_text = d.get_str("raw_text").unwrap_or("").to_string();
+            Ok(Some((file_type, raw_text)))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Ensure all full-document collections exist (no vector index needed).
+pub async fn ensure_full_doc_collections(client: &MongoClient) {
+    let db = client.database("dockock");
+    let existing = db.list_collection_names()
+        .await
+        .unwrap_or_default();
+    for config in FULL_DOC_COLLECTIONS {
+        if !existing.iter().any(|n| n == config.name) {
+            if let Err(e) = db.create_collection(config.name).await {
+                let msg = e.to_string();
+                if !msg.contains("already exists") {
+                    warn!("Failed to create collection '{}': {e}", config.name);
+                }
+            }
+        }
+    }
 }
 
 async fn create_index_for_provider(
