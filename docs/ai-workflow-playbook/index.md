@@ -48,11 +48,11 @@ Use this launcher when you want the document to route the reader to the right en
 
 | Reader | Start Here | Why |
 |---|---|---|
-| Executive or client stakeholder | [AI_EXECUTIVE_SUMMARY_VISUALS.html](AI_EXECUTIVE_SUMMARY_VISUALS.html) | fastest presentation-first overview of the full Itineris workflow |
-| Product, QA, or business reviewer | [AI_WORKFLOW_VISUALS.html](AI_WORKFLOW_VISUALS.html) | best visual explanation of document intake, validation, and test generation |
-| Architecture or delivery lead | [AI_AGENT_ROUTING_VISUALS.html](AI_AGENT_ROUTING_VISUALS.html) | shows ownership model, specialist routing, and repair vs maintenance choices |
-| Engineering lead or implementation reviewer | [AI_DELIVERY_LOOP_VISUALS.html](AI_DELIVERY_LOOP_VISUALS.html) | shows how approved artifacts move through OpenSpec, OpenCode, review, and repair |
-| Deep document reader | [AI_WORKFLOW_PLAYBOOK.md](AI_WORKFLOW_PLAYBOOK.md) | full narrative, rationale, runbooks, and detailed workflow sections |
+| Executive or client stakeholder | [executive-summary.html](executive-summary.html) | fastest presentation-first overview of the full Itineris workflow |
+| Product, QA, or business reviewer | [workflow-map.html](workflow-map.html) | best visual explanation of document intake, validation, and test generation |
+| Architecture or delivery lead | [agent-routing.html](agent-routing.html) | shows ownership model, specialist routing, and repair vs maintenance choices |
+| Engineering lead or implementation reviewer | [delivery-loop.html](delivery-loop.html) | shows how approved artifacts move through OpenSpec, OpenCode, review, and repair |
+| Deep document reader | [index.md](index.md) | full narrative, rationale, runbooks, and detailed workflow sections |
 
 1. Read the phase overview in the [Phase Map](#6-phase-map) to understand where the current work sits in the end-to-end lifecycle.
 2. If you want the Itineris-specific execution story, start with the [Itineris Validation, Implementation, and Test Strategy](#13-itineris-validation-implementation-and-test-strategy).
@@ -69,10 +69,10 @@ For a faster first read, start with the visuals before the detailed prose.
 
 Open the interactive companions here:
 
-- [AI_EXECUTIVE_SUMMARY_VISUALS.html](AI_EXECUTIVE_SUMMARY_VISUALS.html)
-- [AI_WORKFLOW_VISUALS.html](AI_WORKFLOW_VISUALS.html)
-- [AI_AGENT_ROUTING_VISUALS.html](AI_AGENT_ROUTING_VISUALS.html)
-- [AI_DELIVERY_LOOP_VISUALS.html](AI_DELIVERY_LOOP_VISUALS.html)
+- [executive-summary.html](executive-summary.html)
+- [workflow-map.html](workflow-map.html)
+- [agent-routing.html](agent-routing.html)
+- [delivery-loop.html](delivery-loop.html)
 
 #### Workflow Overview
 
@@ -1195,7 +1195,7 @@ This diagram provides a compact visual path from slice type to the default execu
 
 ![Itineris agent routing diagram](ai-agent-routing.svg)
 
-Open the interactive routing view here: [AI_AGENT_ROUTING_VISUALS.html](AI_AGENT_ROUTING_VISUALS.html)
+Open the interactive routing view here: [agent-routing.html](agent-routing.html)
 
 ### Visual Delivery Loop Diagram
 
@@ -1203,7 +1203,7 @@ This diagram shows the relationship between planning, implementation, review, re
 
 ![Itineris OpenSpec to OpenCode delivery loop](ai-delivery-loop.svg)
 
-Open the interactive delivery-loop view here: [AI_DELIVERY_LOOP_VISUALS.html](AI_DELIVERY_LOOP_VISUALS.html)
+Open the interactive delivery-loop view here: [delivery-loop.html](delivery-loop.html)
 
 ### Operator Workflow
 

@@ -103,5 +103,5 @@
   <rect x="1100" y="572" width="370" height="52" rx="26" fill="#ede9fe"/>
   <text x="1133" y="605" class="chip">Playwright coverage for user-facing regression paths</text>
 
-  <text x="80" y="718" class="footer">Tip: open AI_WORKFLOW_VISUALS.html for an interactive view with clickable stages and highlighted paths.</text>
+  <text x="80" y="718" class="footer">Tip: open workflow-map.html for an interactive view with clickable stages and highlighted paths.</text>
 </svg>
