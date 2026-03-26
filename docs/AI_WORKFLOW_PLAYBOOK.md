@@ -1,7 +1,6 @@
 # AI Workflow Playbook
 
-> Status: Working draft  
-> Scope today: Phase 1 is detailed, and the downstream feature-delivery loop is now captured at a workflow level. Some verification subflows remain intentionally scaffolded and will be refined with more execution detail and screenshots.
+> Scope: Phase 1 is detailed, and the downstream feature-delivery loop is documented at a workflow level.
 
 ## Purpose
 
@@ -510,41 +509,7 @@ Before a generated feature is promoted downstream, it should satisfy the followi
 
 ## Screenshots for This Workflow
 
-The screenshots in this section illustrate the operator flow through DockOck. Where an image file is already present in the repository, it is embedded directly. The remaining screenshots stay as placeholders until their files are added.
-
-### Screenshot A. Empty Workspace Before Generation
-
-Use this image near the start of the workflow section.
-
-What it shows:
-
-- the DockOck desktop UI before files are loaded
-- the Source and Golden areas on the left
-- the pipeline, provider, model, and output controls across the top
-- the empty Gherkin output panel waiting for input
-
-Suggested caption:
-
-"DockOck before document ingestion. The user selects source documentation, chooses the provider and pipeline mode, and prepares the generation run."
-
-Pending file: `docs/playbook-02-...`
-
-### Screenshot B. Files Loaded and Pipeline Mode Selected
-
-Use this image in the operator workflow section after file selection.
-
-What it shows:
-
-- multiple project documents loaded into the left panel
-- automatic grouping behavior in action
-- pipeline mode options visible as Fast, Standard, and Full
-- the relationship between selected inputs and the output panel
-
-Suggested caption:
-
-"Project documentation loaded into DockOck. Related Word files are processed as primary inputs while supporting material provides retrieval context for generation."
-
-Pending file: `docs/playbook-02-...`
+The screenshots in this section illustrate the operator flow through DockOck using the image assets currently available in the repository.
 
 ### Screenshot C. Generated Gherkin Output
 
@@ -610,7 +575,7 @@ What it shows:
 - Output mode switched to Dependency Graph
 - the right panel labeled Dependency Graph
 - the imported project files on the left
-- the placeholder state before the combined dependency graph appears
+- the pre-render state before the combined dependency graph appears
 
 Suggested caption:
 
@@ -1217,56 +1182,3 @@ Before a change is considered complete, it should satisfy the following checks:
 6. The resulting code and tests pass the repository's validation gates.
 7. Human review can follow the trace from documentation to specification to implementation.
 
-## Planned Future Sections
-
-The next iterations of this playbook should define, in detail:
-
-### 1. Gherkin to Architecture
-
-- how features are grouped into implementation slices
-- how technical architecture is inferred or selected
-- how dependencies and data contracts are established
-
-### 2. Gherkin to Production Code
-
-- how OpenSpec change artifacts are translated into bounded implementation slices
-- how OpenCode custom commands and agents are selected for each slice
-- how autoresearch is triggered and evaluated inside the coding loop
-- how code review is automated
-
-### 3. Unit Test Workflow
-
-- how unit tests are generated alongside code
-- how coverage expectations are defined
-- how failing tests are fed back into refinement loops
-
-### 4. Integration Test Workflow
-
-- how service boundaries are identified
-- how external dependencies are modeled
-- how Testcontainers environments are generated and validated
-
-### 5. Performance Test Workflow
-
-- how performance scenarios are derived from business features
-- how SLAs or budgets are defined
-- how regressions are detected and blocked
-
-### 6. UI Test Workflow
-
-- how user journeys are derived from Gherkin features
-- how UI selectors, fixtures, and environments are managed
-- how browser automation becomes part of the verification gate
-
-## Information Needed for the Next Revision
-
-To extend this playbook accurately, the next useful inputs are:
-
-1. how you move from approved Gherkin into architecture and coding tasks
-2. which OpenSpec commands, custom OpenCode commands, and custom agents are mandatory for each loop stage
-3. the target tech stack patterns you want the playbook to standardize
-4. how unit tests are expected to be authored or generated
-5. how integration tests should use Testcontainers in your workflow
-6. how performance tests are executed and what budgets matter
-7. how UI tests are authored and run
-8. the actual screenshot files if you want them embedded directly in the document
