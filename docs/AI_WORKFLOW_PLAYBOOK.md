@@ -1,7 +1,7 @@
 # AI Workflow Playbook
 
-> Status: Initial draft  
-> Scope today: Phase 1 is detailed. Later phases are intentionally scaffolded and will be refined as you provide more process detail, tools, and screenshots.
+> Status: Working draft  
+> Scope today: Phase 1 is detailed, and the downstream feature-delivery loop is now captured at a workflow level. Some verification subflows remain intentionally scaffolded and will be refined with more execution detail and screenshots.
 
 ## Purpose
 
@@ -15,6 +15,18 @@ This playbook describes how we take a project from zero implementation, where th
 - traceable links back to source documentation
 
 The first workflow described here is the current front door into that system: transforming Word requirements documents into Gherkin features while using Excel and Visio files as semantic reference context.
+
+## Operator Quick Start
+
+Use this sequence for the fastest path through the document.
+
+1. Read the phase overview in the [Phase Map](#phase-map) to understand where the current work sits in the end-to-end lifecycle.
+2. If you are moving from approved artifacts into implementation, start with the [OpenSpec to OpenCode delivery loop](#detailed-workflow-openspec-to-opencode-delivery-loop).
+3. Use the [Current Custom Agent and Command Catalog](#current-custom-agent-and-command-catalog) only when you need to know what a specific agent or command does.
+4. Use the [Delivery Stage Selection Matrix](#delivery-stage-selection-matrix) and the [Agent Combination Runbook](#agent-combination-runbook) when you need to choose the execution stack for a delivery stage.
+5. Use the [Example Feature Flows](#example-feature-flows) when the current work looks mostly backend-dominant, frontend-dominant, or infrastructure-dominant.
+6. Use the [Quick Routing Cheat Sheet](#quick-routing-cheat-sheet) and the [Mermaid Routing Diagram](#mermaid-routing-diagram) when you only need a fast routing decision.
+7. Use the [Mermaid Delivery Loop Diagram](#mermaid-delivery-loop-diagram) when you need to explain how planning, implementation, review, repair, and maintenance relate.
 
 ## End-State Workflow
 
@@ -45,6 +57,23 @@ At this stage, the playbook documents four output and retrieval paths built on t
 - Spreadsheets and diagrams are supporting evidence unless explicitly promoted to primary inputs.
 - Every downstream artifact should be traceable back to the originating documentation.
 - Generated artifacts should pass through explicit quality gates before they become source-of-truth inputs for the next phase.
+
+## Terminology Standard
+
+The playbook uses the following terms deliberately. They should be read consistently throughout the document.
+
+- Phase: a top-level lifecycle segment in the end-to-end workflow, such as documentation intake, artifact generation, implementation planning, code generation, or hardening.
+- Delivery stage: a step inside the OpenSpec-to-OpenCode execution loop, specifically planning, implementation, review, repair, or maintenance.
+- Feature slice: a bounded, reviewable unit of implementation work that maps back to one or more OpenSpec tasks.
+- Dominant slice type: the change surface that should determine the primary implementation owner for a feature slice, typically backend-dominant, frontend-dominant, or infrastructure-dominant.
+- Planning defect: a blocker caused by unclear scope, missing acceptance criteria, or unresolved technical boundaries.
+- Repair defect: a blocker caused by incorrect implementation, failing tests, build issues, deployment issues, or unstable runtime behavior after the scope is already acceptable.
+
+Usage rule:
+
+- use `phase` for the macro lifecycle
+- use `delivery stage` for the OpenSpec-to-OpenCode loop
+- use `feature slice` for the bounded unit of execution and review
 
 ## Phase Map
 
@@ -81,6 +110,8 @@ Planned outputs:
 - target architecture
 - implementation backlog
 - dependency graph
+- OpenSpec change artifacts such as proposal, spec, design, and tasks
+- OpenCode-ready execution packets
 - coding agent work packets
 
 ### Phase 4. Code and Test Generation
@@ -90,6 +121,7 @@ Goal: generate production code and test suites from approved specifications and 
 Planned outputs:
 
 - application code
+- iterative code changes driven by OpenSpec and OpenCode commands
 - unit tests
 - integration tests
 - performance tests
@@ -679,15 +711,511 @@ The intended downstream chain is:
 2. Markdown knowledge-base documents provide durable project and architecture context.
 3. Dependency graphs expose structural relationships, coupling, and process dependencies.
 4. Index-only mode provides persistent semantic and full-document retrieval for chat and MCP consumers.
-5. Architecture and implementation prompts are generated from the approved artifact set and indexed knowledge base.
-6. Coding agents create production code aligned to those artifacts.
-7. Test-generation agents create:
+5. Approved features are exported into OpenSpec so feature work is represented as explicit change artifacts rather than ad hoc prompts.
+6. OpenSpec commands generate or refine proposal, spec, design, and task artifacts for each feature slice.
+7. OpenCode runs the implementation loop against the approved OpenSpec change set using the team's configured provider and model catalog, including the Rinf-backed LLM configuration.
+8. Custom agents, prompts, skills, and commands shape how OpenCode executes coding, review, and repair work so the loop stays aligned with team conventions.
+9. The autoresearch OpenCode integration is used where appropriate to strengthen the coding loop with targeted research, context gathering, and refinement before or during implementation.
+10. Coding agents create production code aligned to the approved artifacts and retrieved source context.
+11. Test-generation agents create:
    - unit tests for isolated business logic
    - integration tests for service and persistence boundaries
    - Testcontainers-based environment tests for external dependencies
    - performance tests for throughput, latency, and scale assumptions
    - UI tests for end-to-end user behavior
-8. Review agents compare implementation and tests against the originating specifications, indexed source material, and graph relationships.
+12. Review agents compare implementation and tests against the originating specifications, indexed source material, and graph relationships.
+
+## Detailed Workflow: OpenSpec to OpenCode Delivery Loop
+
+This workflow starts after DockOck has produced and the team has approved the specification package for a feature or change.
+
+### Objective
+
+Turn approved documentation-derived artifacts into controlled implementation changes by using OpenSpec as the change-definition layer and OpenCode as the execution layer.
+
+### Why This Matters
+
+The key constraint in this workflow is that feature implementation should not begin from a loosely phrased coding prompt.
+
+Instead, the team first creates or updates an explicit OpenSpec change set, then uses OpenCode to execute against that change set with the correct provider, models, commands, and agent behaviors.
+
+That creates a stronger loop because:
+
+- the implementation target is explicit and reviewable
+- change intent is separated from code synthesis
+- custom commands and agents can enforce house style and workflow rules
+- research and retrieval can happen as first-class steps instead of being improvised inside a single prompt
+
+### Inputs to This Workflow
+
+The downstream loop is expected to consume some or all of the following:
+
+- approved Gherkin features
+- approved Markdown knowledge-base outputs
+- dependency graph outputs where structural context matters
+- indexed source and generated artifacts available through chat or MCP retrieval
+- retained project documentation kept inside the repository so agents can search the original source files directly as a fallback during an OpenSpec change
+- the project's chosen tech-stack profile
+
+### Context Access Pattern
+
+During an OpenSpec change, agents should prefer indexed retrieval through chat or MCP when that source is sufficient.
+
+The original project documents are also retained in the repository so agents can search those files directly as a fallback when indexed retrieval is incomplete, when an exact file is required, or when the change needs side-by-side access to generated artifacts and raw source documents.
+
+### Tooling Roles
+
+| Tool | Role in the loop |
+|---|---|
+| DockOck | Produces the approved specification and retrieval artifacts |
+| OpenSpec | Defines the change through proposal, spec, design, and task artifacts |
+| OpenCode | Executes the implementation loop against the approved change set |
+| Custom provider config | Routes OpenCode to the team's provider and Rinf-backed LLM models |
+| autoresearch-opencode | Improves the coding loop with targeted research and context acquisition |
+| Custom agents and commands | Standardize how prompts, skills, review steps, and edit loops are run |
+
+### Current Custom Agent and Command Catalog
+
+The current custom workflow layer includes a broad agent catalog plus a maintenance command that improves the catalog over time.
+
+#### Planning and Product Framing Agents
+
+- `business-analyst`: gathers and documents detailed software requirements and acceptance criteria
+- `pm-coordinator`: coordinates the overall software delivery lifecycle
+- `principal-technical-expert`: breaks product requirements into implementable technical tasks
+- `product-engineer`: bridges product requirements with technical implementation decisions
+- `project-preferences-advisor`: enforces and evolves permanent project-wide development preferences
+
+#### Architecture and Design Agents
+
+- `software-architect`: designs robust and scalable software architecture for the target stack
+- `architecture-advisor`: provides architecture guidance grounded in Clean Architecture and Righting Software principles
+- `ddia-advisor`: advises on data-system design using the patterns from Designing Data-Intensive Applications
+- `api-designer`: focuses on REST and GraphQL API design quality and developer experience
+- `database-architect`: owns PostgreSQL schema design, query optimization, and performance considerations
+- `ui-ux-designer`: defines design-system, accessibility, and user-experience direction
+
+#### Implementation and Platform Agents
+
+- `backend-developer`: implements backend features in C# and .NET using clean architecture practices
+- `frontend-developer`: implements React and TypeScript frontend work on the team's selected stack
+- `build-engineer`: handles build systems, compilation diagnostics, and build automation
+- `devops-engineer`: handles CI/CD, infrastructure as code, and deployment automation
+- `kubernetes-expert`: covers production Kubernetes deployment, security, and scalability concerns
+- `kafka-expert`: supports event-driven architecture and Kafka-based streaming design
+- `redis-expert`: supports caching strategies and in-memory data-structure usage
+
+#### Review, Quality, and Reliability Agents
+
+- `backend-code-reviewer`: reviews backend code for security, performance, and quality risks
+- `frontend-code-reviewer`: reviews frontend code for stack compliance, correctness, and maintainability
+- `qa-engineer`: drives broad testing coverage, including functional, accessibility, and security concerns
+- `test-automation-engineer`: focuses on end-to-end automation with tools such as Playwright and Selenium
+- `performance-engineer`: handles profiling, load testing, and SLA-oriented optimization
+- `security-engineer`: enforces OWASP-aligned security practices and vulnerability reduction
+- `sre-engineer`: focuses on uptime, operational reliability, and incident response readiness
+- `documentation-expert`: produces internal and external technical documentation
+
+#### Custom Command
+
+- `improve-agents`: a meta-command that reviews accumulated learnings, identifies which findings should be promoted into agent prompts, proposes targeted prompt updates, and flags stale or duplicate learnings for cleanup rather than auto-applying changes
+
+### Agent File Reference by Workflow Phase
+
+The following table keeps the exact filenames visible so operators can choose the right agent for a given phase without translating from shorthand names.
+
+| File | Primary delivery stage | Use when |
+|---|---|---|
+| `business-analyst.md` | OpenSpec planning | requirements need to be clarified, normalized, or rewritten into acceptance-oriented language |
+| `pm-coordinator.md` | OpenSpec planning | the feature needs task sequencing, delivery coordination, or cross-role orchestration |
+| `principal-technical-expert.md` | OpenSpec planning | business scope must be decomposed into concrete technical tasks |
+| `product-engineer.md` | OpenSpec planning, OpenCode implementation | product intent needs to stay connected to implementation choices |
+| `project-preferences-advisor.md` | planning, implementation, review, repair | the run must follow stable project conventions and team preferences |
+| `software-architect.md` | OpenSpec planning | the change needs service boundaries, component structure, or integration design |
+| `architecture-advisor.md` | OpenSpec planning, review | the architecture should be validated against explicit design principles |
+| `ddia-advisor.md` | OpenSpec planning, review | the feature touches storage, distribution, replication, partitioning, or event/data flow decisions |
+| `api-designer.md` | OpenSpec planning, review | the feature introduces or changes API contracts, resource models, or integration surfaces |
+| `database-architect.md` | OpenSpec planning, OpenCode implementation, review | the change affects schema design, queries, migrations, or database performance |
+| `ui-ux-designer.md` | OpenSpec planning, OpenCode implementation | the feature requires interaction design, accessibility direction, or design-system decisions |
+| `backend-developer.md` | OpenCode implementation | backend feature work should be executed in the application and data layers |
+| `frontend-developer.md` | OpenCode implementation | frontend feature work should be executed in the React and TypeScript stack |
+| `build-engineer.md` | OpenCode implementation, repair | build pipelines, compilation problems, or automation work are blocking delivery |
+| `devops-engineer.md` | OpenCode implementation, repair | deployment automation, CI/CD, or environment configuration must be changed |
+| `kubernetes-expert.md` | OpenCode implementation, repair | the feature or fix affects Kubernetes manifests, runtime topology, or cluster behavior |
+| `kafka-expert.md` | OpenSpec planning, OpenCode implementation, repair | the feature depends on event-driven patterns, topics, consumers, or streaming semantics |
+| `redis-expert.md` | OpenSpec planning, OpenCode implementation, repair | caching, eviction, pub/sub, or in-memory data-structure choices matter |
+| `backend-code-reviewer.md` | review | backend code needs security, performance, and maintainability review |
+| `frontend-code-reviewer.md` | review | frontend code needs stack-compliance, correctness, and maintainability review |
+| `qa-engineer.md` | review, repair | functional, accessibility, or broader quality checks need to be defined or expanded |
+| `test-automation-engineer.md` | review, repair | end-to-end or automated regression coverage must be added or stabilized |
+| `performance-engineer.md` | review, repair | the change has performance risk, profiling work, or SLA implications |
+| `security-engineer.md` | review, repair | the change introduces security-sensitive behavior or needs OWASP-oriented review |
+| `sre-engineer.md` | review, repair | reliability, observability, incident readiness, or runtime resilience must be improved |
+| `documentation-expert.md` | review, repair | the change requires developer-facing, operator-facing, or user-facing documentation updates |
+| `improve-agents.md` | periodic maintenance | repeated learnings suggest agent prompts should be tightened or cleaned up rather than rediscovered again |
+
+### Delivery Stage Selection Matrix
+
+This matrix maps the main delivery stages in the OpenSpec-to-OpenCode loop to the most appropriate agent choices.
+
+| Stage | Primary goal | Default agents | Specialist agents to add when needed | Command guidance |
+|---|---|---|---|---|
+| OpenSpec planning | turn approved feature artifacts into change scope, architecture, and executable tasks | `business-analyst.md`, `principal-technical-expert.md`, `software-architect.md` | `api-designer.md`, `database-architect.md`, `ddia-advisor.md`, `ui-ux-designer.md`, `pm-coordinator.md`, `product-engineer.md` | use your normal OpenSpec commands to generate or refine proposal, spec, design, and tasks; `improve-agents.md` is not a primary planning command |
+| OpenCode implementation | execute bounded code changes against the approved OpenSpec change | `backend-developer.md` or `frontend-developer.md`, plus `project-preferences-advisor.md` | `build-engineer.md`, `devops-engineer.md`, `kubernetes-expert.md`, `kafka-expert.md`, `redis-expert.md`, `database-architect.md`, `product-engineer.md` | use the team's normal OpenCode implementation commands and custom prompts; keep `improve-agents.md` out of the hot path |
+| Review | validate correctness, design fit, risk, and test adequacy before accepting the slice | `backend-code-reviewer.md` or `frontend-code-reviewer.md`, `qa-engineer.md` | `security-engineer.md`, `performance-engineer.md`, `sre-engineer.md`, `architecture-advisor.md`, `documentation-expert.md`, `test-automation-engineer.md` | run the review and validation commands that correspond to the slice; if the same review issues recur across runs, queue `improve-agents.md` afterward |
+| Repair | fix defects, close validation gaps, and stabilize the change after review findings or test failures | the original implementation agent, plus `qa-engineer.md` | `build-engineer.md`, `devops-engineer.md`, `kubernetes-expert.md`, `security-engineer.md`, `performance-engineer.md`, `sre-engineer.md`, `test-automation-engineer.md`, `documentation-expert.md` | use repair and retest commands first; use `improve-agents.md` only when the root cause appears to be an agent-instruction gap rather than a one-off defect |
+
+### Command Selection Note
+
+The current command archive contributes one explicit maintenance command, `improve-agents.md`.
+
+The operational feature loop is therefore still driven primarily by OpenSpec commands, OpenCode commands, and the agent catalog, while `improve-agents.md` acts as a prompt-governance command that should run periodically or after repeated workflow failures rather than during every feature slice.
+
+### Agent Combination Runbook
+
+The matrix above identifies suitable candidates for each delivery stage. This runbook extends that guidance by defining which combinations should be treated as primary, which are optional, and which should usually not be combined in the same pass.
+
+#### OpenSpec Planning Runbook
+
+- Primary combination: `business-analyst.md` + `principal-technical-expert.md` + `software-architect.md`
+- Optional additions: `api-designer.md`, `database-architect.md`, `ddia-advisor.md`, `ui-ux-designer.md`, `pm-coordinator.md`, `product-engineer.md`, `project-preferences-advisor.md`
+- Avoid in the same pass: `backend-developer.md`, `frontend-developer.md`, `backend-code-reviewer.md`, `frontend-code-reviewer.md`
+
+Reasoning:
+
+- planning runs should sharpen scope, structure, and task boundaries before code generation starts
+- implementation agents tend to collapse planning into premature coding decisions
+- review agents are more effective after code or executable tasks exist
+
+#### OpenCode Implementation Runbook
+
+- Primary combination for backend slices: `backend-developer.md` + `project-preferences-advisor.md`
+- Primary combination for frontend slices: `frontend-developer.md` + `project-preferences-advisor.md`
+- Optional additions: `database-architect.md`, `build-engineer.md`, `devops-engineer.md`, `kubernetes-expert.md`, `kafka-expert.md`, `redis-expert.md`, `product-engineer.md`, `ui-ux-designer.md`
+- Avoid in the same pass: `backend-developer.md` + `frontend-developer.md` as co-equal primary executors on the same narrow slice, `backend-code-reviewer.md`, `frontend-code-reviewer.md`
+
+Reasoning:
+
+- the implementation pass should have one clear code-owning agent
+- cross-stack specialist agents can support the slice, but two primary implementation agents usually blur responsibility
+- review agents should not be mixed into the main generation pass unless the workflow explicitly performs micro-review after each edit
+
+#### Review Runbook
+
+- Primary combination for backend slices: `backend-code-reviewer.md` + `qa-engineer.md`
+- Primary combination for frontend slices: `frontend-code-reviewer.md` + `qa-engineer.md`
+- Optional additions: `security-engineer.md`, `performance-engineer.md`, `sre-engineer.md`, `architecture-advisor.md`, `documentation-expert.md`, `test-automation-engineer.md`, `project-preferences-advisor.md`
+- Avoid in the same pass: `backend-developer.md`, `frontend-developer.md` as primary actors, `pm-coordinator.md`
+
+Reasoning:
+
+- review should identify risks and gaps, not reopen full implementation loops immediately
+- specialist review agents should be added only when the slice presents matching risk signals
+- coordination roles add limited value in a focused technical review pass
+
+#### Repair Runbook
+
+- Primary combination: original implementation agent + `qa-engineer.md`
+- Optional additions: `build-engineer.md`, `devops-engineer.md`, `kubernetes-expert.md`, `security-engineer.md`, `performance-engineer.md`, `sre-engineer.md`, `test-automation-engineer.md`, `documentation-expert.md`, `project-preferences-advisor.md`
+- Avoid in the same pass: both code reviewers as co-primary actors, broad planning agents such as `business-analyst.md` or `pm-coordinator.md` unless the failure exposed a real scope defect
+
+Reasoning:
+
+- repair should stay anchored to the agent that owns the code change
+- quality and specialist agents can narrow the defect quickly when the failure mode is known
+- broad planning roles should only come back in when the issue is actually a requirement or task-definition problem
+
+#### Maintenance Runbook
+
+- Primary combination: `improve-agents.md`
+- Optional additions: `project-preferences-advisor.md`, `documentation-expert.md`
+- Avoid in the same pass: implementation or review agents unless the goal is to inspect a specific recurring workflow failure
+
+Reasoning:
+
+- maintenance runs should improve prompts and learnings, not expand into feature delivery work
+- this command is most useful after patterns have repeated across multiple slices
+
+### Example Feature Flows
+
+Use these examples when the matrix and runbook are still too abstract for the current feature slice.
+
+#### Example A. Backend Feature Slice
+
+Scenario: an approved feature requires a new backend endpoint, validation rules, persistence changes, and tests.
+
+Recommended flow:
+
+1. OpenSpec planning: `business-analyst.md` + `principal-technical-expert.md` + `software-architect.md`
+2. Add `api-designer.md` if the endpoint contract is new or externally consumed.
+3. Add `database-architect.md` if the feature needs schema updates, indexes, or non-trivial queries.
+4. Generate or refine the OpenSpec proposal, spec, design, and tasks.
+5. OpenCode implementation: `backend-developer.md` + `project-preferences-advisor.md`
+6. Add `database-architect.md` during implementation if migrations or query tuning are part of the slice.
+7. Add `build-engineer.md` only if the slice is blocked by compilation, package, or build automation issues.
+8. Run the normal implementation command set and, if needed, the autoresearch loop for repository discovery or library checks.
+9. Review: `backend-code-reviewer.md` + `qa-engineer.md`
+10. Add `security-engineer.md` for auth, secrets, sensitive data, or exposed attack-surface changes.
+11. Add `performance-engineer.md` if the endpoint is latency-sensitive or high-volume.
+12. Repair: return to `backend-developer.md` + `qa-engineer.md` until the slice is clean.
+
+Why this flow works:
+
+- it keeps architecture and contract decisions ahead of code generation
+- it assigns one clear implementation owner for the slice
+- it adds specialist review only when the feature risk profile warrants it
+
+#### Example B. Frontend Feature Slice
+
+Scenario: an approved feature requires a new UI flow, form validation, route updates, and API integration.
+
+Recommended flow:
+
+1. OpenSpec planning: `business-analyst.md` + `principal-technical-expert.md` + `software-architect.md`
+2. Add `ui-ux-designer.md` if the slice changes user flow, accessibility, or design-system usage.
+3. Add `api-designer.md` if the frontend needs new request or response shapes.
+4. Generate or refine the OpenSpec proposal, spec, design, and tasks.
+5. OpenCode implementation: `frontend-developer.md` + `project-preferences-advisor.md`
+6. Add `ui-ux-designer.md` during implementation if the interaction model is still being clarified.
+7. Add `product-engineer.md` if the UI behavior needs tight alignment with product intent across edge cases.
+8. Run the normal implementation command set and invoke autoresearch when existing UI patterns or library usage need to be discovered first.
+9. Review: `frontend-code-reviewer.md` + `qa-engineer.md`
+10. Add `test-automation-engineer.md` if the slice needs end-to-end coverage or regression automation.
+11. Add `security-engineer.md` when the flow changes auth, token handling, or protected-route behavior.
+12. Repair: return to `frontend-developer.md` + `qa-engineer.md` until the slice is stable.
+
+Why this flow works:
+
+- it separates user-flow design from UI code execution
+- it keeps the frontend implementation anchored to one primary code-owning agent
+- it brings in automation and security review only when the feature surface requires them
+
+#### Example C. Infrastructure and Platform Slice
+
+Scenario: an approved feature requires infrastructure changes such as Kafka topic integration, Redis-backed caching, deployment updates, or Kubernetes runtime changes.
+
+Recommended flow:
+
+1. OpenSpec planning: `business-analyst.md` + `principal-technical-expert.md` + `software-architect.md`
+2. Add `ddia-advisor.md` if the slice changes event flow, data consistency, delivery guarantees, or distributed-system tradeoffs.
+3. Add `kafka-expert.md` for topic design, producer-consumer behavior, ordering, retries, or dead-letter handling.
+4. Add `redis-expert.md` if the slice introduces caching, invalidation rules, pub/sub, or in-memory coordination patterns.
+5. Add `database-architect.md` if the infrastructure change also affects persistence design or query strategy.
+6. Generate or refine the OpenSpec proposal, spec, design, and tasks.
+7. OpenCode implementation: choose one primary execution owner based on the dominant change surface.
+8. Use `backend-developer.md` if the main work is application-side integration code.
+9. Use `devops-engineer.md` if the main work is delivery pipeline, environment, or deployment automation.
+10. Add `kubernetes-expert.md` when manifests, scaling behavior, runtime topology, or cluster concerns are part of the slice.
+11. Add `build-engineer.md` if packaging, compilation, or release automation blocks the slice.
+12. Review: `qa-engineer.md` plus the most relevant specialist reviewer for the risk surface.
+13. Add `security-engineer.md` for secrets, network exposure, credentials, or trust-boundary changes.
+14. Add `sre-engineer.md` for resilience, observability, rollback readiness, or incident-risk review.
+15. Add `performance-engineer.md` when throughput, latency, fan-out, or infrastructure load characteristics matter.
+16. Repair: return to the original implementation owner plus `qa-engineer.md` until the slice is stable.
+
+Why this flow works:
+
+- it keeps distributed-system and platform tradeoffs visible before implementation starts
+- it avoids splitting ownership across too many infrastructure specialists at once
+- it ties review depth to the real operational risk of the slice
+
+### Decision Trees
+
+Use these decision trees for rapid operator guidance.
+
+#### Decision Tree A. Choose the Planning Stack
+
+1. Start with `business-analyst.md` + `principal-technical-expert.md` + `software-architect.md`.
+2. If the slice changes APIs, add `api-designer.md`.
+3. If the slice changes schema, persistence, or queries, add `database-architect.md`.
+4. If the slice changes event flow or distributed data behavior, add `ddia-advisor.md` and possibly `kafka-expert.md`.
+5. If the slice changes user flow or interface behavior, add `ui-ux-designer.md`.
+6. If sequencing and cross-team coordination are the main problem, add `pm-coordinator.md`.
+
+#### Decision Tree B. Choose the Implementation Owner
+
+1. If the slice is mainly backend code, use `backend-developer.md`.
+2. If the slice is mainly frontend code, use `frontend-developer.md`.
+3. If the slice is mainly CI/CD or deployment automation, use `devops-engineer.md`.
+4. If the slice is mainly build, packaging, or compilation work, use `build-engineer.md`.
+5. If the slice is mainly Kubernetes runtime behavior, add `kubernetes-expert.md` and keep one primary owner.
+6. Always add `project-preferences-advisor.md` when you need the implementation run to stay aligned with project conventions.
+
+#### Decision Tree C. Choose the Review Stack
+
+1. Backend slice: start with `backend-code-reviewer.md` + `qa-engineer.md`.
+2. Frontend slice: start with `frontend-code-reviewer.md` + `qa-engineer.md`.
+3. Security-sensitive slice: add `security-engineer.md`.
+4. Latency-sensitive or high-volume slice: add `performance-engineer.md`.
+5. Infrastructure or runtime-reliability slice: add `sre-engineer.md`.
+6. If end-to-end automation is missing, add `test-automation-engineer.md`.
+7. If docs are part of the acceptance bar, add `documentation-expert.md`.
+
+#### Decision Tree D. Choose Repair vs Maintenance
+
+1. If the failure is specific to one feature slice, return to the original implementation owner plus `qa-engineer.md`.
+2. If the failure is build or deployment related, add `build-engineer.md`, `devops-engineer.md`, or `kubernetes-expert.md` as needed.
+3. If the same mistakes repeat across multiple slices, run `improve-agents.md` after the feature repair loop.
+4. If the problem is actually ambiguous scope rather than defective execution, return to the planning stack instead of staying in repair mode.
+
+### Quick Routing Cheat Sheet
+
+Use this section when a routing decision is needed without consulting the full reference material.
+
+| Situation | Start here | Add these if needed | Do not start with |
+|---|---|---|---|
+| new backend feature | `backend-developer.md` + `project-preferences-advisor.md` | `api-designer.md`, `database-architect.md`, `security-engineer.md`, `performance-engineer.md` | `backend-code-reviewer.md` |
+| new frontend feature | `frontend-developer.md` + `project-preferences-advisor.md` | `ui-ux-designer.md`, `api-designer.md`, `test-automation-engineer.md`, `security-engineer.md` | `frontend-code-reviewer.md` |
+| infrastructure-heavy change | dominant owner plus `project-preferences-advisor.md` | `devops-engineer.md`, `kubernetes-expert.md`, `kafka-expert.md`, `redis-expert.md`, `sre-engineer.md` | both frontend and backend developers as co-primary owners |
+| API or schema ambiguity | `business-analyst.md` + `principal-technical-expert.md` + `software-architect.md` | `api-designer.md`, `database-architect.md`, `ddia-advisor.md` | implementation agents |
+| review and sign-off | code reviewer + `qa-engineer.md` | `security-engineer.md`, `performance-engineer.md`, `documentation-expert.md`, `test-automation-engineer.md` | planning agents |
+| repeated workflow mistakes | `improve-agents.md` | `project-preferences-advisor.md`, `documentation-expert.md` | implementation agents in the same run |
+
+### Slice Dominance Glossary
+
+The examples and decision trees assume that every feature slice has a dominant change surface. This section extends the Terminology Standard with the shorthand used for slice classification.
+
+- Backend-dominant slice: most of the work is in API handlers, services, validation, repositories, persistence, or domain logic.
+- Frontend-dominant slice: most of the work is in UI flows, forms, routes, client-side state, view composition, or browser behavior.
+- Infrastructure-dominant slice: most of the work is in deployment automation, runtime configuration, messaging, caching, observability, scaling, or platform behavior.
+- Mixed slice: multiple change surfaces move together, but one still causes most of the technical risk or most of the implementation effort.
+- Planning defect: the current blocker is missing scope clarity, missing acceptance criteria, or unclear technical boundaries rather than bad code.
+- Repair defect: the scope is already acceptable, but implementation, test, build, deployment, or runtime behavior is failing.
+
+Rule of thumb:
+
+- choose the primary implementation owner based on the dominant slice type
+- choose specialist agents based on the main risk, not on every touched file
+- move back to planning only when the blocker is a planning defect rather than a repair defect
+
+### Mermaid Routing Diagram
+
+This diagram provides a compact visual path from slice type to the default execution stack.
+
+```mermaid
+flowchart TD
+   A[Approved feature slice] --> B{Dominant slice type?}
+   B -->|Backend| C[backend-developer.md<br/>+ project-preferences-advisor.md]
+   B -->|Frontend| D[frontend-developer.md<br/>+ project-preferences-advisor.md]
+   B -->|Infrastructure| E[Pick one primary owner:<br/>backend-developer.md or devops-engineer.md<br/>+ project-preferences-advisor.md]
+   B -->|Unclear scope| F[business-analyst.md<br/>+ principal-technical-expert.md<br/>+ software-architect.md]
+
+   C --> G{Need specialists?}
+   D --> G
+   E --> G
+   F --> H[Generate or refine OpenSpec artifacts]
+
+   G -->|API or schema| I[Add api-designer.md or database-architect.md]
+   G -->|Messaging or caching| J[Add kafka-expert.md or redis-expert.md]
+   G -->|Runtime or delivery| K[Add devops-engineer.md or kubernetes-expert.md]
+   G -->|UX or product behavior| L[Add ui-ux-designer.md or product-engineer.md]
+   G -->|No| M[Run implementation commands]
+
+   I --> M
+   J --> M
+   K --> M
+   L --> M
+   H --> M
+
+   M --> N[Review with code reviewer + qa-engineer.md]
+   N --> O{Issues repeated across slices?}
+   O -->|No| P[Repair with original owner + qa-engineer.md]
+   O -->|Yes| Q[Run improve-agents.md after repair]
+```
+
+### Mermaid Delivery Loop Diagram
+
+This diagram shows the relationship between planning, implementation, review, repair, and prompt-maintenance work.
+
+```mermaid
+flowchart LR
+   A[DockOck approved artifacts] --> B[OpenSpec change artifacts]
+   B --> C[Agent selection and OpenCode execution]
+   C --> D[Implementation slice]
+   D --> E[Review and validation]
+   E -->|Pass| F[Accepted slice]
+   E -->|Fail| G[Repair loop]
+   G --> D
+   E -->|Recurring workflow mistakes| H[improve-agents.md]
+   H --> I[Prompt and workflow improvements]
+   I --> C
+```
+
+### Operator Workflow
+
+1. Generate and review Gherkin, Markdown, graph, or index artifacts in DockOck.
+2. Approve the feature slice that should move into implementation.
+3. Export or translate the approved feature into an OpenSpec change.
+4. Run OpenSpec commands to generate or update the proposal, spec, design, and tasks for that change.
+5. Review the OpenSpec artifacts and confirm the scope is implementation-ready.
+6. Open the target repository in OpenCode with the relevant change context.
+7. Execute the team's custom commands or agents so OpenCode works from the approved OpenSpec artifacts rather than a free-form prompt.
+8. Use the configured provider and model selection that points at the team's Rinf-backed LLM environment.
+9. Invoke autoresearch integration when the task requires deeper codebase discovery, dependency lookup, external library comparison, or design validation.
+10. Let OpenCode generate or refine code changes in bounded slices.
+11. Run the review, repair, and test commands defined by the team workflow.
+12. Repeat until the change satisfies the OpenSpec intent, tests, and review gates.
+
+### What the System Does Internally
+
+#### Step 1. Treat OpenSpec as the source of change intent
+
+Once a feature is approved, OpenSpec becomes the operational source of truth for the implementation loop.
+
+That means implementation work is driven from structured change artifacts rather than from a single ephemeral coding prompt.
+
+#### Step 2. Bind OpenCode to the team's provider and models
+
+OpenCode is configured to use the team's own provider integration and model catalog.
+
+In this repository that pattern is represented by an OpenCode-compatible provider configuration, which allows the coding loop to target the team's managed LLM endpoints instead of assuming a public default provider.
+
+#### Step 3. Apply custom agents, prompts, skills, and commands
+
+The team uses its own workflow layer on top of OpenCode.
+
+That workflow layer can determine:
+
+- how feature context is loaded
+- which prompts or skills are applied for planning, coding, review, or repair
+- which commands are used for slice generation, test generation, validation, and cleanup
+- how much autonomy an agent run should have before handing control back to a reviewer
+
+#### Step 4. Use autoresearch to improve the coding loop
+
+Not every coding step should immediately produce edits.
+
+For ambiguous or high-risk work, autoresearch is used to improve the loop by collecting better context first, such as:
+
+- relevant files and modules
+- existing patterns in the repository
+- framework or library usage examples
+- external implementation guidance when that is allowed and useful
+
+This reduces unnecessary generations and helps the coding agent converge on repository-aligned changes more quickly.
+
+#### Step 5. Execute in bounded slices
+
+The implementation loop should operate on bounded feature slices that map back to OpenSpec tasks.
+
+That makes it easier to:
+
+- review code diffs
+- validate tests incrementally
+- isolate regressions
+- rerun only the necessary research or repair steps
+
+### Quality Gates for the Delivery Loop
+
+Before a change is considered complete, it should satisfy the following checks:
+
+1. The code change maps back to an approved OpenSpec change and task set.
+2. The implementation remains consistent with the approved Gherkin behavior and supporting Markdown or graph context.
+3. Retrieval-backed source material can still explain why the change exists and what requirement it satisfies.
+4. Custom command and agent steps have been run for the required planning, coding, and review phases.
+5. autoresearch was used where the task needed additional discovery or external confirmation.
+6. The resulting code and tests pass the repository's validation gates.
+7. Human review can follow the trace from documentation to specification to implementation.
 
 ## Planned Future Sections
 
@@ -701,8 +1229,9 @@ The next iterations of this playbook should define, in detail:
 
 ### 2. Gherkin to Production Code
 
-- how coding agents receive context
-- how implementation tasks are decomposed
+- how OpenSpec change artifacts are translated into bounded implementation slices
+- how OpenCode custom commands and agents are selected for each slice
+- how autoresearch is triggered and evaluated inside the coding loop
 - how code review is automated
 
 ### 3. Unit Test Workflow
@@ -734,7 +1263,7 @@ The next iterations of this playbook should define, in detail:
 To extend this playbook accurately, the next useful inputs are:
 
 1. how you move from approved Gherkin into architecture and coding tasks
-2. which coding agents or platforms are used after DockOck
+2. which OpenSpec commands, custom OpenCode commands, and custom agents are mandatory for each loop stage
 3. the target tech stack patterns you want the playbook to standardize
 4. how unit tests are expected to be authored or generated
 5. how integration tests should use Testcontainers in your workflow
