@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Itineris AI Workflow Visuals</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+
+    :root {
+      --ink: #1d1d1f;
+      --muted: #5a6170;
+      --magenta: #e40189;
+      --panel: rgba(255, 255, 255, 0.82);
+      --line: #d2dae5;
+      --sand: #f7f2e7;
+      --teal: #0f766e;
+      --amber: #d97706;
+      --blue: #1d4ed8;
+      --violet: #7c3aed;
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+      --radius: 24px;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Montserrat", Arial, Helvetica, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(228, 1, 137, 0.16), transparent 20%),
+        radial-gradient(circle at bottom right, rgba(29, 78, 216, 0.14), transparent 24%),
+        linear-gradient(135deg, #f7f4ea 0%, #edf4f7 100%);
+    }
+
+    .shell {
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 40px 28px 56px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.3fr 0.7fr;
+      gap: 24px;
+      align-items: stretch;
+      margin-bottom: 24px;
+    }
+
+    .heroCard, .panel {
+      background: var(--panel);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(255, 255, 255, 0.8);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+    }
+
+    .heroCard {
+      padding: 30px;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-size: clamp(34px, 4.5vw, 58px);
+      line-height: 0.96;
+      letter-spacing: -0.03em;
+      color: var(--magenta);
+    }
+
+    .brandbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 18px;
+      margin-bottom: 18px;
+      background: linear-gradient(135deg, rgba(29,29,31,0.94), rgba(48,48,54,0.92));
+      color: white;
+      border-radius: 20px;
+    }
+
+    .brandbar img {
+      height: 28px;
+      width: auto;
+      display: block;
+    }
+
+    .brandbar span {
+      font-size: 13px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.72);
+      font-weight: 700;
+    }
+
+    .lede {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.55;
+      color: var(--muted);
+      max-width: 70ch;
+    }
+
+    .heroStats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 28px;
+    }
+
+    .stat {
+      padding: 16px 18px;
+      border-radius: 20px;
+      color: white;
+      min-height: 92px;
+    }
+
+    .stat strong {
+      display: block;
+      font-size: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      opacity: 0.9;
+      margin-bottom: 8px;
+    }
+
+    .stat span {
+      display: block;
+      font-size: 20px;
+      line-height: 1.25;
+      font-weight: 700;
+    }
+
+    .teal { background: linear-gradient(135deg, #0f766e, #115e59); }
+    .amber { background: linear-gradient(135deg, #f59e0b, #d97706); }
+    .blue { background: linear-gradient(135deg, #2563eb, #1d4ed8); }
+    .violet { background: linear-gradient(135deg, #8b5cf6, #6d28d9); }
+
+    .panel {
+      padding: 24px;
+    }
+
+    .panel h2 {
+      margin: 0 0 10px;
+      font-size: 22px;
+    }
+
+    .panel p {
+      margin: 0 0 16px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 11px 16px;
+      font: inherit;
+      font-weight: 700;
+      background: #e2e8f0;
+      color: var(--ink);
+      cursor: pointer;
+      transition: transform 120ms ease, background 120ms ease, color 120ms ease;
+    }
+
+    button:hover { transform: translateY(-1px); }
+    button.active { background: var(--magenta); color: #fff; }
+
+    .linkPill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 11px 16px;
+      font: inherit;
+      font-weight: 700;
+      background: #efe3ea;
+      color: var(--ink);
+      text-decoration: none;
+      transition: transform 120ms ease, background 120ms ease, color 120ms ease;
+    }
+
+    .linkPill:hover { transform: translateY(-1px); background: #f5cfe7; }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 24px;
+      align-items: start;
+    }
+
+    .map {
+      position: relative;
+      min-height: 780px;
+      padding: 28px;
+      overflow: hidden;
+    }
+
+    .canvas {
+      position: relative;
+      min-height: 720px;
+    }
+
+    .connector {
+      position: absolute;
+      height: 4px;
+      background: var(--line);
+      transform-origin: left center;
+      border-radius: 999px;
+      transition: background 160ms ease, box-shadow 160ms ease;
+    }
+
+    .connector.active {
+      background: var(--ink);
+      box-shadow: 0 0 0 5px rgba(15, 23, 42, 0.08);
+    }
+
+    .node {
+      position: absolute;
+      width: 260px;
+      padding: 18px 18px 16px;
+      border-radius: 24px;
+      color: white;
+      box-shadow: var(--shadow);
+      border: 1px solid rgba(255,255,255,0.16);
+      cursor: pointer;
+      transition: transform 150ms ease, box-shadow 150ms ease, opacity 150ms ease;
+    }
+
+    .node:hover { transform: translateY(-3px); }
+    .node.dim { opacity: 0.38; }
+    .node.active {
+      transform: translateY(-4px) scale(1.02);
+      box-shadow: 0 28px 64px rgba(15, 23, 42, 0.2);
+    }
+
+    .node h3 {
+      margin: 0 0 10px;
+      font-size: 22px;
+      line-height: 1.1;
+    }
+
+    .node p {
+      margin: 0;
+      font-size: 15px;
+      line-height: 1.45;
+      color: rgba(255,255,255,0.9);
+    }
+
+    .node small {
+      display: block;
+      margin-bottom: 10px;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.72);
+    }
+
+    .centerOrb {
+      position: absolute;
+      left: 410px;
+      top: 246px;
+      width: 300px;
+      height: 300px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 30% 30%, #fff5e5, #f7c07d);
+      color: #7c2d12;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      padding: 30px;
+      box-shadow: 0 30px 80px rgba(217, 119, 6, 0.24);
+      border: 14px solid rgba(255,255,255,0.65);
+    }
+
+    .centerOrb strong {
+      display: block;
+      font-size: 34px;
+      line-height: 1.02;
+      letter-spacing: -0.04em;
+      margin-bottom: 10px;
+    }
+
+    .side h2 { margin-top: 0; }
+
+    .detailCard {
+      border: 1px solid #e2e8f0;
+      border-radius: 22px;
+      padding: 20px;
+      background: rgba(255,255,255,0.72);
+      margin-bottom: 16px;
+    }
+
+    .detailCard h3 {
+      margin: 0 0 12px;
+      font-size: 24px;
+    }
+
+    .detailCard p {
+      margin: 0 0 14px;
+      line-height: 1.55;
+      color: var(--muted);
+    }
+
+    .detailCard ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--ink);
+      line-height: 1.55;
+    }
+
+    .hint {
+      font-size: 14px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 1180px) {
+      .hero, .workspace { grid-template-columns: 1fr; }
+      .map { min-height: 960px; }
+      .canvas { min-height: 900px; }
+      .centerOrb { left: 50%; top: 310px; transform: translateX(-50%); }
+      .node[data-node="source"] { left: 40px !important; top: 80px !important; }
+      .node[data-node="validation"] { right: 40px !important; left: auto !important; top: 80px !important; }
+      .node[data-node="implementation"] { left: 40px !important; top: 690px !important; }
+      .node[data-node="tests"] { right: 40px !important; left: auto !important; top: 690px !important; }
+      .node[data-node="playwright"] { left: 50% !important; top: 140px !important; transform: translateX(-50%); }
+    }
+
+    @media (max-width: 760px) {
+      .shell { padding: 20px 14px 40px; }
+      .heroCard, .panel, .map { padding: 18px; }
+      .node { width: 220px; }
+      .centerOrb { width: 240px; height: 240px; top: 340px; }
+      .centerOrb strong { font-size: 28px; }
+      .heroStats { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="heroCard">
+        <div class="brandbar">
+          <img src="https://itineris.b-cdn.net/wp-content/uploads/2025/07/Itineris_Logo_White.svg" alt="Itineris logo">
+          <span>AI Delivery Visuals</span>
+        </div>
+        <h1>Itineris Workflow Visuals</h1>
+        <p class="lede">This companion view turns the playbook into a presentation-friendly workflow map. Click any stage to focus the explanation, or switch to a highlighted path for validation, implementation, or automated testing.</p>
+        <div class="heroStats">
+          <div class="stat teal"><strong>Source Material</strong><span>Word, Excel, and Visio become structured AI context</span></div>
+          <div class="stat amber"><strong>Quality Loop</strong><span>Generated Gherkins are corrected against manual Itineris validation files</span></div>
+          <div class="stat blue"><strong>Implementation</strong><span>Approved Gherkins hand off into OpenSpec and OpenCode slices</span></div>
+          <div class="stat violet"><strong>Testing</strong><span>The same corrected Gherkins drive independent and Playwright tests</span></div>
+        </div>
+      </div>
+      <aside class="panel">
+        <h2>Presentation Use</h2>
+        <p>Use the controls below to highlight a single path while presenting. This works better than static prose when the reader needs to grasp where validation, implementation, and test generation connect.</p>
+        <div class="controls" id="controls">
+          <button class="active" data-mode="all">Full workflow</button>
+          <button data-mode="validation">Validation path</button>
+          <button data-mode="implementation">Implementation path</button>
+          <button data-mode="testing">Testing path</button>
+        </div>
+        <div class="controls">
+          <a class="linkPill" href="AI_EXECUTIVE_SUMMARY_VISUALS.html">Executive summary</a>
+          <a class="linkPill" href="AI_AGENT_ROUTING_VISUALS.html">Agent routing view</a>
+          <a class="linkPill" href="AI_DELIVERY_LOOP_VISUALS.html">Delivery loop view</a>
+        </div>
+        <p class="hint">Tip: after opening this file in a browser, click the colored stages directly to drill into a single part of the process.</p>
+      </aside>
+    </section>
+
+    <section class="workspace">
+      <div class="panel map">
+        <div class="canvas" id="canvas">
+          <div class="connector" data-link="source-center"></div>
+          <div class="connector" data-link="validation-center"></div>
+          <div class="connector" data-link="center-implementation"></div>
+          <div class="connector" data-link="center-tests"></div>
+          <div class="connector" data-link="center-playwright"></div>
+
+          <div class="node teal" data-node="source" style="left: 22px; top: 120px;">
+            <small>1. Intake</small>
+            <h3>DockOck Ingestion</h3>
+            <p>Word requirements, Excel reference data, and Visio workflows are normalized into a shared project context.</p>
+          </div>
+
+          <div class="node amber" data-node="validation" style="right: 22px; top: 120px;">
+            <small>2. Validation</small>
+            <h3>Compare and Improve</h3>
+            <p>Draft Gherkins are compared against Itineris manual validation files to extract correction patterns.</p>
+          </div>
+
+          <div class="node blue" data-node="implementation" style="left: 28px; top: 560px;">
+            <small>3. Delivery</small>
+            <h3>OpenSpec + OpenCode</h3>
+            <p>Corrected Gherkins become the approved hand-off artifact for bounded implementation slices.</p>
+          </div>
+
+          <div class="node violet" data-node="tests" style="right: 24px; top: 560px;">
+            <small>4. Tests</small>
+            <h3>Independent Test Agents</h3>
+            <p>Separate agents generate automated tests from the approved scenarios, independent from the implementation prompts.</p>
+          </div>
+
+          <div class="node violet" data-node="playwright" style="left: 50%; top: 18px; transform: translateX(-50%); width: 320px;">
+            <small>5. UI Automation</small>
+            <h3>Playwright Regression Flow</h3>
+            <p>The same corrected Gherkins also drive browser-level UI regression tests for user-facing workflows.</p>
+          </div>
+
+          <div class="centerOrb" id="centerOrb">
+            <div>
+              <strong>Corrected Itineris Gherkins</strong>
+              Approved hand-off artifact for implementation and automated testing
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="panel side">
+        <div class="detailCard" id="detailCard">
+          <h3>Full workflow</h3>
+          <p>The critical point is the center of the diagram: the corrected Itineris Gherkin set. It is not only a documentation artifact. It is the approved contract used both for implementation and for downstream automated testing.</p>
+          <ul>
+            <li>Generated Gherkins are improved through comparison with manual validation files.</li>
+            <li>Approved scenarios hand off into OpenSpec and OpenCode.</li>
+            <li>Independent test agents and Playwright reuse the same corrected scenario set.</li>
+          </ul>
+        </div>
+        <div class="detailCard">
+          <h3>Suggested use in the playbook</h3>
+          <p>Keep the static SVGs inside the Markdown document, and use this HTML page when you need a more persuasive, presentation-friendly walkthrough.</p>
+        </div>
+      </aside>
+    </section>
+  </div>
+
+  <script>
+    const modes = {
+      all: {
+        title: 'Full workflow',
+        text: 'The corrected Itineris Gherkin set sits at the center of the delivery model. Validation improves it first, then implementation and both testing paths consume the same approved artifact.',
+        bullets: [
+          'Document ingestion creates the shared context for the first draft.',
+          'Manual Itineris validation files correct the generated scenarios.',
+          'Implementation, independent tests, and Playwright all branch from the same corrected set.'
+        ],
+        activeNodes: ['source', 'validation', 'implementation', 'tests', 'playwright'],
+        activeLinks: ['source-center', 'validation-center', 'center-implementation', 'center-tests', 'center-playwright']
+      },
+      validation: {
+        title: 'Validation path',
+        text: 'This is the quality loop the reader should remember. Generated output does not go straight into implementation. It is first checked against manual Itineris Gherkins and improved through pattern extraction.',
+        bullets: [
+          'DockOck creates the draft Gherkin set from source documents.',
+          'Itineris manual scenarios act as the source of truth for testing intent.',
+          'Recurring differences become reusable correction patterns.'
+        ],
+        activeNodes: ['source', 'validation'],
+        activeLinks: ['source-center', 'validation-center']
+      },
+      implementation: {
+        title: 'Implementation path',
+        text: 'Only the corrected Gherkins move into the delivery engine. That keeps implementation bounded by approved scenarios instead of generic prompts.',
+        bullets: [
+          'Approved Gherkins hand off into OpenSpec proposal, design, and tasks.',
+          'OpenCode executes feature slices using the selected agent stack.',
+          'Review and repair stay tied back to the approved behavior contract.'
+        ],
+        activeNodes: ['validation', 'implementation'],
+        activeLinks: ['validation-center', 'center-implementation']
+      },
+      testing: {
+        title: 'Testing path',
+        text: 'The approved Gherkin set is reused in two downstream testing streams: independent automated tests and Playwright UI tests. This is the strongest visual proof that the process is not generic.',
+        bullets: [
+          'Independent test agents produce behavior-driven automated checks.',
+          'Playwright agents turn the same scenarios into UI regression coverage.',
+          'Failures feed back into repair while repeated scenario issues feed back into Gherkin improvement.'
+        ],
+        activeNodes: ['validation', 'tests', 'playwright'],
+        activeLinks: ['validation-center', 'center-tests', 'center-playwright']
+      }
+    };
+
+    const buttons = [...document.querySelectorAll('[data-mode]')];
+    const nodes = [...document.querySelectorAll('.node')];
+    const links = [...document.querySelectorAll('.connector')];
+    const detailCard = document.getElementById('detailCard');
+    const canvas = document.getElementById('canvas');
+    const center = document.getElementById('centerOrb');
+
+    function centerPoint(el) {
+      return {
+        x: el.offsetLeft + el.offsetWidth / 2,
+        y: el.offsetTop + el.offsetHeight / 2
+      };
+    }
+
+    function drawConnector(name, fromEl, toEl) {
+      const line = document.querySelector(`[data-link="${name}"]`);
+      const a = centerPoint(fromEl);
+      const b = centerPoint(toEl);
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const length = Math.sqrt(dx * dx + dy * dy);
+      const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+      line.style.left = `${a.x}px`;
+      line.style.top = `${a.y}px`;
+      line.style.width = `${length}px`;
+      line.style.transform = `rotate(${angle}deg)`;
+    }
+
+    function layout() {
+      drawConnector('source-center', document.querySelector('[data-node="source"]'), center);
+      drawConnector('validation-center', document.querySelector('[data-node="validation"]'), center);
+      drawConnector('center-implementation', center, document.querySelector('[data-node="implementation"]'));
+      drawConnector('center-tests', center, document.querySelector('[data-node="tests"]'));
+      drawConnector('center-playwright', center, document.querySelector('[data-node="playwright"]'));
+    }
+
+    function renderDetails(mode) {
+      const item = modes[mode];
+      detailCard.innerHTML = `
+        <h3>${item.title}</h3>
+        <p>${item.text}</p>
+        <ul>${item.bullets.map((bullet) => `<li>${bullet}</li>`).join('')}</ul>
+      `;
+
+      buttons.forEach((button) => button.classList.toggle('active', button.dataset.mode === mode));
+      nodes.forEach((node) => {
+        const active = item.activeNodes.includes(node.dataset.node);
+        node.classList.toggle('active', active);
+        node.classList.toggle('dim', !active && mode !== 'all');
+      });
+      links.forEach((link) => {
+        const active = item.activeLinks.includes(link.dataset.link);
+        link.classList.toggle('active', active);
+      });
+    }
+
+    buttons.forEach((button) => {
+      button.addEventListener('click', () => renderDetails(button.dataset.mode));
+    });
+
+    nodes.forEach((node) => {
+      node.addEventListener('click', () => {
+        const nodeMode = node.dataset.node === 'source' ? 'validation'
+          : node.dataset.node === 'validation' ? 'validation'
+          : node.dataset.node === 'implementation' ? 'implementation'
+          : 'testing';
+        renderDetails(nodeMode);
+      });
+    });
+
+    window.addEventListener('resize', layout);
+    window.addEventListener('load', () => {
+      layout();
+      renderDetails('all');
+    });
+  </script>
+</body>
+</html>

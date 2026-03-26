@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Itineris Delivery Loop Visuals</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+
+    :root {
+      --ink: #1d1d1f;
+      --muted: #5a6170;
+      --magenta: #e40189;
+      --panel: rgba(255,255,255,0.84);
+      --line: #c8d3df;
+      --bg-a: #f8f2e7;
+      --bg-b: #edf4ff;
+      --amber: linear-gradient(135deg, #f59e0b, #d97706);
+      --teal: linear-gradient(135deg, #0f766e, #115e59);
+      --blue: linear-gradient(135deg, #2563eb, #1d4ed8);
+      --violet: linear-gradient(135deg, #8b5cf6, #6d28d9);
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Montserrat", Arial, Helvetica, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(228, 1, 137, 0.16), transparent 20%),
+        radial-gradient(circle at bottom right, rgba(37, 99, 235, 0.12), transparent 24%),
+        linear-gradient(135deg, var(--bg-a), var(--bg-b));
+    }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 38px 24px 56px; }
+    .hero, .workspace { display: grid; gap: 24px; }
+    .hero { grid-template-columns: 1.15fr 0.85fr; margin-bottom: 24px; }
+    .workspace { grid-template-columns: 1.1fr 0.9fr; }
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(255,255,255,0.8);
+      border-radius: 28px;
+      backdrop-filter: blur(16px);
+      box-shadow: var(--shadow);
+      padding: 24px;
+    }
+    h1 { margin: 0 0 12px; font-size: clamp(34px, 5vw, 58px); line-height: .96; letter-spacing: -.03em; color: var(--magenta); }
+    h2 { margin: 0 0 12px; font-size: 24px; }
+    p { margin: 0 0 14px; line-height: 1.55; color: var(--muted); }
+    .nav { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+    .nav a, button {
+      display: inline-flex; align-items: center; justify-content: center; padding: 11px 16px;
+      border-radius: 999px; border: 0; font: inherit; font-weight: 700; text-decoration: none;
+      background: #efe3ea; color: var(--ink); cursor: pointer;
+    }
+    button.active { background: var(--magenta); color: white; }
+    .brandbar {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      padding: 14px 18px; margin-bottom: 18px; border-radius: 20px;
+      background: linear-gradient(135deg, rgba(29,29,31,0.94), rgba(48,48,54,0.92)); color: white;
+    }
+    .brandbar img { height: 28px; width: auto; display: block; }
+    .brandbar span { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(255,255,255,0.72); font-weight: 700; }
+    .timeline { display: grid; gap: 20px; }
+    .step {
+      position: relative; padding: 22px 22px 22px 96px; border-radius: 26px; color: white;
+      box-shadow: var(--shadow); transition: transform 140ms ease, opacity 140ms ease; cursor: pointer;
+    }
+    .step:hover { transform: translateY(-2px); }
+    .step.active { transform: translateY(-4px) scale(1.01); }
+    .step.dim { opacity: 0.34; }
+    .step .index {
+      position: absolute; left: 22px; top: 22px; width: 54px; height: 54px; border-radius: 50%;
+      display: grid; place-items: center; font-weight: 800; font-size: 22px; background: rgba(255,255,255,0.18);
+    }
+    .step h3 { margin: 0 0 8px; font-size: 24px; }
+    .step p { margin: 0; color: rgba(255,255,255,0.92); }
+    .amber { background: var(--amber); }
+    .teal { background: var(--teal); }
+    .blue { background: var(--blue); }
+    .violet { background: var(--violet); }
+    .detail ul { margin: 0; padding-left: 18px; line-height: 1.55; }
+    .noteStrip {
+      margin-top: 18px; padding: 16px 18px; border-radius: 20px; background: rgba(255,255,255,0.72);
+      border: 1px solid #d9e2ec;
+    }
+    @media (max-width: 1100px) { .hero, .workspace { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="card">
+        <div class="brandbar">
+          <img src="https://itineris.b-cdn.net/wp-content/uploads/2025/07/Itineris_Logo_White.svg" alt="Itineris logo">
+          <span>Delivery Loop</span>
+        </div>
+        <h1>Delivery Loop</h1>
+        <p>This visual is meant for stakeholder explanation. It shows why the process is reliable: approved artifacts first, explicit OpenSpec change definition next, bounded OpenCode execution after that, then review, repair, and maintenance loops only where they belong.</p>
+        <div class="nav">
+          <a href="AI_EXECUTIVE_SUMMARY_VISUALS.html">Executive summary</a>
+          <a href="AI_WORKFLOW_VISUALS.html">Workflow map</a>
+          <a href="AI_AGENT_ROUTING_VISUALS.html">Agent routing</a>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Focus modes</h2>
+        <p>Highlight the straight-through happy path, the repair loop, or the maintenance loop that tightens prompts after repeated workflow drift.</p>
+        <div class="nav">
+          <button class="active" data-mode="happy">Happy path</button>
+          <button data-mode="repair">Repair loop</button>
+          <button data-mode="maintenance">Maintenance loop</button>
+        </div>
+      </div>
+    </section>
+    <section class="workspace">
+      <div class="card timeline" id="timeline">
+        <div class="step amber" data-step="artifacts"><div class="index">1</div><h3>Approved Artifacts</h3><p>Corrected Gherkins, Markdown knowledge, graph outputs, and indexed documentation form the approved starting point.</p></div>
+        <div class="step teal" data-step="openspec"><div class="index">2</div><h3>OpenSpec Change</h3><p>Proposal, spec, design, and tasks make the change explicit enough to review before implementation starts.</p></div>
+        <div class="step blue" data-step="opencode"><div class="index">3</div><h3>OpenCode Execution</h3><p>The selected agent stack executes the feature in bounded slices rather than one broad generation pass.</p></div>
+        <div class="step violet" data-step="review"><div class="index">4</div><h3>Review and Validation</h3><p>Code review, QA, security, performance, and generated tests decide whether the slice passes, needs repair, or exposes recurring workflow mistakes.</p></div>
+        <div class="step teal" data-step="accept"><div class="index">5</div><h3>Accepted Slice</h3><p>The change is ready for merge, release hardening, or the next bounded slice.</p></div>
+      </div>
+      <aside class="card detail" id="detail"></aside>
+    </section>
+  </div>
+  <script>
+    const modes = {
+      happy: {
+        title: 'Happy path',
+        text: 'This is the cleanest explanation for non-technical readers: approved artifacts become a defined change, the change becomes a bounded implementation slice, and review accepts it.',
+        bullets: [
+          'The workflow does not skip the OpenSpec layer.',
+          'OpenCode runs only after the change is explicit and reviewable.',
+          'Validation is part of the delivery path, not a separate afterthought.'
+        ],
+        activeSteps: ['artifacts', 'openspec', 'opencode', 'review', 'accept']
+      },
+      repair: {
+        title: 'Repair loop',
+        text: 'If a slice fails review, it should not explode into a fresh planning exercise by default. The original owner repairs the bounded slice and re-enters validation quickly.',
+        bullets: [
+          'The repair loop returns from review back to execution.',
+          'QA context travels with the defect instead of being rediscovered.',
+          'This keeps iteration tight and preserves slice ownership.'
+        ],
+        activeSteps: ['opencode', 'review']
+      },
+      maintenance: {
+        title: 'Maintenance loop',
+        text: 'If the same mistakes repeat across multiple slices, the problem is no longer the feature. It is the workflow layer. That is when improve-agents.md becomes the right move.',
+        bullets: [
+          'Repeated review failures trigger prompt or agent maintenance.',
+          'The next slice benefits from workflow-level improvement.',
+          'This is what stops the team from paying the same quality tax repeatedly.'
+        ],
+        activeSteps: ['review', 'openspec', 'opencode']
+      }
+    };
+    const steps = [...document.querySelectorAll('.step')];
+    const detail = document.getElementById('detail');
+    const buttons = [...document.querySelectorAll('[data-mode]')];
+    function render(mode) {
+      const item = modes[mode];
+      detail.innerHTML = `<h2>${item.title}</h2><p>${item.text}</p><ul>${item.bullets.map((x) => `<li>${x}</li>`).join('')}</ul><div class="noteStrip">Use the static SVG in the playbook for print-like reading and this page for narrated walkthroughs.</div>`;
+      buttons.forEach((button) => button.classList.toggle('active', button.dataset.mode === mode));
+      steps.forEach((step) => {
+        const active = item.activeSteps.includes(step.dataset.step);
+        step.classList.toggle('active', active);
+        step.classList.toggle('dim', !active);
+      });
+    }
+    buttons.forEach((button) => button.addEventListener('click', () => render(button.dataset.mode)));
+    steps.forEach((step) => {
+      step.addEventListener('click', () => {
+        if (step.dataset.step === 'review') render('repair');
+        else if (step.dataset.step === 'openspec') render('maintenance');
+        else render('happy');
+      });
+    });
+    window.addEventListener('load', () => render('happy'));
+  </script>
+</body>
+</html>

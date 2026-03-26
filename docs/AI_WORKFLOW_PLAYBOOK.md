@@ -1,10 +1,14 @@
 # AI Workflow Playbook
 
-> Scope: Phase 1 is detailed, and the downstream feature-delivery loop is documented at a workflow level.
+> Scope: This version is tailored to the Itineris delivery workflow. Phase 1 is detailed, and the downstream feature-delivery loop is documented at a workflow level.
 
-## Purpose
+## 1. Executive Summary
 
-This playbook describes how we take a project from zero implementation, where the only reliable inputs are project documents, and turn it into a fully functioning software system with:
+This playbook describes how we take the Itineris project from document-only inputs to a working delivery pipeline that produces implementation-ready specifications, production code, and automated tests.
+
+It shows how DockOck, OpenSpec, OpenCode, and the supporting agent workflows come together in the Itineris delivery process, so the document reads as a practical guide for this engagement rather than a generic internal note.
+
+The end state is a repeatable pipeline that produces:
 
 - production code
 - unit tests
@@ -13,21 +17,80 @@ This playbook describes how we take a project from zero implementation, where th
 - UI tests
 - traceable links back to source documentation
 
-The first workflow described here is the current front door into that system: transforming Word requirements documents into Gherkin features while using Excel and Visio files as semantic reference context.
+The front door into that system is DockOck: it transforms Itineris Word requirements into Gherkin features while using Excel and Visio material as semantic reference context. Those generated Gherkins are then compared against manually written Itineris validation Gherkins, improved through pattern extraction, and only then promoted as the hand-off artifact for implementation planning, feature delivery, independent automated tests, and Playwright UI tests.
 
-## Operator Quick Start
+This document uses portable text diagrams rather than Mermaid blocks so it renders correctly in any Markdown viewer without extra plugins.
+
+## Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [How to Use This Document](#2-how-to-use-this-document)
+3. [End-State Workflow](#3-end-state-workflow)
+4. [Core Principles](#4-core-principles)
+5. [Terminology Standard](#5-terminology-standard)
+6. [Phase Map](#6-phase-map)
+7. [Documentation to Gherkin Workflow](#7-documentation-to-gherkin-workflow)
+8. [Documentation to Markdown Knowledge Base](#8-documentation-to-markdown-knowledge-base)
+9. [Documentation to Dependency Graph](#9-documentation-to-dependency-graph)
+10. [Documentation to Index-Only Retrieval Base](#10-documentation-to-index-only-retrieval-base)
+11. [Screenshots](#11-screenshots)
+12. [How These Outputs Feed the Delivery Workflow](#12-how-these-outputs-feed-the-delivery-workflow)
+13. [Itineris Validation, Implementation, and Test Strategy](#13-itineris-validation-implementation-and-test-strategy)
+14. [OpenSpec to OpenCode Delivery Loop](#14-openspec-to-opencode-delivery-loop)
+
+## 2. How to Use This Document
 
 Use this sequence for the fastest path through the document.
 
-1. Read the phase overview in the [Phase Map](#phase-map) to understand where the current work sits in the end-to-end lifecycle.
-2. If you are moving from approved artifacts into implementation, start with the [OpenSpec to OpenCode delivery loop](#detailed-workflow-openspec-to-opencode-delivery-loop).
-3. Use the [Current Custom Agent and Command Catalog](#current-custom-agent-and-command-catalog) only when you need to know what a specific agent or command does.
-4. Use the [Delivery Stage Selection Matrix](#delivery-stage-selection-matrix) and the [Agent Combination Runbook](#agent-combination-runbook) when you need to choose the execution stack for a delivery stage.
-5. Use the [Example Feature Flows](#example-feature-flows) when the current work looks mostly backend-dominant, frontend-dominant, or infrastructure-dominant.
-6. Use the [Quick Routing Cheat Sheet](#quick-routing-cheat-sheet) and the [Mermaid Routing Diagram](#mermaid-routing-diagram) when you only need a fast routing decision.
-7. Use the [Mermaid Delivery Loop Diagram](#mermaid-delivery-loop-diagram) when you need to explain how planning, implementation, review, repair, and maintenance relate.
+### Audience Launcher
 
-## End-State Workflow
+Use this launcher when you want the document to route the reader to the right entry point immediately.
+
+| Reader | Start Here | Why |
+|---|---|---|
+| Executive or client stakeholder | [AI_EXECUTIVE_SUMMARY_VISUALS.html](AI_EXECUTIVE_SUMMARY_VISUALS.html) | fastest presentation-first overview of the full Itineris workflow |
+| Product, QA, or business reviewer | [AI_WORKFLOW_VISUALS.html](AI_WORKFLOW_VISUALS.html) | best visual explanation of document intake, validation, and test generation |
+| Architecture or delivery lead | [AI_AGENT_ROUTING_VISUALS.html](AI_AGENT_ROUTING_VISUALS.html) | shows ownership model, specialist routing, and repair vs maintenance choices |
+| Engineering lead or implementation reviewer | [AI_DELIVERY_LOOP_VISUALS.html](AI_DELIVERY_LOOP_VISUALS.html) | shows how approved artifacts move through OpenSpec, OpenCode, review, and repair |
+| Deep document reader | [AI_WORKFLOW_PLAYBOOK.md](AI_WORKFLOW_PLAYBOOK.md) | full narrative, rationale, runbooks, and detailed workflow sections |
+
+1. Read the phase overview in the [Phase Map](#6-phase-map) to understand where the current work sits in the end-to-end lifecycle.
+2. If you want the Itineris-specific execution story, start with the [Itineris Validation, Implementation, and Test Strategy](#13-itineris-validation-implementation-and-test-strategy).
+3. If you are moving from approved artifacts into implementation, start with the [OpenSpec to OpenCode Delivery Loop](#14-openspec-to-opencode-delivery-loop).
+4. Use the [Current Custom Agent and Command Catalog](#current-custom-agent-and-command-catalog) only when you need to know what a specific agent or command does.
+5. Use the [Delivery Stage Selection Matrix](#delivery-stage-selection-matrix) and the [Agent Combination Runbook](#agent-combination-runbook) when you need to choose the execution stack for a delivery stage.
+6. Use the [Example Feature Flows](#example-feature-flows) when the current work looks mostly backend-dominant, frontend-dominant, or infrastructure-dominant.
+7. Use the [Quick Routing Cheat Sheet](#quick-routing-cheat-sheet) and the [Visual Routing Diagram](#visual-routing-diagram) when you only need a fast routing decision.
+8. Use the [Visual Delivery Loop Diagram](#visual-delivery-loop-diagram) when you need to explain how planning, implementation, review, repair, and maintenance relate.
+
+### Visual Workflow Maps
+
+For a faster first read, start with the visuals before the detailed prose.
+
+Open the interactive companions here:
+
+- [AI_EXECUTIVE_SUMMARY_VISUALS.html](AI_EXECUTIVE_SUMMARY_VISUALS.html)
+- [AI_WORKFLOW_VISUALS.html](AI_WORKFLOW_VISUALS.html)
+- [AI_AGENT_ROUTING_VISUALS.html](AI_AGENT_ROUTING_VISUALS.html)
+- [AI_DELIVERY_LOOP_VISUALS.html](AI_DELIVERY_LOOP_VISUALS.html)
+
+#### Workflow Overview
+
+![Itineris AI delivery workflow overview](ai-workflow-overview.svg)
+
+#### Validation and Test Feedback Loop
+
+![Itineris validation and test feedback loop](itineris-validation-loop.svg)
+
+#### Agent Routing
+
+![Itineris agent routing diagram](ai-agent-routing.svg)
+
+#### OpenSpec to OpenCode Delivery Loop
+
+![Itineris OpenSpec to OpenCode delivery loop](ai-delivery-loop.svg)
+
+## 3. End-State Workflow
 
 The complete workflow is intended to progress through these phases:
 
@@ -48,16 +111,17 @@ At this stage, the playbook documents four output and retrieval paths built on t
 - documentation to dependency graphs
 - documentation to an index-only retrieval base for chat and MCP consumers
 
-## Core Principles
+## 4. Core Principles
 
 - Documentation is the initial source of truth.
+- For Itineris, approved Gherkin becomes the operational source of truth for implementation and automated testing.
 - AI agents should operate on normalized, structured context instead of raw, disconnected files.
 - Requirements documents are primary inputs.
 - Spreadsheets and diagrams are supporting evidence unless explicitly promoted to primary inputs.
 - Every downstream artifact should be traceable back to the originating documentation.
 - Generated artifacts should pass through explicit quality gates before they become source-of-truth inputs for the next phase.
 
-## Terminology Standard
+## 5. Terminology Standard
 
 The playbook uses the following terms deliberately. They should be read consistently throughout the document.
 
@@ -74,7 +138,7 @@ Usage rule:
 - use `delivery stage` for the OpenSpec-to-OpenCode loop
 - use `feature slice` for the bounded unit of execution and review
 
-## Phase Map
+## 6. Phase Map
 
 ### Phase 1. Documentation Intake and Normalization
 
@@ -137,13 +201,13 @@ Planned outputs:
 - reviewed diffs
 - release candidate
 
-## Detailed Workflow: Documentation to Gherkin
+## 7. Documentation to Gherkin Workflow
 
 This workflow is for projects where the initial usable assets are documentation files rather than source code.
 
 ### Objective
 
-Produce high-quality Gherkin features from requirements documents while using related Excel and Visio files as semantic reference context rather than independent feature generators.
+Produce high-quality Itineris Gherkin features from requirements documents while using related Excel and Visio files as semantic reference context rather than independent feature generators.
 
 ### Why This Matters
 
@@ -264,7 +328,7 @@ These features become the starting point for later phases such as:
 - performance scenario definition
 - UI flow validation
 
-## Detailed Workflow: Documentation to Markdown Knowledge Base
+## 8. Documentation to Markdown Knowledge Base
 
 This workflow uses the same document-ingestion and semantic-context pattern as the Gherkin path, but the output is a structured Markdown knowledge base rather than executable scenarios.
 
@@ -328,7 +392,7 @@ In practice, a mature AI delivery workflow can use both:
 2. Gherkin provides executable acceptance criteria.
 3. Coding agents use both artifacts together to produce more accurate implementations and tests.
 
-## Detailed Workflow: Documentation to Dependency Graph
+## 9. Documentation to Dependency Graph
 
 This workflow uses the same document-ingestion pipeline, but instead of generating scenarios or narrative knowledge articles, it extracts business entities, rules, transitions, and relationships into a dependency graph.
 
@@ -404,7 +468,7 @@ The three output modes complement each other:
 
 Together, they provide a stronger input package for downstream coding and test-generation agents.
 
-## Detailed Workflow: Documentation to Index-Only Retrieval Base
+## 10. Documentation to Index-Only Retrieval Base
 
 This workflow uses the same parsing and normalization pipeline, but instead of generating a new visible artifact in the main output panel, it builds a persistent retrieval layer for downstream question answering.
 
@@ -507,7 +571,7 @@ Before a generated feature is promoted downstream, it should satisfy the followi
 6. It does not invent unsupported business rules.
 7. The feature can be traced back to specific source documents.
 
-## Screenshots for This Workflow
+## 11. Screenshots
 
 The screenshots in this section illustrate the operator flow through DockOck using the image assets currently available in the repository.
 
@@ -666,31 +730,103 @@ Suggested caption:
 
 "The MCP server exposes the same indexed corpus to external coding agents, so semantic and full-document retrieval are available outside the DockOck UI as well."
 
-## How These Outputs Feed the Rest of the Delivery Workflow
+## 12. How These Outputs Feed the Delivery Workflow
 
 These documentation-derived outputs are not the end product. They form the specification and planning bootstrap phase that makes later AI coding work more reliable.
 
 The intended downstream chain is:
 
-1. Gherkin features become the canonical executable requirements.
+1. Gherkin features become the canonical executable requirements for Itineris slices.
 2. Markdown knowledge-base documents provide durable project and architecture context.
 3. Dependency graphs expose structural relationships, coupling, and process dependencies.
 4. Index-only mode provides persistent semantic and full-document retrieval for chat and MCP consumers.
-5. Approved features are exported into OpenSpec so feature work is represented as explicit change artifacts rather than ad hoc prompts.
-6. OpenSpec commands generate or refine proposal, spec, design, and task artifacts for each feature slice.
-7. OpenCode runs the implementation loop against the approved OpenSpec change set using the team's configured provider and model catalog, including the Rinf-backed LLM configuration.
-8. Custom agents, prompts, skills, and commands shape how OpenCode executes coding, review, and repair work so the loop stays aligned with team conventions.
-9. The autoresearch OpenCode integration is used where appropriate to strengthen the coding loop with targeted research, context gathering, and refinement before or during implementation.
-10. Coding agents create production code aligned to the approved artifacts and retrieved source context.
-11. Test-generation agents create:
+5. Itineris-provided validation Gherkins are compared with generated Gherkins so recurring differences can be extracted as correction patterns.
+6. Approved features are exported into OpenSpec so feature work is represented as explicit change artifacts rather than ad hoc prompts.
+7. OpenSpec commands generate or refine proposal, spec, design, and task artifacts for each feature slice.
+8. OpenCode runs the implementation loop against the approved OpenSpec change set using the team's configured provider and model catalog, including the Rinf-backed LLM configuration.
+9. Custom agents, prompts, skills, and commands shape how OpenCode executes coding, review, and repair work so the loop stays aligned with team conventions.
+10. The autoresearch OpenCode integration is used where appropriate to strengthen the coding loop with targeted research, context gathering, and refinement before or during implementation.
+11. Coding agents create production code aligned to the approved artifacts and retrieved source context.
+12. Test-generation agents create:
    - unit tests for isolated business logic
    - integration tests for service and persistence boundaries
    - Testcontainers-based environment tests for external dependencies
    - performance tests for throughput, latency, and scale assumptions
    - UI tests for end-to-end user behavior
-12. Review agents compare implementation and tests against the originating specifications, indexed source material, and graph relationships.
+13. Review agents compare implementation and tests against the originating specifications, indexed source material, dependency relationships, and Itineris validation patterns.
 
-## Detailed Workflow: OpenSpec to OpenCode Delivery Loop
+## 13. Itineris Validation, Implementation, and Test Strategy
+
+This chapter makes the Itineris-specific delivery logic explicit. It answers the two questions that are easy to miss in a quick diagonal read: how AI is used for implementation, and how AI is used for the automated tests we generate specifically for Itineris.
+
+### Objective
+
+Turn Itineris source documents and reviewer-authored Gherkin assets into a tighter execution loop where specification generation, implementation, and automated testing reinforce each other.
+
+### End-to-End Itineris Flow
+
+![Itineris AI delivery workflow overview](ai-workflow-overview.svg)
+
+### From Itineris Documents to Corrected Gherkins
+
+For Itineris, the Gherkin step is not a single-pass document conversion.
+
+We generate an initial feature set from the project documents, then compare that generated output against manually written Gherkin files provided by the Itineris team for testing. Those manual scenario files act as the validation source of truth for style, scope, lifecycle placement, scenario structure, and testing intent.
+
+The comparison step is used to:
+
+- detect systematic gaps between generated and approved scenarios
+- extract repeated correction patterns instead of fixing each file manually
+- improve the final generated Gherkins before they are promoted downstream
+- preserve Itineris-specific conventions rather than drifting into generic wording or invented behavior
+
+This is the specific compare-and-improve feedback loop described in the validation-source-of-truth workflow and in the Gherkin quality improvement plan.
+
+### AI-Assisted Implementation for Itineris Features
+
+Once the corrected Gherkins are approved, they become the execution contract for the implementation loop.
+
+The AI-assisted implementation path is:
+
+1. Convert approved Itineris Gherkins into OpenSpec proposal, spec, design, and tasks.
+2. Use those artifacts to define a bounded feature slice.
+3. Run OpenCode with the right agent stack for the slice type.
+4. Generate implementation changes in small reviewable increments instead of one large prompt-driven change.
+5. Re-check each slice against the originating Gherkins, Markdown context, dependency graph, and retrieved source documents.
+
+That means AI is not used here as a generic code generator. It is used as a controlled implementation engine whose prompt space is bounded by Itineris documents, approved Gherkins, and explicit change artifacts.
+
+### AI-Assisted Testing for Itineris Features
+
+Testing is also part of the same specification loop, not an afterthought.
+
+For Itineris, the corrected Gherkins are then fed to testing agents in two distinct ways:
+
+1. Independent test-generation agents use the approved scenarios to create automated tests for business behavior without depending on the implementation prompts that produced the code.
+2. UI automation agents use the same approved Gherkins to build Playwright end-to-end tests for the user flows described in the Itineris documents.
+
+In other words, the same corrected Gherkin set is the hand-off artifact both for implementation and for downstream automated testing.
+
+In practice, that gives us a layered testing strategy:
+
+- Gherkins define the expected behavior
+- code-generation agents implement the feature
+- independent test agents generate verification from the same approved behavior contract
+- Playwright agents translate user-facing scenarios into browser-level regression tests
+
+### Itineris Test Feedback Loop
+
+![Itineris validation and test feedback loop](itineris-validation-loop.svg)
+
+### Why This Matters
+
+This Itineris-specific flow gives us three important controls:
+
+- document fidelity, because generated behavior is corrected against real Itineris examples
+- implementation discipline, because coding agents work from approved change artifacts rather than a free-form brief
+- test independence, because the tests come from approved Gherkins and separate test agents, including Playwright coverage for UI flows
+
+## 14. OpenSpec to OpenCode Delivery Loop
 
 This workflow starts after DockOck has produced and the team has approved the specification package for a feature or change.
 
@@ -1053,58 +1189,21 @@ Rule of thumb:
 - choose specialist agents based on the main risk, not on every touched file
 - move back to planning only when the blocker is a planning defect rather than a repair defect
 
-### Mermaid Routing Diagram
+### Visual Routing Diagram
 
 This diagram provides a compact visual path from slice type to the default execution stack.
 
-```mermaid
-flowchart TD
-   A[Approved feature slice] --> B{Dominant slice type?}
-   B -->|Backend| C[backend-developer.md<br/>+ project-preferences-advisor.md]
-   B -->|Frontend| D[frontend-developer.md<br/>+ project-preferences-advisor.md]
-   B -->|Infrastructure| E[Pick one primary owner:<br/>backend-developer.md or devops-engineer.md<br/>+ project-preferences-advisor.md]
-   B -->|Unclear scope| F[business-analyst.md<br/>+ principal-technical-expert.md<br/>+ software-architect.md]
+![Itineris agent routing diagram](ai-agent-routing.svg)
 
-   C --> G{Need specialists?}
-   D --> G
-   E --> G
-   F --> H[Generate or refine OpenSpec artifacts]
+Open the interactive routing view here: [AI_AGENT_ROUTING_VISUALS.html](AI_AGENT_ROUTING_VISUALS.html)
 
-   G -->|API or schema| I[Add api-designer.md or database-architect.md]
-   G -->|Messaging or caching| J[Add kafka-expert.md or redis-expert.md]
-   G -->|Runtime or delivery| K[Add devops-engineer.md or kubernetes-expert.md]
-   G -->|UX or product behavior| L[Add ui-ux-designer.md or product-engineer.md]
-   G -->|No| M[Run implementation commands]
-
-   I --> M
-   J --> M
-   K --> M
-   L --> M
-   H --> M
-
-   M --> N[Review with code reviewer + qa-engineer.md]
-   N --> O{Issues repeated across slices?}
-   O -->|No| P[Repair with original owner + qa-engineer.md]
-   O -->|Yes| Q[Run improve-agents.md after repair]
-```
-
-### Mermaid Delivery Loop Diagram
+### Visual Delivery Loop Diagram
 
 This diagram shows the relationship between planning, implementation, review, repair, and prompt-maintenance work.
 
-```mermaid
-flowchart LR
-   A[DockOck approved artifacts] --> B[OpenSpec change artifacts]
-   B --> C[Agent selection and OpenCode execution]
-   C --> D[Implementation slice]
-   D --> E[Review and validation]
-   E -->|Pass| F[Accepted slice]
-   E -->|Fail| G[Repair loop]
-   G --> D
-   E -->|Recurring workflow mistakes| H[improve-agents.md]
-   H --> I[Prompt and workflow improvements]
-   I --> C
-```
+![Itineris OpenSpec to OpenCode delivery loop](ai-delivery-loop.svg)
+
+Open the interactive delivery-loop view here: [AI_DELIVERY_LOOP_VISUALS.html](AI_DELIVERY_LOOP_VISUALS.html)
 
 ### Operator Workflow
 

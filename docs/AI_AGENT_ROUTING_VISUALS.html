@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Itineris Agent Routing Visuals</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700;800&display=swap');
+
+    :root {
+      --ink: #1d1d1f;
+      --muted: #5a6170;
+      --magenta: #e40189;
+      --panel: rgba(255,255,255,0.84);
+      --line: #c8d3df;
+      --bg-a: #f8f2e7;
+      --bg-b: #edf6f8;
+      --amber: linear-gradient(135deg, #f59e0b, #d97706);
+      --teal: linear-gradient(135deg, #0f766e, #115e59);
+      --blue: linear-gradient(135deg, #2563eb, #1d4ed8);
+      --violet: linear-gradient(135deg, #8b5cf6, #6d28d9);
+      --shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Montserrat", Arial, Helvetica, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(228, 1, 137, 0.16), transparent 20%),
+        radial-gradient(circle at bottom right, rgba(37, 99, 235, 0.12), transparent 25%),
+        linear-gradient(135deg, var(--bg-a), var(--bg-b));
+    }
+    .shell { max-width: 1480px; margin: 0 auto; padding: 38px 24px 56px; }
+    .hero, .workspace { display: grid; gap: 24px; }
+    .hero { grid-template-columns: 1.15fr 0.85fr; margin-bottom: 24px; }
+    .workspace { grid-template-columns: 1.15fr 0.85fr; }
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(255,255,255,0.8);
+      backdrop-filter: blur(16px);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      padding: 24px;
+    }
+    h1 { margin: 0 0 12px; font-size: clamp(34px, 5vw, 58px); line-height: 0.96; letter-spacing: -0.03em; color: var(--magenta); }
+    h2 { margin: 0 0 12px; font-size: 24px; }
+    p { margin: 0 0 14px; line-height: 1.55; color: var(--muted); }
+    .nav { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+    .nav a, button {
+      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      padding: 11px 16px; border-radius: 999px; border: 0; font: inherit; font-weight: 700;
+      text-decoration: none; cursor: pointer; background: #efe3ea; color: var(--ink);
+    }
+    button.active { background: var(--magenta); color: #fff; }
+    .brandbar {
+      display: flex; align-items: center; justify-content: space-between; gap: 16px;
+      padding: 14px 18px; margin-bottom: 18px; border-radius: 20px;
+      background: linear-gradient(135deg, rgba(29,29,31,0.94), rgba(48,48,54,0.92)); color: white;
+    }
+    .brandbar img { height: 28px; width: auto; display: block; }
+    .brandbar span { font-size: 13px; letter-spacing: 0.08em; text-transform: uppercase; color: rgba(255,255,255,0.72); font-weight: 700; }
+    .map { position: relative; min-height: 820px; overflow: hidden; }
+    .canvas { position: relative; min-height: 760px; }
+    .connector {
+      position: absolute; height: 4px; background: var(--line); border-radius: 999px;
+      transform-origin: left center; transition: background 160ms ease, box-shadow 160ms ease;
+    }
+    .connector.active { background: var(--ink); box-shadow: 0 0 0 5px rgba(16, 32, 51, 0.08); }
+    .node {
+      position: absolute; width: 250px; padding: 18px; border-radius: 24px; color: white;
+      box-shadow: var(--shadow); cursor: pointer; transition: transform 140ms ease, opacity 140ms ease;
+    }
+    .node:hover { transform: translateY(-3px); }
+    .node.active { transform: translateY(-4px) scale(1.02); }
+    .node.dim { opacity: 0.36; }
+    .node small { display: block; margin-bottom: 10px; text-transform: uppercase; letter-spacing: .08em; font-size: 12px; font-weight: 700; opacity: .74; }
+    .node h3 { margin: 0 0 10px; font-size: 22px; line-height: 1.1; }
+    .node p { margin: 0; color: rgba(255,255,255,0.9); font-size: 15px; }
+    .amber { background: var(--amber); }
+    .teal { background: var(--teal); }
+    .blue { background: var(--blue); }
+    .violet { background: var(--violet); }
+    .center {
+      position: absolute; left: 50%; top: 50%; transform: translate(-50%, -46%);
+      width: 320px; height: 320px; border-radius: 50%; display: grid; place-items: center; text-align: center;
+      background: radial-gradient(circle at 35% 30%, #fff4df, #f7c173); color: #7c2d12;
+      padding: 34px; box-shadow: 0 28px 80px rgba(217, 119, 6, 0.22); border: 14px solid rgba(255,255,255,0.7);
+    }
+    .center strong { display: block; font-size: 34px; line-height: 1; margin-bottom: 12px; letter-spacing: -0.04em; }
+    ul { margin: 0; padding-left: 18px; line-height: 1.55; }
+    .detail { min-height: 250px; }
+    @media (max-width: 1180px) { .hero, .workspace { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <div class="card">
+        <div class="brandbar">
+          <img src="https://itineris.b-cdn.net/wp-content/uploads/2025/07/Itineris_Logo_White.svg" alt="Itineris logo">
+          <span>Agent Routing</span>
+        </div>
+        <h1>Agent Routing</h1>
+        <p>This interactive view makes the delivery ownership model legible. Instead of reading a long matrix first, the reader can choose a slice type and immediately see the default owner, specialist expansion path, and downstream review loop.</p>
+        <div class="nav">
+          <a href="AI_EXECUTIVE_SUMMARY_VISUALS.html">Executive summary</a>
+          <a href="AI_WORKFLOW_VISUALS.html">Workflow map</a>
+          <a href="AI_DELIVERY_LOOP_VISUALS.html">Delivery loop</a>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Highlight a route</h2>
+        <p>Use the buttons to focus on one slice type. The diagram emphasizes a core Itineris principle: one clear implementation owner, specialists added only when risk justifies them.</p>
+        <div class="nav">
+          <button class="active" data-mode="backend">Backend slice</button>
+          <button data-mode="frontend">Frontend slice</button>
+          <button data-mode="infra">Infrastructure slice</button>
+          <button data-mode="planning">Unclear scope</button>
+        </div>
+      </div>
+    </section>
+    <section class="workspace">
+      <div class="card map">
+        <div class="canvas" id="canvas">
+          <div class="connector" data-link="entry-core"></div>
+          <div class="connector" data-link="entry-infra"></div>
+          <div class="connector" data-link="entry-plan"></div>
+          <div class="connector" data-link="core-specialists"></div>
+          <div class="connector" data-link="infra-specialists"></div>
+          <div class="connector" data-link="plan-specialists"></div>
+          <div class="connector" data-link="specialists-review"></div>
+          <div class="connector" data-link="review-repair"></div>
+          <div class="connector" data-link="repair-maintenance"></div>
+
+          <div class="node amber" data-node="entry" style="left: 26px; top: 300px;">
+            <small>Entry</small>
+            <h3>Approved Feature Slice</h3>
+            <p>Classify by dominant change surface and the real risk area.</p>
+          </div>
+          <div class="node teal" data-node="core" style="left: 360px; top: 150px;">
+            <small>Primary owner</small>
+            <h3>Backend or Frontend Lead</h3>
+            <p>Choose one code-owning agent and keep project preferences attached.</p>
+          </div>
+          <div class="node blue" data-node="infra" style="left: 360px; top: 460px;">
+            <small>Platform owner</small>
+            <h3>Infrastructure Lead</h3>
+            <p>Choose one primary owner for delivery, runtime, or deployment-heavy changes.</p>
+          </div>
+          <div class="node violet" data-node="plan" style="left: 680px; top: 20px; width: 290px;">
+            <small>Recovery</small>
+            <h3>Planning Stack</h3>
+            <p>Return to analyst, principal technical expert, and architect when scope is still ambiguous.</p>
+          </div>
+          <div class="center" id="centerOrb"><div><strong>Specialist Expansion</strong>Add API, database, UX, Kafka, Redis, DevOps, or Kubernetes specialists only when the slice needs them.</div></div>
+          <div class="node blue" data-node="review" style="right: 40px; top: 160px;">
+            <small>Quality gate</small>
+            <h3>Review Stack</h3>
+            <p>Code reviewer plus QA, with security, performance, and test automation added by risk.</p>
+          </div>
+          <div class="node teal" data-node="repair" style="right: 40px; top: 420px;">
+            <small>Correction</small>
+            <h3>Repair Loop</h3>
+            <p>Return to the original owner with QA context and fix the bounded slice.</p>
+          </div>
+          <div class="node violet" data-node="maintenance" style="left: 690px; top: 620px; width: 290px;">
+            <small>Prompt governance</small>
+            <h3>Maintenance</h3>
+            <p>If the same mistakes repeat across slices, tighten prompts through improve-agents.md.</p>
+          </div>
+        </div>
+      </div>
+      <aside class="card detail" id="detail"></aside>
+    </section>
+  </div>
+  <script>
+    const routes = {
+      backend: {
+        title: 'Backend slice',
+        text: 'Use a backend implementation owner when API handlers, validation, persistence, or domain logic are the dominant change surface.',
+        bullets: [
+          'Primary owner: backend-developer.md plus project-preferences-advisor.md.',
+          'Add api-designer.md or database-architect.md if the contract or schema is part of the risk.',
+          'Review with backend-code-reviewer.md and qa-engineer.md.'
+        ],
+        activeNodes: ['entry', 'core', 'review', 'repair'],
+        activeLinks: ['entry-core', 'core-specialists', 'specialists-review', 'review-repair']
+      },
+      frontend: {
+        title: 'Frontend slice',
+        text: 'Use a frontend implementation owner when the main work is user flow, form behavior, route updates, or client-side state.',
+        bullets: [
+          'Primary owner: frontend-developer.md plus project-preferences-advisor.md.',
+          'Add ui-ux-designer.md or product-engineer.md when user behavior still needs sharpening.',
+          'Review with frontend-code-reviewer.md and qa-engineer.md, then repair in place if needed.'
+        ],
+        activeNodes: ['entry', 'core', 'review', 'repair'],
+        activeLinks: ['entry-core', 'core-specialists', 'specialists-review', 'review-repair']
+      },
+      infra: {
+        title: 'Infrastructure slice',
+        text: 'When delivery, runtime, messaging, caching, or topology is the dominant concern, choose one platform owner and layer specialists carefully.',
+        bullets: [
+          'Primary owner: devops-engineer.md or backend-developer.md depending on where most execution happens.',
+          'Add kubernetes-expert.md, kafka-expert.md, redis-expert.md, or sre-engineer.md according to risk.',
+          'Repair should stay anchored to the original owner rather than exploding into a broad planning pass.'
+        ],
+        activeNodes: ['entry', 'infra', 'review', 'repair', 'maintenance'],
+        activeLinks: ['entry-infra', 'infra-specialists', 'specialists-review', 'review-repair', 'repair-maintenance']
+      },
+      planning: {
+        title: 'Unclear scope',
+        text: 'If the slice is still ambiguous, do not start coding. Route back into planning first and return later with a bounded change.',
+        bullets: [
+          'Use business-analyst.md, principal-technical-expert.md, and software-architect.md.',
+          'Generate or refine OpenSpec artifacts until the scope is executable.',
+          'Only after the slice is clear should it move into implementation ownership.'
+        ],
+        activeNodes: ['entry', 'plan', 'maintenance'],
+        activeLinks: ['entry-plan', 'plan-specialists', 'repair-maintenance']
+      }
+    };
+    const nodes = [...document.querySelectorAll('.node')];
+    const links = [...document.querySelectorAll('.connector')];
+    const detail = document.getElementById('detail');
+    const center = document.getElementById('centerOrb');
+    const buttons = [...document.querySelectorAll('[data-mode]')];
+    function point(el) { return { x: el.offsetLeft + el.offsetWidth / 2, y: el.offsetTop + el.offsetHeight / 2 }; }
+    function draw(name, fromEl, toEl) {
+      const line = document.querySelector(`[data-link="${name}"]`);
+      const a = point(fromEl), b = point(toEl);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      line.style.left = `${a.x}px`;
+      line.style.top = `${a.y}px`;
+      line.style.width = `${Math.sqrt(dx*dx + dy*dy)}px`;
+      line.style.transform = `rotate(${Math.atan2(dy, dx) * 180 / Math.PI}deg)`;
+    }
+    function layout() {
+      draw('entry-core', document.querySelector('[data-node="entry"]'), document.querySelector('[data-node="core"]'));
+      draw('entry-infra', document.querySelector('[data-node="entry"]'), document.querySelector('[data-node="infra"]'));
+      draw('entry-plan', document.querySelector('[data-node="entry"]'), document.querySelector('[data-node="plan"]'));
+      draw('core-specialists', document.querySelector('[data-node="core"]'), center);
+      draw('infra-specialists', document.querySelector('[data-node="infra"]'), center);
+      draw('plan-specialists', document.querySelector('[data-node="plan"]'), center);
+      draw('specialists-review', center, document.querySelector('[data-node="review"]'));
+      draw('review-repair', document.querySelector('[data-node="review"]'), document.querySelector('[data-node="repair"]'));
+      draw('repair-maintenance', document.querySelector('[data-node="repair"]'), document.querySelector('[data-node="maintenance"]'));
+    }
+    function render(mode) {
+      const item = routes[mode];
+      detail.innerHTML = `<h2>${item.title}</h2><p>${item.text}</p><ul>${item.bullets.map((x) => `<li>${x}</li>`).join('')}</ul>`;
+      buttons.forEach((button) => button.classList.toggle('active', button.dataset.mode === mode));
+      nodes.forEach((node) => {
+        const active = item.activeNodes.includes(node.dataset.node);
+        node.classList.toggle('active', active);
+        node.classList.toggle('dim', !active);
+      });
+      links.forEach((link) => link.classList.toggle('active', item.activeLinks.includes(link.dataset.link)));
+    }
+    buttons.forEach((button) => button.addEventListener('click', () => render(button.dataset.mode)));
+    window.addEventListener('load', () => { layout(); render('backend'); });
+    window.addEventListener('resize', layout);
+  </script>
+</body>
+</html>

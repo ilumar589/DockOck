@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 920" role="img" aria-labelledby="title desc">
+  <title id="title">Itineris agent routing diagram</title>
+  <desc id="desc">A branded routing diagram showing how approved feature slices map to planning, implementation, review, and maintenance agent combinations.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f8f2e7"/>
+      <stop offset="100%" stop-color="#edf4ff"/>
+    </linearGradient>
+    <linearGradient id="brandGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#e40189"/>
+      <stop offset="100%" stop-color="#c70076"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#d97706"/>
+    </linearGradient>
+    <linearGradient id="teal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f766e"/>
+      <stop offset="100%" stop-color="#115e59"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1e40af"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#0f172a" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M0,0 L12,6 L0,12 z" fill="#475569"/>
+    </marker>
+    <style>
+      .title { font: 700 34px 'Montserrat', Arial, Helvetica, sans-serif; fill: #e40189; }
+      .subtitle { font: 400 18px 'Montserrat', Arial, Helvetica, sans-serif; fill: #3f4b5b; }
+      .cardTitle { font: 700 22px 'Montserrat', Arial, Helvetica, sans-serif; fill: #fff; }
+      .cardBody { font: 400 15px 'Montserrat', Arial, Helvetica, sans-serif; fill: #eff6ff; }
+      .label { font: 700 14px 'Montserrat', Arial, Helvetica, sans-serif; fill: #e40189; letter-spacing: 1px; }
+      .flow { fill: none; stroke: #475569; stroke-width: 4; marker-end: url(#arrow); }
+      .note { font: 400 15px 'Montserrat', Arial, Helvetica, sans-serif; fill: #475569; }
+    </style>
+  </defs>
+  <rect width="1600" height="920" rx="36" fill="url(#bg)"/>
+  <circle cx="1455" cy="98" r="64" fill="url(#brandGlow)" opacity="0.14"/>
+  <text x="70" y="82" class="title">Itineris Agent Routing Map</text>
+  <text x="70" y="114" class="subtitle">A clear visual for who leads each slice, when specialists join, and how review and maintenance work loop back.</text>
+
+  <text x="98" y="172" class="label">ENTRY POINT</text>
+  <rect x="70" y="190" width="300" height="150" rx="28" fill="url(#amber)" filter="url(#shadow)"/>
+  <text x="100" y="248" class="cardTitle">Approved Feature Slice</text>
+  <text x="100" y="282" class="cardBody">Classify the slice by dominant</text>
+  <text x="100" y="306" class="cardBody">change surface and main risk.</text>
+
+  <text x="460" y="172" class="label">PRIMARY OWNERS</text>
+  <rect x="430" y="160" width="310" height="170" rx="28" fill="url(#teal)" filter="url(#shadow)"/>
+  <text x="462" y="220" class="cardTitle">Backend or Frontend Lead</text>
+  <text x="462" y="254" class="cardBody">backend-developer.md or</text>
+  <text x="462" y="278" class="cardBody">frontend-developer.md with</text>
+  <text x="462" y="302" class="cardBody">project-preferences-advisor.md</text>
+
+  <rect x="430" y="370" width="310" height="170" rx="28" fill="url(#blue)" filter="url(#shadow)"/>
+  <text x="462" y="430" class="cardTitle">Infrastructure Owner</text>
+  <text x="462" y="464" class="cardBody">Choose one primary owner:</text>
+  <text x="462" y="488" class="cardBody">backend-developer.md or</text>
+  <text x="462" y="512" class="cardBody">devops-engineer.md</text>
+
+  <rect x="430" y="580" width="310" height="170" rx="28" fill="url(#violet)" filter="url(#shadow)"/>
+  <text x="462" y="640" class="cardTitle">Planning Recovery</text>
+  <text x="462" y="674" class="cardBody">If scope is unclear, go back to</text>
+  <text x="462" y="698" class="cardBody">business-analyst.md, principal-</text>
+  <text x="462" y="722" class="cardBody">technical-expert.md, and architect</text>
+
+  <text x="860" y="172" class="label">SPECIALIST EXPANSION</text>
+  <rect x="820" y="160" width="320" height="130" rx="28" fill="#ffffff" opacity="0.88" filter="url(#shadow)"/>
+  <text x="852" y="214" class="note">API or schema</text>
+  <text x="852" y="238" class="note">api-designer.md, database-architect.md</text>
+  <text x="852" y="270" class="note">Messaging or caching</text>
+  <text x="852" y="294" class="note">kafka-expert.md, redis-expert.md</text>
+
+  <rect x="820" y="320" width="320" height="130" rx="28" fill="#ffffff" opacity="0.88" filter="url(#shadow)"/>
+  <text x="852" y="374" class="note">Runtime or delivery</text>
+  <text x="852" y="398" class="note">devops-engineer.md, kubernetes-expert.md</text>
+  <text x="852" y="430" class="note">UX or product behavior</text>
+  <text x="852" y="454" class="note">ui-ux-designer.md, product-engineer.md</text>
+
+  <text x="1250" y="172" class="label">QUALITY LOOP</text>
+  <rect x="1190" y="160" width="320" height="150" rx="28" fill="url(#blue)" filter="url(#shadow)"/>
+  <text x="1222" y="218" class="cardTitle">Review Stack</text>
+  <text x="1222" y="252" class="cardBody">Code reviewer + qa-engineer.md</text>
+  <text x="1222" y="276" class="cardBody">Add security, performance, SRE,</text>
+  <text x="1222" y="300" class="cardBody">or test automation specialists as needed</text>
+
+  <rect x="1190" y="360" width="320" height="150" rx="28" fill="url(#teal)" filter="url(#shadow)"/>
+  <text x="1222" y="418" class="cardTitle">Repair Loop</text>
+  <text x="1222" y="452" class="cardBody">Original owner + qa-engineer.md</text>
+  <text x="1222" y="476" class="cardBody">Fix failures without reopening</text>
+  <text x="1222" y="500" class="cardBody">the entire planning cycle</text>
+
+  <rect x="1190" y="560" width="320" height="150" rx="28" fill="url(#violet)" filter="url(#shadow)"/>
+  <text x="1222" y="618" class="cardTitle">Maintenance Command</text>
+  <text x="1222" y="652" class="cardBody">Repeated failures across slices</text>
+  <text x="1222" y="676" class="cardBody">trigger improve-agents.md</text>
+
+  <path class="flow" d="M370 265 H430"/>
+  <path class="flow" d="M370 265 C400 265, 400 455, 430 455"/>
+  <path class="flow" d="M370 265 C400 265, 400 665, 430 665"/>
+  <path class="flow" d="M740 245 H820"/>
+  <path class="flow" d="M740 455 H820"/>
+  <path class="flow" d="M1140 245 H1190"/>
+  <path class="flow" d="M1140 385 H1190"/>
+  <path class="flow" d="M1140 625 H1190"/>
+  <path class="flow" d="M1350 510 V550"/>
+  <path class="flow" d="M1350 710 V782 H585 V750"/>
+  <text x="920" y="804" class="note">If the issue is recurring process drift, maintenance refines the prompts and the next slice starts cleaner.</text>
+</svg>
