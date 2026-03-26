@@ -1,0 +1,180 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "build",
+  "instructions": [
+    ".opencode/README.md"
+  ],
+  "watcher": {
+    "ignore": [
+      "target/**",
+      "node_modules/**",
+      ".git/**"
+    ]
+  },
+  "permission": {
+    "read": {
+      "*": "allow",
+      "*.env": "deny",
+      "*.env.*": "deny",
+      "*.env.example": "allow"
+    },
+    "external_directory": "ask",
+    "doom_loop": "ask",
+    "bash": {
+      "*": "ask",
+      "rm *": "deny",
+      "del *": "deny",
+      "rmdir *": "deny",
+      "Remove-Item *": "deny",
+      "git push*": "deny",
+      "git reset --hard*": "deny",
+      "git checkout --*": "deny",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git show*": "allow",
+      "git branch*": "allow",
+      "rg *": "allow",
+      "cargo run*": "allow",
+      "cargo build*": "allow",
+      "cargo test*": "allow",
+      "cargo check*": "allow",
+      "cargo fmt*": "allow",
+      "npm install*": "allow",
+      "npm ci*": "allow",
+      "npm start*": "allow",
+      "node server.js*": "allow",
+      "docker compose*": "allow",
+      "docker-compose *": "allow"
+    }
+  },
+  "agent": {
+    "build": {
+      "description": "Primary implementation agent for Itineris delivery work. Use for bounded code changes, validation, and repair while delegating planning and specialist analysis to the custom subagents.",
+      "permission": {
+        "bash": {
+          "*": "ask",
+          "rm *": "deny",
+          "del *": "deny",
+          "rmdir *": "deny",
+          "Remove-Item *": "deny",
+          "git push*": "deny",
+          "git reset --hard*": "deny",
+          "git checkout --*": "deny",
+          "git status*": "allow",
+          "git diff*": "allow",
+          "git log*": "allow",
+          "git show*": "allow",
+          "git branch*": "allow",
+          "rg *": "allow",
+          "cargo run*": "allow",
+          "cargo build*": "allow",
+          "cargo test*": "allow",
+          "cargo check*": "allow",
+          "cargo fmt*": "allow",
+          "npm install*": "allow",
+          "npm ci*": "allow",
+          "npm start*": "allow",
+          "node server.js*": "allow",
+          "docker compose*": "allow",
+          "docker-compose *": "allow"
+        },
+        "task": {
+          "*": "deny",
+          "general": "allow",
+          "explore": "allow",
+          "describer": "allow",
+          "business-analyst": "allow",
+          "pm-coordinator": "allow",
+          "principal-technical-expert": "allow",
+          "product-engineer": "allow",
+          "project-preferences-advisor": "allow",
+          "software-architect": "allow",
+          "architecture-advisor": "allow",
+          "ddia-advisor": "allow",
+          "api-designer": "allow",
+          "database-architect": "allow",
+          "ui-ux-designer": "allow",
+          "backend-developer": "allow",
+          "frontend-developer": "allow",
+          "build-engineer": "allow",
+          "devops-engineer": "allow",
+          "kubernetes-expert": "allow",
+          "kafka-expert": "allow",
+          "redis-expert": "allow",
+          "backend-code-reviewer": "allow",
+          "frontend-code-reviewer": "allow",
+          "qa-engineer": "allow",
+          "test-automation-engineer": "allow",
+          "performance-engineer": "allow",
+          "security-engineer": "allow",
+          "sre-engineer": "allow",
+          "documentation-expert": "allow"
+        }
+      }
+    },
+    "plan": {
+      "description": "Primary planning agent for Itineris workflow runs. Use for requirements clarification, technical decomposition, architectural guidance, and review-oriented analysis without editing files.",
+      "permission": {
+        "edit": "deny",
+        "read": {
+          "*": "allow",
+          "*.env": "deny",
+          "*.env.*": "deny",
+          "*.env.example": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "git status*": "allow",
+          "git diff*": "allow",
+          "git log*": "allow",
+          "git show*": "allow",
+          "git branch*": "allow",
+          "rg *": "allow"
+        },
+        "task": {
+          "*": "deny",
+          "explore": "allow",
+          "describer": "allow",
+          "business-analyst": "allow",
+          "pm-coordinator": "allow",
+          "principal-technical-expert": "allow",
+          "product-engineer": "allow",
+          "project-preferences-advisor": "allow",
+          "software-architect": "allow",
+          "architecture-advisor": "allow",
+          "ddia-advisor": "allow",
+          "api-designer": "allow",
+          "database-architect": "allow",
+          "ui-ux-designer": "allow",
+          "backend-code-reviewer": "allow",
+          "frontend-code-reviewer": "allow",
+          "qa-engineer": "allow",
+          "test-automation-engineer": "allow",
+          "performance-engineer": "allow",
+          "security-engineer": "allow",
+          "sre-engineer": "allow",
+          "documentation-expert": "allow"
+        }
+      }
+    },
+    "describer": {
+      "description": "Read-only repository description agent for clarifying scope, boundaries, and likely impact before planning or implementation.",
+      "permission": {
+        "edit": "deny",
+        "read": {
+          "*": "allow",
+          "*.env": "deny",
+          "*.env.*": "deny",
+          "*.env.example": "allow"
+        },
+        "bash": {
+          "*": "deny",
+          "rg *": "allow",
+          "git diff*": "allow",
+          "git show*": "allow"
+        }
+      }
+    }
+  }
+}
