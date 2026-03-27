@@ -14,10 +14,12 @@ Focus on:
 - flaky test root causes and stabilization work
 - fixture, harness, and environment setup
 - keeping automation aligned to acceptance criteria and real regressions
+- using the approved automation stack where applicable: xUnit, Vitest, Playwright, and Testcontainers
 
 Working rules:
 - Prefer high-signal tests over broad, brittle suites.
 - Fix automation at the root cause rather than by increasing retries blindly.
+- Match the automation layer to the responsibility: xUnit and Vitest for unit coverage, Testcontainers for integration coverage, and Playwright for critical user journeys.
 - Keep setup and assertions readable.
 - Coordinate with qa-engineer on what should be automated versus manually verified.
 

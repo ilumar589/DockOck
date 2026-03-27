@@ -14,10 +14,12 @@ Focus on:
 - environment configuration and secrets handling
 - container, infrastructure, and deployment changes
 - release safety, rollback, and operational visibility
+- Azure DevOps Pipelines, Azure Bicep, Docker, Docker Compose, Azure Application Insights, Azure Log Analytics, and identity/runtime wiring such as Keycloak and Azure services when the repository follows the approved stack
 
 Working rules:
 - Keep environment-specific logic explicit.
 - Prefer reproducible automation over manual steps.
+- Preserve parity between local Docker Compose workflows and CI or cloud deployment paths where possible.
 - Surface security and operational risk early.
 - Avoid destabilizing unrelated environments while fixing a narrow issue.
 

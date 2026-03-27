@@ -8,18 +8,23 @@ OpenCode discovers these markdown files automatically. The filename becomes the 
 
 Recommended starting combinations from the AI workflow playbook:
 
-- Planning: `@describer`, `@business-analyst`, `@principal-technical-expert`, `@software-architect`
+- Planning: `@describer`, `@business-analyst`, `@principal-technical-expert`, `@tech-stack-advisor`, `@software-architect`
 - Implementation: `@backend-developer` or `@frontend-developer`, with `@project-preferences-advisor` attached
 - Review: `@backend-code-reviewer` or `@frontend-code-reviewer`, plus `@qa-engineer`
 - Repair: return to the original implementation owner with `@qa-engineer`, then add specialists by failure mode
-- Specialists: `@api-designer`, `@architecture-advisor`, `@database-architect`, `@ddia-advisor`, `@ui-ux-designer`, `@build-engineer`, `@devops-engineer`, `@kubernetes-expert`, `@kafka-expert`, `@redis-expert`, `@test-automation-engineer`, `@performance-engineer`, `@security-engineer`, `@sre-engineer`, `@documentation-expert`, `@product-engineer`, `@pm-coordinator`
+- Specialists: `@api-designer`, `@architecture-advisor`, `@doc-mcp-architecture-coordinator`, `@database-architect`, `@database-testability-engineer`, `@ddia-advisor`, `@tech-stack-advisor`, `@ui-ux-designer`, `@build-engineer`, `@devops-engineer`, `@kubernetes-expert`, `@kafka-expert`, `@redis-expert`, `@test-automation-engineer`, `@performance-engineer`, `@security-engineer`, `@sre-engineer`, `@documentation-expert`, `@product-engineer`, `@pm-coordinator`
+
+Doc MCP coordination pattern:
+
+- Pair `@doc-mcp-architecture-coordinator` with `@pm-coordinator` when the repository architecture must be reconstructed from the indexed document corpus before slices are planned or assigned.
 
 Stack assumptions baked into the prompts:
 
-- backend defaults to C# and .NET with Clean Architecture-style boundaries
-- frontend defaults to React and TypeScript
-- persistence defaults to PostgreSQL unless the repository clearly uses something else
-- operational concerns assume containerized deployment and often Kubernetes-backed runtime environments
+- backend defaults to ASP.NET Core Minimal API on .NET 10 with C#, Clean Architecture, EF Core, MediatR, FluentValidation, and Serilog
+- frontend defaults to React 19 with TypeScript 5, Vite 6, shadcn/ui, Tailwind CSS v4, Zustand, TanStack Query, React Hook Form with Zod, React Router 7, and Axios
+- persistence defaults to PostgreSQL 16 with PostGIS, with Redis for distributed cache, Keycloak for identity, Azure Blob Storage for document storage, and Azure Cognitive Search for full-text search
+- testing defaults to xUnit, Vitest, Playwright, and Testcontainers with strong coverage expectations on critical flows
+- operational concerns assume Docker and Docker Compose locally, Azure DevOps Pipelines and Azure Bicep for delivery, and Azure Application Insights with Azure Log Analytics for observability
 
 Project policy highlights from `opencode.json`:
 
@@ -36,6 +41,8 @@ Maintenance:
 
 Workflow commands:
 
+- `/tech-stack-scan` identifies the effective repository stack, highlights inferred defaults, and recommends the right agent mix before planning or customization
+- `/doc-mcp-architecture-scan` scans the indexed Doc MCP corpus with `@doc-mcp-architecture-coordinator` and `@pm-coordinator` to produce architecture detail and coordination input
 - `/plan-slice` turns a request into a bounded slice with the right planning agents
 - `/implement-slice` executes one approved slice with a single primary implementation owner
 - `/review-slice` runs the findings-first review stack

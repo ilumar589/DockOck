@@ -7,7 +7,7 @@ Plan the next bounded delivery slice for this Itineris project.
 Your job:
 
 1. Describe the slice in concrete terms using the current request and repository context.
-2. Decide whether `@describer`, `@business-analyst`, `@principal-technical-expert`, `@software-architect`, or specialist planning agents should be invoked.
+2. Decide whether `@describer`, `@business-analyst`, `@principal-technical-expert`, `@tech-stack-advisor`, `@software-architect`, `@doc-mcp-architecture-coordinator`, or other specialist planning agents should be invoked.
 3. Produce a small execution plan with explicit scope, non-goals, affected areas, and validation expectations.
 4. Flag missing decisions or ambiguity that should block implementation.
 5. Keep the slice small enough for one clear implementation owner.

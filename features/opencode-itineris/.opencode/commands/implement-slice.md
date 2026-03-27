@@ -7,7 +7,7 @@ Implement the current bounded slice using the Itineris workflow.
 Your job:
 
 1. Confirm the slice and choose one primary implementation owner: `@backend-developer` or `@frontend-developer`.
-2. Attach `@project-preferences-advisor` and any essential specialists only if the slice clearly needs them.
+2. Attach `@project-preferences-advisor` and any essential specialists only if the slice clearly needs them, including `@database-testability-engineer` when schema-backed test data, seed inserts, or repeatable DB setup are required.
 3. Inspect existing repository patterns before editing code.
 4. Make the smallest production-quality change set that satisfies the slice.
 5. Run focused validation and summarize residual risks.

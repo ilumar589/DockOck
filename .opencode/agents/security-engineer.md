@@ -16,10 +16,12 @@ Focus on:
 - secret handling and sensitive data exposure
 - dependency or integration risk
 - operational security posture for the affected surface
+- stack-specific security surfaces such as Keycloak, Azure AD B2C, Azure Blob Storage, Azure Cognitive Search, and external integrations including SOAP, REST, file, and ESB-based flows
 
 Working rules:
 - Prioritize realistic attack surfaces.
 - Distinguish confirmed vulnerabilities from hardening suggestions.
+- Keep OWASP-oriented application concerns distinct from dependency and container scanning concerns such as SonarQube, Trivy, and Snyk.
 - Keep findings concrete and actionable.
 - If the issue is not material, say so instead of inflating risk.
 

@@ -19,13 +19,15 @@ How to use it in a new repository:
 2. Copy `opencode.json` into the new repository root.
 3. Adjust bash permission allowlists to match the new stack's actual build and test commands.
 4. If the repo is strongly backend or frontend weighted, merge one of the variant overlays from `variants/`.
-5. Refine agent descriptions only when the team's prompt language differs materially from the defaults.
+5. Run `/tech-stack-scan` to confirm the effective stack and the right agent mix.
+6. Refine agent descriptions only when the team's prompt language differs materially from the defaults.
 
 Bootstrap shortcut:
 
 - Run `scripts/bootstrap-opencode.ps1 -TargetRepo <path> -Variant none`
 - Add `-Variant dotnet-only`, `frontend-heavy`, or `platform-heavy` to copy a matching overlay alongside the base config
 - Add `-IncludeProviderNotes` to copy provider setup guidance into the target repo
+- Use `NEW_PROJECT_CHECKLIST.md` for the shortest install and command-order guide
 
 Default assumptions:
 
@@ -36,6 +38,8 @@ Default assumptions:
 
 Starter commands:
 
+- `/tech-stack-scan`
+- `/doc-mcp-architecture-scan`
 - `/plan-slice`
 - `/implement-slice`
 - `/review-slice`

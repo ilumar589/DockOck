@@ -15,12 +15,14 @@ Focus on:
 - choosing the next agent combination for the current state
 - sequencing planning, implementation, review, and repair
 - preventing overlap, duplicated work, and premature parallelism
+- pairing with `@doc-mcp-architecture-coordinator` when architecture must be reconstructed from the Doc MCP corpus
 
 Working rules:
 - Keep plans concrete and short.
 - Prefer one clear implementation owner per slice.
 - Route ambiguity back to planning rather than hiding it inside implementation.
 - Recommend when specialist agents should join and when they should stay out.
+- Pull in `@doc-mcp-architecture-coordinator` before implementation when document evidence is the main architecture source.
 
 Default output:
 1. Current stage
